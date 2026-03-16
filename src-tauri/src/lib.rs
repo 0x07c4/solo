@@ -1,0 +1,2182 @@
+mod models;
+mod openai;
+mod storage;
+
+use crate::models::{
+    ChatMessage, ChatSession, ChatStreamDoneEvent, ChatStreamStatusEvent, ChatStreamTokenEvent,
+    CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent, ConnectionTestResult,
+    ManualImportResult, MessageAttachment, Settings, SettingsUpdate, ToolProposal,
+    ToolProposalPayload, Workspace,
+};
+use crate::openai::{chat_completion, test_connection, CompletionMessage};
+use crate::storage::{
+    apply_write_proposal, build_workspace_tree, canonicalize_workspace, diff_text, make_id, now_millis,
+    preview_file_result, read_workspace_file, resolve_workspace_file, update_recent_files, SharedState,
+};
+use serde::Deserialize;
+use std::{
+    fs,
+    io::{BufRead, BufReader},
+    path::Path,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tauri::{Emitter, Manager, State};
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
+        .setup(|app| {
+            let state = SharedState::new(app.handle())?;
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            open_chatgpt_in_browser,
+            codex_login_status,
+            codex_login_start,
+            settings_get,
+            settings_update,
+            settings_test_connection,
+            sessions_list,
+            session_create,
+            session_open,
+            workspaces_list,
+            workspace_add,
+            workspace_remove,
+            workspace_select,
+            workspace_tree,
+            workspace_read_file,
+            chat_send,
+            manual_import_assistant_reply,
+            approval_list,
+            approval_accept,
+            approval_reject
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running solo");
+}
+
+#[tauri::command]
+fn open_chatgpt_in_browser() -> Result<bool, String> {
+    let url = "https://chatgpt.com/";
+    let candidates = [
+        ("xdg-open", vec![url]),
+        ("gio", vec!["open", url]),
+    ];
+
+    let mut last_error = String::new();
+    for (command, args) in candidates {
+        match Command::new(command).args(args).spawn() {
+            Ok(_) => return Ok(true),
+            Err(err) => last_error = format!("{command}: {err}"),
+        }
+    }
+
+    Err(format!("无法打开默认浏览器：{last_error}"))
+}
+
+#[tauri::command]
+fn codex_login_status() -> Result<CodexLoginStatus, String> {
+    let command_output = Command::new("codex").args(["login", "status"]).output();
+
+    match command_output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut lines = stdout
+                .lines()
+                .chain(stderr.lines())
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter(|line| !line.starts_with("WARNING:"))
+                .filter(|line| !line.starts_with("Warning:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+
+            if lines.is_empty() {
+                lines.push("未检测到登录信息。".to_string());
+            }
+
+            let login_line = lines
+                .iter()
+                .find(|line| line.starts_with("Logged in using"))
+                .cloned();
+
+            let (logged_in, method, message) = if let Some(login_line) = login_line {
+                let method = login_line
+                    .trim_start_matches("Logged in using")
+                    .trim()
+                    .to_string();
+                (true, method, login_line)
+            } else {
+                let fallback = lines
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "Codex 未登录。".to_string());
+                (false, String::new(), fallback)
+            };
+
+            Ok(CodexLoginStatus {
+                available: true,
+                logged_in,
+                method,
+                message,
+            })
+        }
+        Err(err) => {
+            let auth_snapshot = read_codex_auth_snapshot();
+            if let Some((logged_in, method, message)) = auth_snapshot {
+                return Ok(CodexLoginStatus {
+                    available: true,
+                    logged_in,
+                    method,
+                    message,
+                });
+            }
+
+            Ok(CodexLoginStatus {
+                available: false,
+                logged_in: false,
+                method: String::new(),
+                message: format!("未检测到 Codex CLI：{err}"),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn codex_login_start() -> Result<bool, String> {
+    Command::new("codex")
+        .arg("login")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("启动 Codex 登录失败：{err}"))?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn settings_get(state: State<'_, SharedState>) -> Result<Settings, String> {
+    Ok(state.read(|store| store.settings.clone()))
+}
+
+#[tauri::command]
+fn settings_update(
+    update: SettingsUpdate,
+    state: State<'_, SharedState>,
+) -> Result<Settings, String> {
+    state.update(|store| {
+        if let Some(value) = update.provider {
+            store.settings.provider = value.trim().to_string();
+        }
+        if let Some(value) = update.base_url {
+            store.settings.base_url = value.trim().trim_end_matches('/').to_string();
+        }
+        if let Some(value) = update.api_key {
+            store.settings.api_key = value.trim().to_string();
+        }
+        if let Some(value) = update.model_id {
+            store.settings.model_id = value.trim().to_string();
+        }
+        if let Some(value) = update.theme {
+            store.settings.theme = value;
+        }
+        if let Some(value) = update.confirm_writes {
+            store.settings.confirm_writes = value;
+        }
+        if let Some(value) = update.confirm_commands {
+            store.settings.confirm_commands = value;
+        }
+        store.save_settings()?;
+        Ok(store.settings.clone())
+    })
+}
+
+#[tauri::command]
+async fn settings_test_connection(
+    settings: Settings,
+    state: State<'_, SharedState>,
+) -> Result<ConnectionTestResult, String> {
+    let normalized = normalize_settings(settings);
+    if normalized.provider == "codex_cli" {
+        let status = codex_login_status()?;
+        if status.logged_in {
+            return Ok(ConnectionTestResult {
+                success: true,
+                model_id: "codex_cli".to_string(),
+                message: "已检测到 ChatGPT 登录态，可直接在应用内对话。".to_string(),
+            });
+        }
+        return Err("未检测到 ChatGPT 登录态，请先登录。".to_string());
+    }
+    if normalized.provider == "manual" {
+        return Ok(ConnectionTestResult {
+            success: true,
+            model_id: "manual".to_string(),
+            message: "当前为手动协作模式，无需测试 API 连接。".to_string(),
+        });
+    }
+    validate_model_settings(&normalized)?;
+    test_connection(&state.client(), &normalized).await
+}
+
+#[tauri::command]
+fn sessions_list(state: State<'_, SharedState>) -> Result<Vec<ChatSession>, String> {
+    Ok(state.read(|store| store.sorted_sessions()))
+}
+
+#[tauri::command]
+fn session_create(state: State<'_, SharedState>) -> Result<ChatSession, String> {
+    state.update(|store| {
+        let timestamp = now_millis();
+        let session = ChatSession {
+            id: make_id("session"),
+            title: "新会话".to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            workspace_id: None,
+            messages: Vec::new(),
+            pending_approvals: Vec::new(),
+        };
+        store.sessions.push(session.clone());
+        store.save_sessions()?;
+        Ok(session)
+    })
+}
+
+#[tauri::command]
+fn session_open(session_id: String, state: State<'_, SharedState>) -> Result<ChatSession, String> {
+    state
+        .read(|store| store.sessions.iter().find(|session| session.id == session_id).cloned())
+        .ok_or_else(|| "session not found".to_string())
+}
+
+#[tauri::command]
+fn workspaces_list(state: State<'_, SharedState>) -> Result<Vec<Workspace>, String> {
+    Ok(state.read(|store| store.sorted_workspaces()))
+}
+
+#[tauri::command]
+fn workspace_add(path: String, state: State<'_, SharedState>) -> Result<Workspace, String> {
+    let canonical = canonicalize_workspace(&path)?;
+    state.update(|store| {
+        let canonical_str = canonical.to_string_lossy().to_string();
+        if let Some(existing) = store.workspaces.iter().find(|workspace| workspace.path == canonical_str)
+        {
+            return Err(format!("工作区已存在：{}", existing.path));
+        }
+
+        let timestamp = now_millis();
+        let workspace = Workspace {
+            id: make_id("workspace"),
+            name: canonical
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace")
+                .to_string(),
+            path: canonical_str,
+            created_at: timestamp,
+            last_opened_at: timestamp,
+            recent_files: Vec::new(),
+        };
+        store.workspaces.push(workspace.clone());
+        store.save_workspaces()?;
+        Ok(workspace)
+    })
+}
+
+#[tauri::command]
+fn workspace_remove(workspace_id: String, state: State<'_, SharedState>) -> Result<bool, String> {
+    state.update(|store| {
+        store.workspaces.retain(|workspace| workspace.id != workspace_id);
+        for session in &mut store.sessions {
+            if session.workspace_id.as_deref() == Some(workspace_id.as_str()) {
+                session.workspace_id = None;
+            }
+        }
+        for proposal in &mut store.proposals {
+            let matches_workspace = match &proposal.payload {
+                ToolProposalPayload::Write { workspace_id: value, .. } => value == &workspace_id,
+                ToolProposalPayload::Command { workspace_id: value, .. } => value == &workspace_id,
+            };
+            if matches_workspace && proposal.status == "pending" {
+                proposal.status = "rejected".to_string();
+                proposal.error = Some("workspace removed".to_string());
+            }
+        }
+        store.save_workspaces()?;
+        store.save_sessions()?;
+        store.save_proposals()?;
+        Ok(true)
+    })
+}
+
+#[tauri::command]
+fn workspace_select(
+    session_id: String,
+    workspace_id: Option<String>,
+    state: State<'_, SharedState>,
+) -> Result<ChatSession, String> {
+    state.update(|store| {
+        let next_workspace_id = workspace_id.clone();
+        if let Some(workspace_id) = workspace_id {
+            let workspace = store
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+                .ok_or_else(|| "workspace not found".to_string())?;
+            workspace.last_opened_at = now_millis();
+        }
+
+        let session = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+        session.workspace_id = next_workspace_id;
+        session.updated_at = now_millis();
+        let cloned = session.clone();
+        store.save_sessions()?;
+        store.save_workspaces()?;
+        Ok(cloned)
+    })
+}
+
+#[tauri::command]
+fn workspace_tree(
+    workspace_id: String,
+    max_depth: Option<u8>,
+    state: State<'_, SharedState>,
+) -> Result<crate::models::FileTreeNode, String> {
+    let workspace = state
+        .read(|store| store.workspaces.iter().find(|workspace| workspace.id == workspace_id).cloned())
+        .ok_or_else(|| "workspace not found".to_string())?;
+    build_workspace_tree(&workspace, max_depth.unwrap_or(4))
+}
+
+#[tauri::command]
+fn workspace_read_file(
+    workspace_id: String,
+    relative_path: String,
+    state: State<'_, SharedState>,
+) -> Result<crate::models::FileReadResult, String> {
+    state.update(|store| {
+        let workspace = store
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| "workspace not found".to_string())?;
+        let result = preview_file_result(read_workspace_file(workspace, &relative_path)?, 12_000);
+        update_recent_files(workspace, &relative_path);
+        store.save_workspaces()?;
+        Ok(result)
+    })
+}
+
+#[tauri::command]
+async fn chat_send(
+    session_id: String,
+    input: String,
+    attachment_paths: Option<Vec<String>>,
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<ChatSession, String> {
+    let state_handle = state.inner().clone();
+    let attachments = attachment_paths.unwrap_or_default();
+
+    let provider = state_handle.read(|store| store.settings.provider.clone());
+    let effective_provider = if provider == "openai" {
+        match codex_login_status() {
+            Ok(status) if status.logged_in => "codex_cli".to_string(),
+            _ => "openai".to_string(),
+        }
+    } else {
+        provider.clone()
+    };
+
+    let (session, latest_user_message_id) = state_handle.update(|store| {
+        if effective_provider == "openai" {
+            validate_model_settings(&store.settings)?;
+        }
+
+        let session = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+
+        if session.title == "新会话" && !input.trim().is_empty() {
+            session.title = derive_session_title(&input);
+        }
+
+        let message_id = make_id("message");
+        let attachment_refs = attachments
+            .iter()
+            .map(|path| MessageAttachment {
+                relative_path: path.clone(),
+                label: path.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        session.messages.push(ChatMessage {
+            id: message_id.clone(),
+            role: "user".to_string(),
+            content: input.clone(),
+            timestamp: now_millis(),
+            status: "done".to_string(),
+            attachments: attachment_refs,
+        });
+        session.updated_at = now_millis();
+        let cloned = session.clone();
+        store.save_sessions()?;
+        Ok((cloned, message_id))
+    })?;
+
+    if effective_provider == "manual" {
+        return Ok(session);
+    }
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = process_chat_turn(
+            app_handle.clone(),
+            state_handle.clone(),
+            session_id.clone(),
+            latest_user_message_id,
+            attachments,
+            effective_provider,
+        )
+        .await
+        {
+            let assistant_message_id = make_id("message");
+            let _ = persist_assistant_message(
+                &state_handle,
+                &session_id,
+                &assistant_message_id,
+                &format!("请求失败：{err}"),
+                "error",
+            );
+            let _ = app_handle.emit(
+                "chat-stream-done",
+                ChatStreamDoneEvent {
+                    session_id: session_id.clone(),
+                    session_title: state_handle
+                        .read(|store| {
+                            store
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == session_id)
+                                .map(|session| session.title.clone())
+                                .unwrap_or_else(|| "新会话".to_string())
+                        }),
+                    message_id: assistant_message_id,
+                    content: format!("请求失败：{err}"),
+                    status: "error".to_string(),
+                },
+            );
+        }
+    });
+
+    Ok(session)
+}
+
+#[tauri::command]
+fn manual_import_assistant_reply(
+    session_id: String,
+    content: String,
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<ManualImportResult, String> {
+    let state_handle = state.inner().clone();
+    let imported = state_handle.update(|store| {
+        let workspace = current_session_workspace(store, &session_id)?;
+        let parsed_blocks = parse_manual_reply_blocks(&content)?;
+
+        if !parsed_blocks.is_empty() && workspace.is_none() {
+            return Err("当前会话未绑定工作区，无法从外部回复生成文件或命令提案。".to_string());
+        }
+
+        let mut created = Vec::new();
+        for block in parsed_blocks {
+            let workspace = workspace
+                .as_ref()
+                .ok_or_else(|| "当前会话未绑定工作区。".to_string())?;
+            let proposal = create_manual_proposal(store, &session_id, workspace, block)?;
+            created.push(proposal);
+        }
+
+        let proposal_ids = created.iter().map(|proposal| proposal.id.clone()).collect::<Vec<_>>();
+        let session = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+
+        let message_id = make_id("message");
+        session.messages.push(ChatMessage {
+            id: message_id,
+            role: "assistant".to_string(),
+            content: content.clone(),
+            timestamp: now_millis(),
+            status: "done".to_string(),
+            attachments: Vec::new(),
+        });
+        session.pending_approvals.extend(proposal_ids);
+        session.updated_at = now_millis();
+
+        let cloned_session = session.clone();
+        store.save_sessions()?;
+        store.save_proposals()?;
+        Ok(ManualImportResult {
+            session: cloned_session,
+            proposals: created,
+        })
+    })?;
+
+    for proposal in &imported.proposals {
+        let _ = app.emit("tool-proposal-created", proposal);
+    }
+
+    Ok(imported)
+}
+
+#[tauri::command]
+fn approval_list(
+    session_id: Option<String>,
+    state: State<'_, SharedState>,
+) -> Result<Vec<ToolProposal>, String> {
+    Ok(state.read(|store| store.sorted_proposals(session_id.as_deref())))
+}
+
+#[tauri::command]
+fn approval_accept(
+    proposal_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<ToolProposal, String> {
+    let state_handle = state.inner().clone();
+    let proposal = state_handle.read(|store| {
+        store
+            .proposals
+            .iter()
+            .find(|proposal| proposal.id == proposal_id)
+            .cloned()
+    });
+    let proposal = proposal.ok_or_else(|| "proposal not found".to_string())?;
+
+    match &proposal.payload {
+        ToolProposalPayload::Write { workspace_id, .. } => {
+            let applied = state_handle.update(|store| {
+                let proposal = store
+                    .proposals
+                    .iter()
+                    .find(|proposal| proposal.id == proposal_id)
+                    .ok_or_else(|| "proposal not found".to_string())?;
+                if proposal.status != "pending" {
+                    return Err(format!("该提案当前状态为 `{}`，不能再次应用。", proposal.status));
+                }
+                let workspace = store
+                    .workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == *workspace_id)
+                    .ok_or_else(|| "workspace not found".to_string())?;
+                let proposal = store
+                    .proposals
+                    .iter_mut()
+                    .find(|proposal| proposal.id == proposal_id)
+                    .ok_or_else(|| "proposal not found".to_string())?;
+                let (relative_path, _) = apply_write_proposal(workspace, proposal)?;
+                update_recent_files(workspace, &relative_path);
+                proposal.status = "applied".to_string();
+                proposal.error = None;
+                proposal.latest_output = Some(format!("Applied changes to {relative_path}"));
+                if let Some(session) = store
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == proposal.session_id)
+                {
+                    session.pending_approvals.retain(|entry| entry != &proposal_id);
+                    session.updated_at = now_millis();
+                }
+                let cloned = proposal.clone();
+                store.save_workspaces()?;
+                store.save_proposals()?;
+                store.save_sessions()?;
+                Ok(cloned)
+            })?;
+            let _ = app.emit("approval-updated", &applied);
+            let _ = app.emit(
+                "workspace-updated",
+                serde_json::json!({ "kind": "writeApplied", "proposalId": applied.id }),
+            );
+            Ok(applied)
+        }
+        ToolProposalPayload::Command { .. } => {
+            let approved = state_handle.update(|store| {
+                let proposal = store
+                    .proposals
+                    .iter_mut()
+                    .find(|proposal| proposal.id == proposal_id)
+                    .ok_or_else(|| "proposal not found".to_string())?;
+                if proposal.status != "pending" {
+                    return Err(format!("该提案当前状态为 `{}`，不能再次执行。", proposal.status));
+                }
+                proposal.status = "approved".to_string();
+                proposal.error = None;
+                proposal.latest_output = Some("等待执行…".to_string());
+                if let Some(session) = store
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == proposal.session_id)
+                {
+                    session.pending_approvals.retain(|entry| entry != &proposal_id);
+                    session.updated_at = now_millis();
+                }
+                let cloned = proposal.clone();
+                store.save_proposals()?;
+                store.save_sessions()?;
+                Ok(cloned)
+            })?;
+            let _ = app.emit("approval-updated", &approved);
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = run_command_proposal(app_handle.clone(), state_handle.clone(), proposal_id.clone()).await {
+                    let _ = mark_proposal_failed(&state_handle, &proposal_id, &err);
+                    let _ = app_handle.emit(
+                        "command-finished",
+                        CommandFinishedEvent {
+                            proposal_id,
+                            exit_code: -1,
+                        },
+                    );
+                }
+            });
+            Ok(approved)
+        }
+    }
+}
+
+#[tauri::command]
+fn approval_reject(
+    proposal_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<ToolProposal, String> {
+    let proposal = state.inner().clone().update(|store| {
+        let proposal = store
+            .proposals
+            .iter_mut()
+            .find(|proposal| proposal.id == proposal_id)
+            .ok_or_else(|| "proposal not found".to_string())?;
+        if proposal.status != "pending" {
+            return Err(format!("该提案当前状态为 `{}`，不能拒绝。", proposal.status));
+        }
+        proposal.status = "rejected".to_string();
+        proposal.error = None;
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == proposal.session_id)
+        {
+            session.pending_approvals.retain(|entry| entry != &proposal_id);
+            session.updated_at = now_millis();
+        }
+        let cloned = proposal.clone();
+        store.save_proposals()?;
+        store.save_sessions()?;
+        Ok(cloned)
+    })?;
+    let _ = app.emit("approval-updated", &proposal);
+    Ok(proposal)
+}
+
+async fn process_chat_turn(
+    app: tauri::AppHandle,
+    state: SharedState,
+    session_id: String,
+    latest_user_message_id: String,
+    attachment_paths: Vec<String>,
+    effective_provider: String,
+) -> Result<(), String> {
+    let snapshot = state.read(|store| {
+        let settings = store.settings.clone();
+        let session = store
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned();
+        let workspace = session.as_ref().and_then(|session| {
+            session
+                .workspace_id
+                .as_ref()
+                .and_then(|workspace_id| store.workspaces.iter().find(|workspace| &workspace.id == workspace_id))
+                .cloned()
+        });
+        (settings, session, workspace)
+    });
+    let (mut settings, session, workspace) = snapshot;
+    settings.provider = effective_provider;
+    let session = session.ok_or_else(|| "session not found".to_string())?;
+
+    let attachment_blobs = attachment_paths
+        .iter()
+        .map(|relative_path| {
+            let workspace = workspace
+                .as_ref()
+                .ok_or_else(|| "attachments require an active workspace".to_string())?;
+            let file = read_workspace_file(workspace, relative_path)?;
+            Ok((relative_path.clone(), file.content))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let system_prompt = if settings.provider == "codex_cli" {
+        "You are ChatGPT. Reply naturally and directly. \
+         Do not introduce yourself unless asked. \
+         Do not mention internal model names unless the user explicitly asks."
+            .to_string()
+    } else {
+        build_system_prompt(workspace.as_ref())
+    };
+    let mut messages = vec![CompletionMessage::system(system_prompt)];
+    for message in &session.messages {
+        let mut content = message.content.clone();
+        if message.role == "user" && message.id == latest_user_message_id {
+            content = build_augmented_user_message(&content, &attachment_blobs);
+        }
+        match message.role.as_str() {
+            "user" => messages.push(CompletionMessage::user(content)),
+            "assistant" => messages.push(CompletionMessage::assistant(Some(content), None)),
+            _ => {}
+        }
+    }
+
+    let assistant_message_id = make_id("message");
+    let (mut visible_reply, reply_streamed_live) = if settings.provider == "codex_cli" {
+        run_codex_chat_turn_streaming(
+            app.clone(),
+            session_id.clone(),
+            assistant_message_id.clone(),
+            &messages,
+            workspace.as_ref(),
+        )
+        .await?
+    } else {
+        let mut reply = String::new();
+        for _ in 0..6 {
+            let assistant = chat_completion(&state.client(), &settings, &messages).await?;
+            if let Some(content) = assistant.content.clone() {
+                if !content.trim().is_empty() {
+                    if !reply.is_empty() {
+                        reply.push_str("\n\n");
+                    }
+                    reply.push_str(content.trim());
+                }
+            }
+
+            if let Some(tool_calls) = assistant.tool_calls.clone() {
+                messages.push(CompletionMessage::assistant(
+                    assistant.content.clone(),
+                    Some(tool_calls.clone()),
+                ));
+                for tool_call in tool_calls {
+                    let tool_result = handle_tool_call(
+                        &app,
+                        &state,
+                        &session_id,
+                        workspace.as_ref(),
+                        &settings,
+                        &tool_call,
+                    )
+                    .await;
+                    messages.push(CompletionMessage::tool(tool_call.id.clone(), tool_result));
+                }
+                continue;
+            }
+
+            break;
+        }
+        (reply, false)
+    };
+
+    if visible_reply.trim().is_empty() {
+        visible_reply = "我已经分析了当前请求；如果需要副作用操作，会在右侧生成待确认提案。".to_string();
+    }
+
+    if !reply_streamed_live {
+        emit_streamed_reply(&app, &session_id, &assistant_message_id, &visible_reply).await;
+    }
+    let session_title =
+        persist_assistant_message(&state, &session_id, &assistant_message_id, &visible_reply, "done")?;
+    app.emit(
+        "chat-stream-done",
+        ChatStreamDoneEvent {
+            session_id,
+            session_title,
+            message_id: assistant_message_id,
+            content: visible_reply,
+            status: "done".to_string(),
+        },
+    )
+    .map_err(|err| format!("emit chat completion failed: {err}"))?;
+
+    Ok(())
+}
+
+async fn run_codex_chat_turn_streaming(
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+    messages: &[CompletionMessage],
+    workspace: Option<&Workspace>,
+) -> Result<(String, bool), String> {
+    let status = codex_login_status()?;
+    if !status.logged_in {
+        return Err("未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string());
+    }
+
+    let prompt = build_codex_exec_prompt(messages);
+    let workspace_path = workspace.map(|entry| entry.path.clone());
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let output_file = std::env::temp_dir().join(format!("solo-codex-reply-{}.txt", now_millis()));
+        emit_chat_stream_status(
+            &app,
+            &session_id,
+            &message_id,
+            "准备",
+            "正在启动模型任务…",
+            "info",
+        );
+
+        let mut command = Command::new("codex");
+        command
+            .arg("exec")
+            .arg("--skip-git-repo-check")
+            .arg("--sandbox")
+            .arg("read-only")
+            .arg("--json")
+            .arg("--output-last-message")
+            .arg(&output_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(path) = workspace_path.as_deref() {
+            command.arg("--cd").arg(path);
+            let workspace_name = Path::new(path)
+                .file_name()
+                .and_then(|entry| entry.to_str())
+                .unwrap_or(path);
+            emit_chat_stream_status(
+                &app,
+                &session_id,
+                &message_id,
+                "工作区",
+                &format!("使用工作区：{workspace_name}"),
+                "info",
+            );
+        }
+
+        command.arg(&prompt);
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("启动 Codex 对话失败：{err}"))?;
+        emit_chat_stream_status(
+            &app,
+            &session_id,
+            &message_id,
+            "连接",
+            "已连接模型，开始接收中间过程…",
+            "info",
+        );
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "无法捕获 Codex stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "无法捕获 Codex stderr".to_string())?;
+
+        let streamed_reply = Arc::new(Mutex::new(String::new()));
+        let streamed_reply_stdout = Arc::clone(&streamed_reply);
+        let app_stdout = app.clone();
+        let app_status = app.clone();
+        let session_for_stdout = session_id.clone();
+        let message_for_stdout = message_id.clone();
+        let session_for_status = session_id.clone();
+        let message_for_status = message_id.clone();
+        let stdout_handle = std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            let mut last_status = String::new();
+            for raw_line in reader.lines().map_while(Result::ok) {
+                if let Some((stage, detail, level)) = extract_codex_status_from_json_line(&raw_line) {
+                    let key = format!("{stage}|{detail}|{level}");
+                    if key != last_status {
+                        last_status = key;
+                        let _ = app_status.emit(
+                            "chat-stream-status",
+                            ChatStreamStatusEvent {
+                                session_id: session_for_status.clone(),
+                                message_id: message_for_status.clone(),
+                                stage,
+                                detail,
+                                level,
+                            },
+                        );
+                    }
+                }
+                if let Some(delta) = extract_codex_delta_from_json_line(&raw_line) {
+                    if let Ok(mut content) = streamed_reply_stdout.lock() {
+                        content.push_str(&delta);
+                    }
+                    let _ = app_stdout.emit(
+                        "chat-stream-token",
+                        ChatStreamTokenEvent {
+                            session_id: session_for_stdout.clone(),
+                            message_id: message_for_stdout.clone(),
+                            delta,
+                        },
+                    );
+                }
+            }
+        });
+
+        let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stderr_lines_capture = Arc::clone(&stderr_lines);
+        let app_stderr = app.clone();
+        let session_for_stderr = session_id.clone();
+        let message_for_stderr = message_id.clone();
+        let stderr_handle = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for raw_line in reader.lines().map_while(Result::ok) {
+                let trimmed = raw_line.trim();
+                if trimmed.is_empty()
+                    || trimmed.starts_with("WARNING:")
+                    || trimmed.starts_with("Warning:")
+                {
+                    continue;
+                }
+                if let Ok(mut lines) = stderr_lines_capture.lock() {
+                    lines.push(trimmed.to_string());
+                }
+                let level = if trimmed.to_ascii_lowercase().contains("error") {
+                    "error"
+                } else {
+                    "warn"
+                };
+                let _ = app_stderr.emit(
+                    "chat-stream-status",
+                    ChatStreamStatusEvent {
+                        session_id: session_for_stderr.clone(),
+                        message_id: message_for_stderr.clone(),
+                        stage: "CLI".to_string(),
+                        detail: summarize_status_text(trimmed, 96),
+                        level: level.to_string(),
+                    },
+                );
+            }
+        });
+
+        let timeout = Duration::from_secs(180);
+        let started_at = Instant::now();
+        let mut warned_no_text_20s = false;
+        let mut warned_no_text_60s = false;
+        let mut warned_near_timeout = false;
+        let exit_status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    let elapsed = started_at.elapsed();
+                    let no_stream_text = streamed_reply
+                        .lock()
+                        .map(|text| text.trim().is_empty())
+                        .unwrap_or(true);
+                    if no_stream_text && !warned_no_text_20s && elapsed >= Duration::from_secs(20) {
+                        warned_no_text_20s = true;
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "监控",
+                            "20 秒仍未收到正文输出，模型可能在长思考。",
+                            "warn",
+                        );
+                    }
+                    if no_stream_text && !warned_no_text_60s && elapsed >= Duration::from_secs(60) {
+                        warned_no_text_60s = true;
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "监控",
+                            "60 秒仍无正文输出，建议检查网络或重试。",
+                            "warn",
+                        );
+                    }
+                    if !warned_near_timeout && elapsed >= Duration::from_secs(150) {
+                        warned_near_timeout = true;
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "监控",
+                            "请求接近超时阈值（180 秒）。",
+                            "warn",
+                        );
+                    }
+                    if started_at.elapsed() >= timeout {
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "超时",
+                            "180 秒内未收到完成信号。",
+                            "error",
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = fs::remove_file(&output_file);
+                        return Err("请求超时：180 秒内未收到模型完成信号，请重试。".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                Err(err) => return Err(format!("等待 Codex 返回失败：{err}")),
+            }
+        };
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
+
+        let stderr_output = stderr_lines
+            .lock()
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_default();
+
+        if !exit_status.success() {
+            let mut error = if stderr_output.is_empty() {
+                format!("Codex 执行失败，退出码 {}", exit_status.code().unwrap_or(-1))
+            } else {
+                stderr_output
+            };
+            if error.contains("Please run `codex login`") || error.contains("logged in") {
+                error = "未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string();
+            }
+            emit_chat_stream_status(
+                &app,
+                &session_id,
+                &message_id,
+                "失败",
+                &summarize_status_text(&error, 120),
+                "error",
+            );
+            let _ = fs::remove_file(&output_file);
+            return Err(error);
+        }
+
+        let content = fs::read_to_string(&output_file).unwrap_or_default();
+        let _ = fs::remove_file(&output_file);
+        let file_reply = content.trim().to_string();
+        if !file_reply.is_empty() {
+            let has_streamed_delta = !streamed_reply
+                .lock()
+                .map(|text| text.trim().is_empty())
+                .unwrap_or(true);
+            emit_chat_stream_status(
+                &app,
+                &session_id,
+                &message_id,
+                "完成",
+                "回复生成完成。",
+                "success",
+            );
+            return Ok((file_reply, has_streamed_delta));
+        }
+
+        let streamed = streamed_reply
+            .lock()
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        if !streamed.is_empty() {
+            emit_chat_stream_status(
+                &app,
+                &session_id,
+                &message_id,
+                "完成",
+                "回复生成完成。",
+                "success",
+            );
+            return Ok((streamed, true));
+        }
+
+        emit_chat_stream_status(
+            &app,
+            &session_id,
+            &message_id,
+            "失败",
+            "模型没有返回可显示内容。",
+            "error",
+        );
+        Err("Codex 没有返回可显示的回复，请重试。".to_string())
+    })
+    .await
+    .map_err(|err| format!("Codex 对话任务失败：{err}"))?
+}
+
+fn emit_chat_stream_status(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    message_id: &str,
+    stage: &str,
+    detail: &str,
+    level: &str,
+) {
+    let compact_detail = summarize_status_text(detail, 120);
+    if compact_detail.is_empty() {
+        return;
+    }
+    let _ = app.emit(
+        "chat-stream-status",
+        ChatStreamStatusEvent {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            stage: stage.to_string(),
+            detail: compact_detail,
+            level: level.to_string(),
+        },
+    );
+}
+
+fn extract_codex_status_from_json_line(line: &str) -> Option<(String, String, String)> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let event_type = value
+        .get("type")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or_default()
+        .trim();
+    if event_type.is_empty() {
+        return None;
+    }
+
+    let lower = event_type.to_ascii_lowercase();
+    if lower.contains("delta") || lower.contains("usage") || lower.contains("token") {
+        return None;
+    }
+
+    let (stage, level) = map_codex_event_stage(event_type);
+    let detail = value
+        .get("message")
+        .and_then(json_value_to_string)
+        .or_else(|| value.get("summary").and_then(json_value_to_string))
+        .or_else(|| value.get("status").and_then(json_value_to_string))
+        .or_else(|| value.get("text").and_then(json_value_to_string))
+        .or_else(|| value.get("detail").and_then(json_value_to_string))
+        .or_else(|| value.get("name").and_then(json_value_to_string))
+        .or_else(|| value.get("title").and_then(json_value_to_string))
+        .or_else(|| value.get("event").and_then(extract_status_text))
+        .or_else(|| value.get("data").and_then(extract_status_text))
+        .unwrap_or_else(|| humanize_codex_event_type(event_type));
+    let compact_detail = summarize_status_text(&detail, 96);
+    if is_noisy_codex_status(event_type, &compact_detail) {
+        return None;
+    }
+    if compact_detail.is_empty() {
+        return None;
+    }
+    Some((stage.to_string(), compact_detail, level.to_string()))
+}
+
+fn map_codex_event_stage(event_type: &str) -> (&'static str, &'static str) {
+    let lower = event_type.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") || lower.contains("fail") {
+        ("异常", "error")
+    } else if lower.contains("tool") || lower.contains("command") {
+        ("执行工具", "info")
+    } else if lower.contains("reason") || lower.contains("think") {
+        ("思考", "info")
+    } else if lower.contains("response") || lower.contains("message") || lower.contains("output") {
+        ("生成回复", "info")
+    } else if lower.contains("complete")
+        || lower.contains("finished")
+        || lower.contains("finish")
+        || lower.contains("done")
+    {
+        ("完成", "success")
+    } else if lower.contains("start") || lower.contains("init") || lower.contains("create") {
+        ("准备", "info")
+    } else {
+        ("处理中", "info")
+    }
+}
+
+fn extract_status_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(entry) => {
+            if entry.trim().is_empty() {
+                None
+            } else {
+                Some(entry.to_string())
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["message", "summary", "status", "text", "detail", "name", "title"] {
+                if let Some(text) = map.get(key).and_then(json_value_to_string) {
+                    return Some(text);
+                }
+            }
+            map.values().find_map(extract_status_text)
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(extract_status_text),
+        _ => None,
+    }
+}
+
+fn humanize_codex_event_type(event_type: &str) -> String {
+    let text = event_type
+        .replace(['.', '_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        "处理中".to_string()
+    } else {
+        text
+    }
+}
+
+fn is_noisy_codex_status(event_type: &str, detail: &str) -> bool {
+    let event = event_type.trim().to_ascii_lowercase();
+    let text = detail.trim().to_ascii_lowercase();
+
+    if text.is_empty() {
+        return true;
+    }
+
+    let is_generic_item_event = event == "item.started"
+        || event == "item.completed"
+        || event == "item.updated"
+        || event == "item.created"
+        || event.ends_with("item.started")
+        || event.ends_with("item.completed")
+        || event.ends_with("item.updated")
+        || event.ends_with("item.created");
+
+    if is_generic_item_event {
+        return text == "item started"
+            || text == "item completed"
+            || text == "item updated"
+            || text == "item created"
+            || text == event;
+    }
+
+    false
+}
+
+fn extract_codex_delta_from_json_line(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let event_type = value
+        .get("type")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or_default();
+    if !event_type.contains("delta") {
+        return None;
+    }
+
+    extract_delta_from_value(&value)
+}
+
+fn extract_delta_from_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(delta) = map.get("delta").and_then(json_value_to_string) {
+                return Some(delta);
+            }
+            if let Some(delta) = map.get("text").and_then(json_value_to_string) {
+                return Some(delta);
+            }
+            for nested in map.values() {
+                if let Some(delta) = extract_delta_from_value(nested) {
+                    return Some(delta);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(extract_delta_from_value),
+        _ => None,
+    }
+}
+
+fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(entry) => {
+            if entry.is_empty() {
+                None
+            } else {
+                Some(entry.clone())
+            }
+        }
+        serde_json::Value::Array(values) => {
+            let merged = values
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .collect::<String>();
+            if merged.is_empty() { None } else { Some(merged) }
+        }
+        _ => None,
+    }
+}
+
+fn summarize_status_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = compact.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn build_codex_exec_prompt(messages: &[CompletionMessage]) -> String {
+    let model_hint = read_codex_config_model();
+
+    if let Some(last_user) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.as_ref())
+    {
+        let lower = last_user.to_lowercase();
+        let asks_model =
+            lower.contains("什么模型") || lower.contains("哪个模型") || lower.contains("model");
+        if asks_model {
+            return if let Some(model) = model_hint {
+                format!("用户问的是当前模型型号。请只回复一句：当前使用的模型是 `{model}`。")
+            } else {
+                "用户问的是当前模型型号。请只回复一句：当前无法从本机配置读取模型名称。"
+                    .to_string()
+            };
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push(
+        "你是 ChatGPT。输出规则：\
+         1) 默认用简洁中文，先给结论，再补一句必要解释；\
+         2) 除非用户明确要求，不要长篇、不要分点教程、不要模板化免责声明；\
+         3) 不要自我介绍，不要谈产品归属，不要说“在这个场景里/作为助手”；\
+         4) 如果用户问“你是什么模型/型号”，且上下文里有“当前模型提示”，就直接回答这个模型名。"
+            .to_string(),
+    );
+    if let Some(model) = read_codex_config_model() {
+        lines.push(format!("当前模型提示：{model}"));
+    }
+    lines.push("以下是当前对话上下文：".to_string());
+
+    for message in messages {
+        let role = match message.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            _ => continue,
+        };
+        let content = message
+            .content
+            .as_ref()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        lines.push(format!("\n[{role}]\n{content}"));
+    }
+
+    lines.push("\n请继续回答最后一条 User 消息。".to_string());
+    lines.join("\n")
+}
+
+fn read_codex_config_model() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let config_path = Path::new(&home).join(".codex").join("config.toml");
+    let content = fs::read_to_string(config_path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("model") || !trimmed.contains('=') {
+            continue;
+        }
+        let (_, value) = trimmed.split_once('=')?;
+        let model = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        if !model.is_empty() {
+            return Some(model);
+        }
+    }
+    None
+}
+
+async fn handle_tool_call(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    session_id: &str,
+    workspace: Option<&Workspace>,
+    settings: &Settings,
+    tool_call: &crate::openai::ToolCall,
+) -> String {
+    match tool_call.function.name.as_str() {
+        "list_files" => {
+            #[derive(Deserialize)]
+            struct Args {
+                path: Option<String>,
+                max_depth: Option<u8>,
+            }
+            let args = parse_args::<Args>(&tool_call.function.arguments);
+            let Ok(args) = args else {
+                return "Failed to parse list_files arguments".to_string();
+            };
+            let Some(workspace) = workspace else {
+                return "No active workspace is attached to this session".to_string();
+            };
+            let root = match &args.path {
+                Some(relative_path) if !relative_path.is_empty() => match resolve_workspace_file(workspace, relative_path) {
+                    Ok(path) => path,
+                    Err(err) => return err,
+                },
+                _ => Path::new(&workspace.path).to_path_buf(),
+            };
+            match describe_tree(&root, args.max_depth.unwrap_or(2), 0) {
+                Ok(tree) => tree,
+                Err(err) => err,
+            }
+        }
+        "read_file" => {
+            #[derive(Deserialize)]
+            struct Args {
+                path: String,
+            }
+            let args = parse_args::<Args>(&tool_call.function.arguments);
+            let Ok(args) = args else {
+                return "Failed to parse read_file arguments".to_string();
+            };
+            let Some(workspace) = workspace else {
+                return "No active workspace is attached to this session".to_string();
+            };
+            match read_workspace_file(workspace, &args.path) {
+                Ok(file) => {
+                    let _ = state.update(|store| {
+                        if let Some(workspace) = store.workspaces.iter_mut().find(|entry| entry.id == workspace.id) {
+                            update_recent_files(workspace, &args.path);
+                            store.save_workspaces()?;
+                        }
+                        Ok(())
+                    });
+                    format!("FILE {}\n```text\n{}\n```", args.path, truncate_for_model(&file.content))
+                }
+                Err(err) => format!("Failed to read file: {err}"),
+            }
+        }
+        "propose_write_file" => {
+            #[derive(Deserialize)]
+            struct Args {
+                path: String,
+                content: String,
+                summary: Option<String>,
+            }
+            let args = parse_args::<Args>(&tool_call.function.arguments);
+            let Ok(args) = args else {
+                return "Failed to parse propose_write_file arguments".to_string();
+            };
+            let Some(workspace) = workspace else {
+                return "No active workspace is attached to this session".to_string();
+            };
+            if !settings.confirm_writes {
+                return "Write proposals are disabled because confirm_writes is false".to_string();
+            }
+            match create_write_proposal(app, state, session_id, workspace, &args.path, &args.content, args.summary).await
+            {
+                Ok(proposal) => format!("Created write proposal {} for {}", proposal.id, args.path),
+                Err(err) => format!("Failed to create write proposal: {err}"),
+            }
+        }
+        "propose_run_command" => {
+            #[derive(Deserialize)]
+            struct Args {
+                command: String,
+                cwd: Option<String>,
+                reason: Option<String>,
+            }
+            let args = parse_args::<Args>(&tool_call.function.arguments);
+            let Ok(args) = args else {
+                return "Failed to parse propose_run_command arguments".to_string();
+            };
+            let Some(workspace) = workspace else {
+                return "No active workspace is attached to this session".to_string();
+            };
+            if !settings.confirm_commands {
+                return "Command proposals are disabled because confirm_commands is false".to_string();
+            }
+            let command_args = CommandProposalArgs {
+                command: args.command,
+                cwd: args.cwd,
+                reason: args.reason,
+            };
+            match create_command_proposal(app, state, session_id, workspace, command_args).await {
+                Ok(proposal) => format!("Created command proposal {}", proposal.id),
+                Err(err) => format!("Failed to create command proposal: {err}"),
+            }
+        }
+        _ => "Unknown tool".to_string(),
+    }
+}
+
+async fn create_write_proposal(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    session_id: &str,
+    workspace: &Workspace,
+    relative_path: &str,
+    next_content: &str,
+    summary: Option<String>,
+) -> Result<ToolProposal, String> {
+    let proposal = state.update(|store| {
+        let absolute = resolve_workspace_file(workspace, relative_path)?;
+        let current = if absolute.exists() {
+            fs::read_to_string(&absolute).map_err(|err| format!("read current file failed: {err}"))?
+        } else {
+            String::new()
+        };
+        let proposal = ToolProposal {
+            id: make_id("proposal"),
+            session_id: session_id.to_string(),
+            kind: "write".to_string(),
+            title: format!("修改 {relative_path}"),
+            summary: summary.unwrap_or_else(|| "模型建议更新文件内容".to_string()),
+            created_at: now_millis(),
+            status: "pending".to_string(),
+            payload: ToolProposalPayload::Write {
+                workspace_id: workspace.id.clone(),
+                relative_path: relative_path.to_string(),
+                base_hash: crate::storage::hash_text(&current),
+                diff_text: diff_text(relative_path, &current, next_content),
+                next_content_preview: next_content.to_string(),
+            },
+            latest_output: None,
+            error: None,
+        };
+        store.proposals.push(proposal.clone());
+        if let Some(session) = store.sessions.iter_mut().find(|session| session.id == session_id) {
+            session.pending_approvals.push(proposal.id.clone());
+            session.updated_at = now_millis();
+        }
+        store.save_proposals()?;
+        store.save_sessions()?;
+        Ok(proposal)
+    })?;
+    app.emit("tool-proposal-created", &proposal)
+        .map_err(|err| format!("emit proposal failed: {err}"))?;
+    Ok(proposal)
+}
+
+async fn create_command_proposal(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    session_id: &str,
+    workspace: &Workspace,
+    args: CommandProposalArgs,
+) -> Result<ToolProposal, String> {
+    let cwd = args.cwd.unwrap_or_default();
+    let summary = args
+        .reason
+        .clone()
+        .unwrap_or_else(|| "模型建议执行本地命令".to_string());
+    let reason = args.reason.unwrap_or_else(|| "模型请求".to_string());
+    if !cwd.is_empty() {
+        let _ = resolve_workspace_file(workspace, &cwd)?;
+    }
+    let proposal = state.update(|store| {
+        let proposal = ToolProposal {
+            id: make_id("proposal"),
+            session_id: session_id.to_string(),
+            kind: "command".to_string(),
+            title: format!("运行命令 {}", args.command),
+            summary,
+            created_at: now_millis(),
+            status: "pending".to_string(),
+            payload: ToolProposalPayload::Command {
+                workspace_id: workspace.id.clone(),
+                cwd: cwd.clone(),
+                argv: vec!["/usr/bin/zsh".to_string(), "-lc".to_string(), args.command.clone()],
+                display_command: args.command.clone(),
+                reason,
+            },
+            latest_output: Some(String::new()),
+            error: None,
+        };
+        store.proposals.push(proposal.clone());
+        if let Some(session) = store.sessions.iter_mut().find(|session| session.id == session_id) {
+            session.pending_approvals.push(proposal.id.clone());
+            session.updated_at = now_millis();
+        }
+        store.save_proposals()?;
+        store.save_sessions()?;
+        Ok(proposal)
+    })?;
+    app.emit("tool-proposal-created", &proposal)
+        .map_err(|err| format!("emit proposal failed: {err}"))?;
+    Ok(proposal)
+}
+
+async fn run_command_proposal(
+    app: tauri::AppHandle,
+    state: SharedState,
+    proposal_id: String,
+) -> Result<(), String> {
+    let proposal = state.read(|store| {
+        store
+            .proposals
+            .iter()
+            .find(|proposal| proposal.id == proposal_id)
+            .cloned()
+    });
+    let proposal = proposal.ok_or_else(|| "proposal not found".to_string())?;
+    if proposal.status != "approved" {
+        return Err(format!("命令提案状态不是 approved，而是 `{}`。", proposal.status));
+    }
+
+    let ToolProposalPayload::Command {
+        workspace_id,
+        cwd,
+        argv,
+        ..
+    } = proposal.payload.clone()
+    else {
+        return Err("proposal is not a command".to_string());
+    };
+
+    let workspace = state
+        .read(|store| store.workspaces.iter().find(|workspace| workspace.id == workspace_id).cloned())
+        .ok_or_else(|| "workspace not found".to_string())?;
+    let cwd_path = if cwd.is_empty() {
+        Path::new(&workspace.path).to_path_buf()
+    } else {
+        resolve_workspace_file(&workspace, &cwd)?
+    };
+    if !cwd_path.exists() || !cwd_path.is_dir() {
+        return Err(format!("命令工作目录不存在：{}", cwd_path.display()));
+    }
+
+    let output_buffer = Arc::new(Mutex::new(String::new()));
+
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&cwd_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn command failed: {err}"))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| "failed to capture stdout".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "failed to capture stderr".to_string())?;
+    let proposal_id_stdout = proposal_id.clone();
+    let proposal_id_stderr = proposal_id.clone();
+    let app_stdout = app.clone();
+    let app_stderr = app.clone();
+    let stdout_buffer = output_buffer.clone();
+    let stderr_buffer = output_buffer.clone();
+
+    let stdout_handle = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let chunk = format!("{line}\n");
+            if let Ok(mut output) = stdout_buffer.lock() {
+                output.push_str(&chunk);
+                truncate_command_buffer(&mut output, 24_000);
+            }
+            let _ = app_stdout.emit(
+                "command-output",
+                CommandOutputEvent {
+                    proposal_id: proposal_id_stdout.clone(),
+                    chunk,
+                },
+            );
+        }
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let chunk = format!("{line}\n");
+            if let Ok(mut output) = stderr_buffer.lock() {
+                output.push_str(&chunk);
+                truncate_command_buffer(&mut output, 24_000);
+            }
+            let _ = app_stderr.emit(
+                "command-output",
+                CommandOutputEvent {
+                    proposal_id: proposal_id_stderr.clone(),
+                    chunk,
+                },
+            );
+        }
+    });
+
+    let status = child.wait().map_err(|err| format!("wait command failed: {err}"))?;
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    let exit_code = status.code().unwrap_or(-1);
+    let latest_output = output_buffer
+        .lock()
+        .map(|buffer| buffer.clone())
+        .unwrap_or_else(|_| String::new());
+    let updated = state.update(|store| {
+        let proposal = store
+            .proposals
+            .iter_mut()
+            .find(|proposal| proposal.id == proposal_id)
+            .ok_or_else(|| "proposal not found".to_string())?;
+        proposal.status = if exit_code == 0 {
+            "applied".to_string()
+        } else {
+            "failed".to_string()
+        };
+        proposal.latest_output = Some(if latest_output.trim().is_empty() {
+            format!("命令执行结束，exit code {exit_code}")
+        } else {
+            latest_output.clone()
+        });
+        if exit_code != 0 {
+            proposal.error = Some(format!("命令退出码为 {exit_code}"));
+        } else {
+            proposal.error = None;
+        }
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == proposal.session_id)
+        {
+            session.pending_approvals.retain(|entry| entry != &proposal_id);
+            session.updated_at = now_millis();
+        }
+        let cloned = proposal.clone();
+        store.save_proposals()?;
+        store.save_sessions()?;
+        Ok(cloned)
+    })?;
+
+    app.emit("approval-updated", &updated)
+        .map_err(|err| format!("emit approval update failed: {err}"))?;
+    app.emit(
+        "command-finished",
+        CommandFinishedEvent {
+            proposal_id,
+            exit_code,
+        },
+    )
+    .map_err(|err| format!("emit command finished failed: {err}"))?;
+    Ok(())
+}
+
+fn mark_proposal_failed(state: &SharedState, proposal_id: &str, error: &str) -> Result<ToolProposal, String> {
+    state.update(|store| {
+        let proposal = store
+            .proposals
+            .iter_mut()
+            .find(|proposal| proposal.id == proposal_id)
+            .ok_or_else(|| "proposal not found".to_string())?;
+        proposal.status = "failed".to_string();
+        proposal.error = Some(error.to_string());
+        proposal.latest_output = Some(error.to_string());
+        let cloned = proposal.clone();
+        store.save_proposals()?;
+        Ok(cloned)
+    })
+}
+
+fn persist_assistant_message(
+    state: &SharedState,
+    session_id: &str,
+    message_id: &str,
+    content: &str,
+    status: &str,
+) -> Result<String, String> {
+    state.update(|store| {
+        let session = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+        session.messages.push(ChatMessage {
+            id: message_id.to_string(),
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            timestamp: now_millis(),
+            status: status.to_string(),
+            attachments: Vec::new(),
+        });
+        session.updated_at = now_millis();
+        let title = session.title.clone();
+        store.save_sessions()?;
+        Ok(title)
+    })
+}
+
+async fn emit_streamed_reply(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    message_id: &str,
+    content: &str,
+) {
+    let chunks = chunk_string(content, 18);
+    for chunk in chunks {
+        let _ = app.emit(
+            "chat-stream-token",
+            ChatStreamTokenEvent {
+                session_id: session_id.to_string(),
+                message_id: message_id.to_string(),
+                delta: chunk,
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(18)).await;
+    }
+}
+
+fn build_system_prompt(workspace: Option<&Workspace>) -> String {
+    let workspace_summary = workspace.map(|workspace| {
+        format!(
+            "Current workspace: {} at {}. Recent files: {}.",
+            workspace.name,
+            workspace.path,
+            if workspace.recent_files.is_empty() {
+                "none".to_string()
+            } else {
+                workspace.recent_files.join(", ")
+            }
+        )
+    });
+    format!(
+        "You are Solo, a Linux coding assistant inside a desktop client. \
+        Default behavior: read files and list files directly when needed. \
+        Never claim to have changed files or executed commands until the user approves a proposal. \
+        Use propose_write_file for file edits and propose_run_command for shell commands. \
+        Keep replies concise and actionable. {}",
+        workspace_summary.unwrap_or_else(|| "No workspace is currently attached.".to_string())
+    )
+}
+
+fn current_session_workspace(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+) -> Result<Option<Workspace>, String> {
+    let workspace_id = store
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?
+        .workspace_id
+        .clone();
+
+    Ok(workspace_id.and_then(|workspace_id| {
+        store
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .cloned()
+    }))
+}
+
+enum ManualReplyBlock {
+    Write {
+        path: String,
+        content: String,
+        summary: Option<String>,
+    },
+    Command {
+        cwd: Option<String>,
+        command: String,
+        reason: Option<String>,
+    },
+}
+
+fn parse_manual_reply_blocks(content: &str) -> Result<Vec<ManualReplyBlock>, String> {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut blocks = Vec::new();
+
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if line.starts_with("```solo-write") || line.starts_with("```solo-command") {
+            let header = line.trim_start_matches("```").trim();
+            let mut body = Vec::new();
+            index += 1;
+            while index < lines.len() && lines[index].trim() != "```" {
+                body.push(lines[index]);
+                index += 1;
+            }
+            if index >= lines.len() {
+                return Err("外部回复里的代码块没有正常闭合。".to_string());
+            }
+
+            let attrs = parse_block_attrs(header);
+            if header.starts_with("solo-write") {
+                let path = attrs
+                    .iter()
+                    .find_map(|(key, value)| (key == "path").then(|| value.clone()))
+                    .ok_or_else(|| "solo-write 代码块缺少 path=...".to_string())?;
+                let summary = attrs
+                    .iter()
+                    .find_map(|(key, value)| (key == "summary").then(|| value.clone()));
+                blocks.push(ManualReplyBlock::Write {
+                    path,
+                    content: body.join("\n"),
+                    summary,
+                });
+            } else {
+                let cwd = attrs
+                    .iter()
+                    .find_map(|(key, value)| (key == "cwd").then(|| value.clone()));
+                let reason = attrs
+                    .iter()
+                    .find_map(|(key, value)| (key == "reason").then(|| value.clone()));
+                blocks.push(ManualReplyBlock::Command {
+                    cwd,
+                    command: body.join("\n").trim().to_string(),
+                    reason,
+                });
+            }
+        }
+        index += 1;
+    }
+
+    Ok(blocks)
+}
+
+fn parse_block_attrs(header: &str) -> Vec<(String, String)> {
+    header
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn create_manual_proposal(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+    workspace: &Workspace,
+    block: ManualReplyBlock,
+) -> Result<ToolProposal, String> {
+    match block {
+        ManualReplyBlock::Write { path, content, summary } => {
+            let absolute = resolve_workspace_file(workspace, &path)?;
+            let current = if absolute.exists() {
+                fs::read_to_string(&absolute).map_err(|err| format!("read current file failed: {err}"))?
+            } else {
+                String::new()
+            };
+            let proposal = ToolProposal {
+                id: make_id("proposal"),
+                session_id: session_id.to_string(),
+                kind: "write".to_string(),
+                title: format!("修改 {path}"),
+                summary: summary.unwrap_or_else(|| "外部回复建议修改文件".to_string()),
+                created_at: now_millis(),
+                status: "pending".to_string(),
+                payload: ToolProposalPayload::Write {
+                    workspace_id: workspace.id.clone(),
+                    relative_path: path.clone(),
+                    base_hash: crate::storage::hash_text(&current),
+                    diff_text: diff_text(&path, &current, &content),
+                    next_content_preview: content,
+                },
+                latest_output: None,
+                error: None,
+            };
+            store.proposals.push(proposal.clone());
+            Ok(proposal)
+        }
+        ManualReplyBlock::Command { cwd, command, reason } => {
+            if command.trim().is_empty() {
+                return Err("solo-command 代码块不能为空。".to_string());
+            }
+            if let Some(cwd) = &cwd {
+                let _ = resolve_workspace_file(workspace, cwd)?;
+            }
+            let cwd = cwd.unwrap_or_else(|| ".".to_string());
+            let proposal = ToolProposal {
+                id: make_id("proposal"),
+                session_id: session_id.to_string(),
+                kind: "command".to_string(),
+                title: format!("运行命令 {}", command.lines().next().unwrap_or("shell")),
+                summary: reason.clone().unwrap_or_else(|| "外部回复建议执行命令".to_string()),
+                created_at: now_millis(),
+                status: "pending".to_string(),
+                payload: ToolProposalPayload::Command {
+                    workspace_id: workspace.id.clone(),
+                    cwd,
+                    argv: vec!["/usr/bin/zsh".to_string(), "-lc".to_string(), command.clone()],
+                    display_command: command,
+                    reason: reason.unwrap_or_else(|| "外部回复".to_string()),
+                },
+                latest_output: Some(String::new()),
+                error: None,
+            };
+            store.proposals.push(proposal.clone());
+            Ok(proposal)
+        }
+    }
+}
+
+fn read_codex_auth_snapshot() -> Option<(bool, String, String)> {
+    let home = std::env::var("HOME").ok()?;
+    let auth_path = Path::new(&home).join(".codex").join("auth.json");
+    let content = fs::read_to_string(auth_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let auth_mode = value
+        .get("auth_mode")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let access_token = value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|token| token.as_str())
+        .unwrap_or("");
+
+    if access_token.is_empty() {
+        return Some((false, auth_mode, "Codex 未登录。".to_string()));
+    }
+
+    let method = if auth_mode.is_empty() {
+        "chatgpt".to_string()
+    } else {
+        auth_mode
+    };
+    Some((true, method.clone(), format!("已检测到 Codex 本地会话：{method}")))
+}
+
+fn normalize_settings(mut settings: Settings) -> Settings {
+    settings.provider = settings.provider.trim().to_string();
+    settings.base_url = settings.base_url.trim().trim_end_matches('/').to_string();
+    settings.api_key = settings.api_key.trim().to_string();
+    settings.model_id = settings.model_id.trim().to_string();
+    settings
+}
+
+fn validate_model_settings(settings: &Settings) -> Result<(), String> {
+    if settings.base_url.trim().is_empty() {
+        return Err("请先填写 Base URL。".to_string());
+    }
+    if settings.api_key.trim().is_empty() {
+        return Err("请先填写 API Key。".to_string());
+    }
+    if settings.model_id.trim().is_empty() {
+        return Err("请先填写 Model ID。".to_string());
+    }
+    Ok(())
+}
+
+fn build_augmented_user_message(input: &str, attachments: &[(String, String)]) -> String {
+    if attachments.is_empty() {
+        return input.to_string();
+    }
+
+    let mut content = String::from(input);
+    content.push_str("\n\nAttached files:\n");
+    for (path, body) in attachments {
+        content.push_str(&format!("\nFile: {path}\n```text\n{}\n```\n", truncate_for_model(body)));
+    }
+    content
+}
+
+fn chunk_string(input: &str, size: usize) -> Vec<String> {
+    let chars = input.chars().collect::<Vec<_>>();
+    chars
+        .chunks(size)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
+fn derive_session_title(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "新会话".to_string();
+    }
+    trimmed.chars().take(20).collect()
+}
+
+fn truncate_for_model(content: &str) -> String {
+    const MAX_CHARS: usize = 12_000;
+    let char_count = content.chars().count();
+    if char_count <= MAX_CHARS {
+        return content.to_string();
+    }
+    content.chars().take(MAX_CHARS).collect::<String>() + "\n...[truncated]"
+}
+
+fn truncate_command_buffer(output: &mut String, max_chars: usize) {
+    let count = output.chars().count();
+    if count <= max_chars {
+        return;
+    }
+    let keep = output.chars().skip(count - max_chars).collect::<String>();
+    *output = format!("...[output truncated]\n{keep}");
+}
+
+fn parse_args<T>(raw: &str) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(raw).map_err(|err| format!("invalid tool arguments: {err}"))
+}
+
+fn describe_tree(path: &Path, max_depth: u8, depth: u8) -> Result<String, String> {
+    if depth > max_depth {
+        return Ok(String::new());
+    }
+    let mut lines = Vec::new();
+    if depth == 0 {
+        lines.push(format!("{}{}", "  ".repeat(depth as usize), path.display()));
+    }
+    let mut entries = fs::read_dir(path)
+        .map_err(|err| format!("read directory failed: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("read directory failed: {err}"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let entry_path = entry.path();
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| "<invalid utf8>".to_string());
+        lines.push(format!(
+            "{}{}{}",
+            "  ".repeat((depth + 1) as usize),
+            if entry_path.is_dir() { "📁 " } else { "📄 " },
+            name
+        ));
+        if entry_path.is_dir() && depth + 1 < max_depth {
+            let nested = describe_tree(&entry_path, max_depth, depth + 1)?;
+            if !nested.is_empty() {
+                lines.push(nested);
+            }
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+#[derive(Deserialize)]
+struct CommandProposalArgs {
+    command: String,
+    cwd: Option<String>,
+    reason: Option<String>,
+}
