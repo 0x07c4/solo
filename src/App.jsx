@@ -265,7 +265,6 @@ function WorkspaceTreeNode({ node, level, selectedPath, onOpenFile }) {
           </span>
           <TreeIcon node={node} expanded={expanded} />
           <span className="tree-node-label">{node.name}</span>
-          {hasChildren ? <span className="tree-node-meta">{node.children.length}</span> : null}
         </button>
         {expanded && hasChildren ? (
           <div className="tree-children">
@@ -284,7 +283,6 @@ function WorkspaceTreeNode({ node, level, selectedPath, onOpenFile }) {
     );
   }
 
-  const extension = node.name.includes(".") ? node.name.split(".").at(-1) : "";
   return (
     <button
       type="button"
@@ -295,7 +293,6 @@ function WorkspaceTreeNode({ node, level, selectedPath, onOpenFile }) {
       <span className="tree-caret tree-caret-placeholder" aria-hidden="true" />
       <TreeIcon node={node} />
       <span className="tree-node-label">{node.name}</span>
-      {extension ? <span className="tree-node-meta">{extension.slice(0, 4)}</span> : null}
     </button>
   );
 }
@@ -1134,11 +1131,22 @@ export default function App() {
   const composerHint = !codexAuth.loggedIn
     ? "先登录 ChatGPT 才能发送。"
     : "Enter 发送，Shift+Enter 换行。";
+  const sessionMessageCount = activeSession?.messages?.length ?? 0;
   const workspaceStatusText = activeSessionWorkspaceId
     ? activeWorkspace?.name ?? "已挂载"
     : "纯对话";
   const modeLabel = layoutMode === "workbench" ? "Workbench" : "Chat";
-  const topbarContextLabel = activeWorkspace?.name ?? "chat";
+  const topbarContextLabel = layoutMode === "workbench" ? "workspace" : "chat";
+  const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
+  const inspectorSessionState = activeSession ? "active" : "idle";
+  const previewTitle = selectedFilePath || "暂无文件";
+  const previewStateLabel = previewState.loading
+    ? "loading"
+    : previewState.error
+      ? "error"
+      : filePreview
+        ? "ready"
+        : "empty";
 
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
@@ -1184,12 +1192,15 @@ export default function App() {
           onDoubleClick={() => void handleWindowToggleMaximize()}
         >
           <div className="topbar-brand">
-            <div className="topbar-trail" aria-label="current context">
-              <span className="topbar-app">solo</span>
-              <span className="topbar-separator">/</span>
-              <span className="topbar-context">{topbarContextLabel}</span>
+            <div className="topbar-route">
+              <div className="topbar-trail" aria-label="current context">
+                <span className="topbar-app">solo</span>
+                <span className="topbar-separator">/</span>
+                <span className="topbar-context">{topbarContextLabel}</span>
+              </div>
+              <span className="topbar-title-divider" aria-hidden="true" />
+              <h1>{activeSession?.title ?? "新会话"}</h1>
             </div>
-            <h1>{activeSession?.title ?? "新会话"}</h1>
           </div>
         </div>
         <div className="topbar-status">
@@ -1290,9 +1301,7 @@ export default function App() {
                     <span className="session-title">{session.title}</span>
                     <span className="list-badge">{session.messages?.length ?? 0}</span>
                   </div>
-                  <span className="session-meta">
-                    {session.workspaceId ? "工作区会话" : "纯对话会话"}
-                  </span>
+                  <span className="session-meta">{session.workspaceId ? "工作区" : "聊天"}</span>
                 </button>
               ))}
             </div>
@@ -1331,7 +1340,7 @@ export default function App() {
                     <div className="workspace-row">
                       <span className="workspace-title">{workspace.name}</span>
                       {workspace.id === activeSessionWorkspaceId ? (
-                        <span className="list-badge list-badge-accent">active</span>
+                        <span className="list-badge list-badge-accent">已挂载</span>
                       ) : null}
                     </div>
                     <span className="workspace-path">{workspace.path}</span>
@@ -1389,153 +1398,211 @@ export default function App() {
 
         <section className="chat-pane">
           <div className="chat-head">
-            <div className="chat-head-main">
-              <p className="section-eyebrow">Conversation</p>
-              <h2>{activeSession?.title ?? "新会话"}</h2>
-              <p className="chat-subtitle">
-                {layoutMode === "workbench"
-                  ? `已挂载工作区 ${activeWorkspace?.name ?? "workspace"}`
-                  : "当前为纯对话模式"}
-              </p>
-            </div>
-            <div className="compact-row">
-              {layoutMode === "workbench" ? (
-                <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                  纯对话
+            <div className="chat-head-shell">
+              <div className="chat-head-main">
+                <p className="section-eyebrow">Conversation</p>
+                <h2>{activeSession?.title ?? "新会话"}</h2>
+                <p className="chat-subtitle">
+                  {layoutMode === "workbench"
+                    ? `已挂载工作区 ${activeWorkspace?.name ?? "workspace"}`
+                    : "当前为纯对话模式"}
+                </p>
+              </div>
+              <div className="compact-row">
+                {layoutMode === "workbench" ? (
+                  <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
+                    纯对话
+                  </button>
+                ) : null}
+                <button type="button" className="ghost-button" onClick={handleCreateSession}>
+                  新会话
                 </button>
-              ) : null}
-              <button type="button" className="ghost-button" onClick={handleCreateSession}>
-                新会话
-              </button>
-              {!codexAuth.loggedIn ? (
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={codexChecking}
-                  onClick={handleCodexLogin}
-                >
-                  {codexChecking ? "登录中…" : "登录"}
-                </button>
-              ) : null}
-            </div>
-          </div>
-          <div className="chat-scroll">
-            {!codexAuth.loggedIn ? (
-              <div className="preview-card shell-card hero-card">
-                <p className="section-eyebrow">ChatGPT</p>
-                <h2>登录 ChatGPT</h2>
-                <p>{codexAuth.message}</p>
-                <div className="compact-row">
+                {!codexAuth.loggedIn ? (
                   <button
                     type="button"
                     className="primary-button"
                     disabled={codexChecking}
                     onClick={handleCodexLogin}
                   >
-                    {codexChecking ? "登录中…" : "登录 ChatGPT"}
+                    {codexChecking ? "登录中…" : "登录"}
                   </button>
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    disabled={codexChecking}
-                    onClick={handleRefreshCodexStatus}
-                  >
-                    {codexChecking ? "刷新中…" : "刷新状态"}
-                  </button>
-                </div>
-              </div>
-            ) : activeSession?.messages?.length ? (
-              <>
-                {activeSession.messages.map((message) => (
-                  <MessageBubble
-                    key={message.id}
-                    message={message}
-                    progress={
-                      message.id === activeStreamMessageId &&
-                      (message.status === "streaming" || message.status === "error")
-                        ? activeStreamProgress
-                        : []
-                    }
-                  />
-                ))}
-                {showPendingAssistant ? (
-                  <MessageBubble
-                    message={{
-                      id: "assistant_pending",
-                      role: "assistant",
-                      status: "streaming",
-                      content: pendingAssistantText,
-                    }}
-                    progress={activeStreamProgress}
-                  />
                 ) : null}
-              </>
-            ) : (
-              <div className="empty-state hero">
-                <p className="section-eyebrow">Chat</p>
-                <h2>直接在应用里对话。</h2>
-                <p>
-                  {layoutMode === "workbench"
-                    ? "你已经登录 ChatGPT，现在可以直接提问，也可以让 Solo 结合当前工作区继续分析。"
-                    : "你已经登录 ChatGPT，现在可以直接提问；需要代码上下文时再挂载工作区。"}
-                </p>
               </div>
-            )}
+            </div>
+          </div>
+          <div className="chat-scroll">
+            <div className="conversation-stack">
+              {!codexAuth.loggedIn ? (
+                <div className="shell-card hero-card">
+                  <p className="section-eyebrow">ChatGPT</p>
+                  <h2>登录 ChatGPT</h2>
+                  <p>{codexAuth.message}</p>
+                  <div className="compact-row">
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={codexChecking}
+                      onClick={handleCodexLogin}
+                    >
+                      {codexChecking ? "登录中…" : "登录 ChatGPT"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={codexChecking}
+                      onClick={handleRefreshCodexStatus}
+                    >
+                      {codexChecking ? "刷新中…" : "刷新状态"}
+                    </button>
+                  </div>
+                </div>
+              ) : activeSession?.messages?.length ? (
+                <>
+                  {activeSession.messages.map((message) => (
+                    <MessageBubble
+                      key={message.id}
+                      message={message}
+                      progress={
+                        message.id === activeStreamMessageId &&
+                        (message.status === "streaming" || message.status === "error")
+                          ? activeStreamProgress
+                          : []
+                      }
+                    />
+                  ))}
+                  {showPendingAssistant ? (
+                    <MessageBubble
+                      message={{
+                        id: "assistant_pending",
+                        role: "assistant",
+                        status: "streaming",
+                        content: pendingAssistantText,
+                      }}
+                      progress={activeStreamProgress}
+                    />
+                  ) : null}
+                </>
+              ) : (
+                <div className="empty-state hero">
+                  <p className="section-eyebrow">Chat</p>
+                  <h2>直接在应用里对话。</h2>
+                  <p>
+                    {layoutMode === "workbench"
+                      ? "你已经登录 ChatGPT，现在可以直接提问，也可以让 Solo 结合当前工作区继续分析。"
+                      : "你已经登录 ChatGPT，现在可以直接提问；需要代码上下文时再挂载工作区。"}
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="composer">
-            <textarea
-              className="composer-input"
-              value={draft}
-              disabled={!codexAuth.loggedIn || codexChecking || chatSending}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={handleComposerKeyDown}
-              placeholder="描述你要做的事，或者让 Solo 分析当前工作区。"
-            />
-            <div className="composer-actions">
-              <p className="composer-hint">{composerHint}</p>
-              <div className="composer-button-row">
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={!canSend}
-                  onClick={handleSend}
-                >
-                  发送
-                </button>
+            <div className="composer-shell">
+              <textarea
+                className="composer-input"
+                value={draft}
+                disabled={!codexAuth.loggedIn || codexChecking || chatSending}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
+                placeholder="描述你要做的事，或者让 Solo 分析当前工作区。"
+              />
+              <div className="composer-actions">
+                <p className="composer-hint">{composerHint}</p>
+                <div className="composer-button-row">
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={!canSend}
+                    onClick={handleSend}
+                  >
+                    发送
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         </section>
 
         <aside className="inspector">
-          <div className="section-header">
+          <div className="inspector-head">
             <div>
-              <p className="section-eyebrow">Workbench</p>
-              <h2>上下文面板</h2>
+              <p className="section-eyebrow">Inspector</p>
+              <h2>工具抽屉</h2>
+            </div>
+            <span className="section-count">{modeLabel}</span>
+          </div>
+
+          <div className="inspector-summary">
+            <div className="inspector-summary-item">
+              <span className="section-eyebrow">workspace</span>
+              <strong>{activeWorkspace?.name ?? "none"}</strong>
+            </div>
+            <div className="inspector-summary-item">
+              <span className="section-eyebrow">messages</span>
+              <strong>{sessionMessageCount}</strong>
             </div>
           </div>
 
           <div className="inspector-scroll">
-            <div className="info-card">
-              <span className="section-eyebrow">Workspace</span>
-              <strong>{activeWorkspace?.name ?? "未选择"}</strong>
-              <p>{activeWorkspace?.path ?? "添加工作区后，这里会显示当前目录。"}</p>
-            </div>
-
-            <div className="info-card">
-              <span className="section-eyebrow">Session</span>
-              <strong>{activeSession?.title ?? "暂无会话"}</strong>
-              <p>{activeSession ? `${activeSession.messages?.length ?? 0} 条消息` : "请先创建会话。"}</p>
-            </div>
-
-            <div className="preview-card">
-              <div className="preview-header">
-                <div>
-                  <span className="section-eyebrow">Preview</span>
-                  <strong>{selectedFilePath || "暂无文件"}</strong>
+            <section className="drawer-panel">
+              <div className="drawer-panel-head">
+                <div className="drawer-panel-title">
+                  <span className="section-eyebrow">Workspace</span>
+                  <strong>{activeWorkspace?.name ?? "未选择"}</strong>
+                </div>
+                <span className={`drawer-chip drawer-chip-${inspectorWorkspaceState}`}>
+                  {inspectorWorkspaceState}
+                </span>
+              </div>
+              <div className="drawer-meta-grid">
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">路径</span>
+                  <span className="drawer-meta-value drawer-meta-path">
+                    {activeWorkspace?.path ?? "添加工作区后，这里会显示当前目录。"}
+                  </span>
+                </div>
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">模式</span>
+                  <span className="drawer-meta-value">{layoutMode === "workbench" ? "workspace" : "chat-only"}</span>
                 </div>
               </div>
+            </section>
+
+            <section className="drawer-panel">
+              <div className="drawer-panel-head">
+                <div className="drawer-panel-title">
+                  <span className="section-eyebrow">Session</span>
+                  <strong>{activeSession?.title ?? "暂无会话"}</strong>
+                </div>
+                <span className={`drawer-chip drawer-chip-${inspectorSessionState}`}>
+                  {inspectorSessionState}
+                </span>
+              </div>
+              <div className="drawer-meta-grid">
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">消息</span>
+                  <span className="drawer-meta-value">
+                    {activeSession ? `${sessionMessageCount} 条消息` : "请先创建会话。"}
+                  </span>
+                </div>
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">上下文</span>
+                  <span className="drawer-meta-value">
+                    {activeSessionWorkspaceId ? "挂载工作区" : "纯对话会话"}
+                  </span>
+                </div>
+              </div>
+            </section>
+
+            <section className="drawer-panel drawer-panel-preview is-grow">
+              <div className="drawer-panel-head">
+                <div className="drawer-panel-title">
+                  <span className="section-eyebrow">Preview</span>
+                  <strong>{previewTitle}</strong>
+                </div>
+                <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateLabel}</span>
+              </div>
+              <div className="drawer-preview-body">
               {previewState.loading ? <p>正在读取文件…</p> : null}
               {previewState.error ? (
                 <div className="status-banner status-banner-error">
@@ -1555,7 +1622,8 @@ export default function App() {
               ) : (
                 <pre>从左侧文件树点开文件后，这里会显示内容。</pre>
               )}
-            </div>
+              </div>
+            </section>
           </div>
         </aside>
       </main>

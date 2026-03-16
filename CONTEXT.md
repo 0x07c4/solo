@@ -12,48 +12,61 @@
 
 ## 2. 已落地决策
 
-1. **对话通道优先 `codex_cli`**
+1. **`Solo` 的命名含义明确为“个人开发者可独立完成开发闭环”**
+   - 首先服务个人开发使用场景，而不是团队协作平台。
+   - 产品目标是让一个人用 Solo 就能完成对话、上下文理解、执行和确认闭环。
+
+2. **对话通道优先 `codex_cli`**
    - 不再依赖用户单独充值 API key 才能聊天。
    - 启动时会把 provider 调整到 `codex_cli`。
 
-2. **支持纯对话模式（无工作区）**
+3. **支持纯对话模式（无工作区）**
    - 不挂载文件夹也可直接聊天。
    - 只有需要代码上下文时才绑定工作区。
 
-3. **界面方向参考 ChatGPT + Copilot**
+4. **界面方向参考 ChatGPT + Copilot**
    - 左侧：会话 + 工作区
    - 中间：主对话
    - 右侧：上下文/文件预览
 
-4. **“生成中”状态放在消息区，不放输入区**
+5. **“生成中”状态放在消息区，不放输入区**
    - 输入区只保留输入提示。
 
-5. **UI 设计语言改为 ChatGPT + AstroNvim/LazyVim**
+6. **UI 设计语言改为 ChatGPT + AstroNvim/LazyVim**
    - 交互形态继续以对话为主，不做成伪编辑器。
    - 视觉系统借 editor chrome、紧凑信息密度和 pane 语言。
 
-6. **字体策略固定为“UI 无衬线 + Maple Mono NF CN”**
+7. **架构上吸收 Zed 的 ACP 思路**
+   - 不把模型能力、工作区能力和 UI 直接耦死在一起。
+   - 目标是走 adapter / capability / event 的 agent 内核分层，方便后续继续扩展。
+
+8. **字体策略固定为“UI 无衬线 + Maple Mono NF CN”**
    - 正文、按钮、标题仍以无衬线为主。
    - 路径、文件树、状态栏、badge、过程日志、预览区使用 `Maple Mono NF CN`。
 
-7. **布局模式改为自适应**
+9. **布局模式改为自适应**
    - 无工作区绑定时进入纯对话模式（弱化 workbench）。
    - 当前会话绑定工作区后进入 workbench 模式（三栏）。
 
-8. **继续吸收 Zed 的 UI 优点，但不做成编辑器**
+10. **继续吸收 Zed 的 UI 优点，但不做成编辑器**
    - 顶部 chrome 更薄、更像开发工具状态条。
    - 左侧栏更高密度，减少大卡片感，增强 pane/list 语言。
    - 目标是“开发工具感”，不是“网页控制台感”。
 
-9. **主页面固定一屏，不使用浏览器级滚动**
+11. **继续吸收 Neovim 的状态线与 pane 语言**
+   - 顶栏优先做成单行 statusline，而不是网页式信息卡。
+   - Section 标题、计数、路径和状态统一偏 monospace 工具感。
+   - 侧栏与右栏都按 editor pane 处理，减少漂浮卡片和夸张圆角。
+
+12. **主页面固定一屏，不使用浏览器级滚动**
    - 整个应用视口固定在 100vh。
    - 只允许聊天区、文件树、右侧面板等内部区域各自滚动。
 
-10. **移除系统白色标题栏，改为应用内自绘窗口 chrome**
+13. **移除系统白色标题栏，改为应用内自绘窗口 chrome**
    - Tauri 窗口禁用原生 decorations。
    - 顶部使用深色标题栏、拖拽区、自绘最小化/最大化/关闭按钮。
 
-11. **Git 历史只保留公开身份**
+14. **Git 历史只保留公开身份**
    - 仓库历史重写为单个 `Solo` 初始化提交。
    - 提交身份统一使用 GitHub `noreply`：`0x07c4 <0x07c4@users.noreply.github.com>`。
    - 不保留任何带个人邮箱、本地绝对路径或旧品牌历史的公开提交链。
@@ -67,8 +80,11 @@
 - 对话执行：`codex exec`（`codex_cli` 模式）
 - 主题：默认 `TokyoNight`，支持 Catppuccin / Gruvbox / Nord / One Dark / Dracula / Kanagawa
 - 布局：按当前会话是否绑定工作区自动切换 `chat / workbench`
+- 架构：继续向 Zed ACP 风格的 adapter / capability / event 分层靠拢
 - 字体：关键开发工具区域使用 `Maple Mono NF CN`
-- Chrome：顶部与侧栏已开始向 Zed 式紧凑 pane 风格收敛
+- Chrome：顶部已收成更接近 Neovim/Zed 的单行状态栏，侧栏已改成紧凑 pane section，右栏已改成工具抽屉式 inspector
+- Chat：消息区与输入区已开始收成居中的 conversation column，减少大面积空洞留白
+- Sidebar：已去掉大部分文件树 badge 和过亮列表装饰，继续往更安静的 editor list 收敛
 - Window：已切换为自绘深色标题栏，避免 Linux 默认白色系统栏破坏主题
 - Git：仓库历史将收敛为公开可推送的单提交初始化状态
 
@@ -83,6 +99,7 @@
 - [x] 建立 `Workbench Dark` 视觉方向，默认 TokyoNight
 - [x] 落地 `Maple Mono NF CN` 到关键开发工具区域
 - [x] 吸收 Zed 的薄 chrome / 高密度侧栏优点
+- [x] 吸收 Neovim 的状态线与 pane 语言
 - [x] 移除系统白标题栏，接管窗口顶部 chrome
 - [x] 清理公开 Git 历史中的个人身份与旧品牌残留
 

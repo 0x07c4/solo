@@ -2,6 +2,12 @@
 
 Solo is a Linux desktop AI workbench built with `React + Tauri`.
 
+The name `Solo` means:
+
+- it is built first for solo developers
+- the goal is that one person can use Solo to independently complete the development loop
+- chat, workspace context, execution guidance, and approval flow should eventually live in one desktop tool
+
 It is designed around two core modes:
 
 - `Chat`: direct conversation using the local `codex` CLI login state
@@ -11,6 +17,7 @@ Current direction:
 
 - ChatGPT-style conversation flow inside the app
 - Codex-style local workspace context when needed
+- Zed ACP-inspired agent architecture, so model/runtime and editor capabilities stay decoupled
 - streamed progress feedback during long replies
 - approval-based file edits and command execution
 - dark, editor-inspired desktop UI with theme switching
