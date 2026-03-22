@@ -5,13 +5,14 @@ mod storage;
 use crate::models::{
     ChatMessage, ChatSession, ChatStreamDoneEvent, ChatStreamStatusEvent, ChatStreamTokenEvent,
     CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent, ConnectionTestResult,
-    ManualImportResult, MessageAttachment, Settings, SettingsUpdate, ToolProposal,
-    ToolProposalPayload, Workspace,
+    ManualImportResult, MessageAttachment, SessionInteractionMode, Settings, SettingsUpdate,
+    ToolProposal, ToolProposalPayload, Workspace,
 };
 use crate::openai::{chat_completion, test_connection, CompletionMessage};
 use crate::storage::{
-    apply_write_proposal, build_workspace_tree, canonicalize_workspace, diff_text, make_id, now_millis,
-    preview_file_result, read_workspace_file, resolve_workspace_file, update_recent_files, SharedState,
+    apply_write_proposal, build_workspace_tree, canonicalize_workspace, diff_text, make_id,
+    now_millis, preview_file_result, read_workspace_file, resolve_workspace_file,
+    update_recent_files, SharedState,
 };
 use serde::Deserialize;
 use std::{
@@ -24,6 +25,21 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnExecutionMode {
+    QuickChat,
+    Agent,
+}
+
+impl From<SessionInteractionMode> for TurnExecutionMode {
+    fn from(value: SessionInteractionMode) -> Self {
+        match value {
+            SessionInteractionMode::Conversation => TurnExecutionMode::QuickChat,
+            SessionInteractionMode::WorkspaceCollaboration => TurnExecutionMode::Agent,
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -32,6 +48,7 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let state = SharedState::new(app.handle())?;
             app.manage(state);
@@ -47,6 +64,7 @@ pub fn run() {
             sessions_list,
             session_create,
             session_open,
+            session_mode_set,
             workspaces_list,
             workspace_add,
             workspace_remove,
@@ -66,10 +84,7 @@ pub fn run() {
 #[tauri::command]
 fn open_chatgpt_in_browser() -> Result<bool, String> {
     let url = "https://chatgpt.com/";
-    let candidates = [
-        ("xdg-open", vec![url]),
-        ("gio", vec!["open", url]),
-    ];
+    let candidates = [("xdg-open", vec![url]), ("gio", vec!["open", url])];
 
     let mut last_error = String::new();
     for (command, args) in candidates {
@@ -241,6 +256,7 @@ fn session_create(state: State<'_, SharedState>) -> Result<ChatSession, String> 
             title: "新会话".to_string(),
             created_at: timestamp,
             updated_at: timestamp,
+            interaction_mode: SessionInteractionMode::Conversation,
             workspace_id: None,
             messages: Vec::new(),
             pending_approvals: Vec::new(),
@@ -254,8 +270,39 @@ fn session_create(state: State<'_, SharedState>) -> Result<ChatSession, String> 
 #[tauri::command]
 fn session_open(session_id: String, state: State<'_, SharedState>) -> Result<ChatSession, String> {
     state
-        .read(|store| store.sessions.iter().find(|session| session.id == session_id).cloned())
+        .read(|store| {
+            store
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+        })
         .ok_or_else(|| "session not found".to_string())
+}
+
+#[tauri::command]
+fn session_mode_set(
+    session_id: String,
+    interaction_mode: SessionInteractionMode,
+    state: State<'_, SharedState>,
+) -> Result<ChatSession, String> {
+    state.update(|store| {
+        let session = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+        if interaction_mode == SessionInteractionMode::WorkspaceCollaboration
+            && session.workspace_id.is_none()
+        {
+            return Err("请先为当前会话挂载工作区，再进入工作区协作。".to_string());
+        }
+        session.interaction_mode = interaction_mode;
+        session.updated_at = now_millis();
+        let cloned = session.clone();
+        store.save_sessions()?;
+        Ok(cloned)
+    })
 }
 
 #[tauri::command]
@@ -268,7 +315,10 @@ fn workspace_add(path: String, state: State<'_, SharedState>) -> Result<Workspac
     let canonical = canonicalize_workspace(&path)?;
     state.update(|store| {
         let canonical_str = canonical.to_string_lossy().to_string();
-        if let Some(existing) = store.workspaces.iter().find(|workspace| workspace.path == canonical_str)
+        if let Some(existing) = store
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.path == canonical_str)
         {
             return Err(format!("工作区已存在：{}", existing.path));
         }
@@ -295,16 +345,29 @@ fn workspace_add(path: String, state: State<'_, SharedState>) -> Result<Workspac
 #[tauri::command]
 fn workspace_remove(workspace_id: String, state: State<'_, SharedState>) -> Result<bool, String> {
     state.update(|store| {
-        store.workspaces.retain(|workspace| workspace.id != workspace_id);
+        store
+            .workspaces
+            .retain(|workspace| workspace.id != workspace_id);
         for session in &mut store.sessions {
             if session.workspace_id.as_deref() == Some(workspace_id.as_str()) {
                 session.workspace_id = None;
+                session.interaction_mode = SessionInteractionMode::Conversation;
             }
         }
         for proposal in &mut store.proposals {
             let matches_workspace = match &proposal.payload {
-                ToolProposalPayload::Write { workspace_id: value, .. } => value == &workspace_id,
-                ToolProposalPayload::Command { workspace_id: value, .. } => value == &workspace_id,
+                ToolProposalPayload::Write {
+                    workspace_id: value,
+                    ..
+                } => value == &workspace_id,
+                ToolProposalPayload::Command {
+                    workspace_id: value,
+                    ..
+                } => value == &workspace_id,
+                ToolProposalPayload::Choice {
+                    workspace_id: value,
+                    ..
+                } => value == &workspace_id,
             };
             if matches_workspace && proposal.status == "pending" {
                 proposal.status = "rejected".to_string();
@@ -341,6 +404,9 @@ fn workspace_select(
             .find(|session| session.id == session_id)
             .ok_or_else(|| "session not found".to_string())?;
         session.workspace_id = next_workspace_id;
+        if session.workspace_id.is_none() {
+            session.interaction_mode = SessionInteractionMode::Conversation;
+        }
         session.updated_at = now_millis();
         let cloned = session.clone();
         store.save_sessions()?;
@@ -356,7 +422,13 @@ fn workspace_tree(
     state: State<'_, SharedState>,
 ) -> Result<crate::models::FileTreeNode, String> {
     let workspace = state
-        .read(|store| store.workspaces.iter().find(|workspace| workspace.id == workspace_id).cloned())
+        .read(|store| {
+            store
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .cloned()
+        })
         .ok_or_else(|| "workspace not found".to_string())?;
     build_workspace_tree(&workspace, max_depth.unwrap_or(4))
 }
@@ -385,6 +457,7 @@ async fn chat_send(
     session_id: String,
     input: String,
     attachment_paths: Option<Vec<String>>,
+    interaction_mode: SessionInteractionMode,
     app: tauri::AppHandle,
     state: State<'_, SharedState>,
 ) -> Result<ChatSession, String> {
@@ -412,9 +485,16 @@ async fn chat_send(
             .find(|session| session.id == session_id)
             .ok_or_else(|| "session not found".to_string())?;
 
+        if interaction_mode == SessionInteractionMode::WorkspaceCollaboration
+            && session.workspace_id.is_none()
+        {
+            return Err("请先为当前会话挂载工作区，再进入工作区协作。".to_string());
+        }
+
         if session.title == "新会话" && !input.trim().is_empty() {
             session.title = derive_session_title(&input);
         }
+        session.interaction_mode = interaction_mode.clone();
 
         let message_id = make_id("message");
         let attachment_refs = attachments
@@ -445,13 +525,16 @@ async fn chat_send(
 
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
+        let execution_mode = TurnExecutionMode::from(interaction_mode);
         if let Err(err) = process_chat_turn(
             app_handle.clone(),
             state_handle.clone(),
             session_id.clone(),
             latest_user_message_id,
+            input.clone(),
             attachments,
             effective_provider,
+            execution_mode,
         )
         .await
         {
@@ -467,15 +550,14 @@ async fn chat_send(
                 "chat-stream-done",
                 ChatStreamDoneEvent {
                     session_id: session_id.clone(),
-                    session_title: state_handle
-                        .read(|store| {
-                            store
-                                .sessions
-                                .iter()
-                                .find(|session| session.id == session_id)
-                                .map(|session| session.title.clone())
-                                .unwrap_or_else(|| "新会话".to_string())
-                        }),
+                    session_title: state_handle.read(|store| {
+                        store
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == session_id)
+                            .map(|session| session.title.clone())
+                            .unwrap_or_else(|| "新会话".to_string())
+                    }),
                     message_id: assistant_message_id,
                     content: format!("请求失败：{err}"),
                     status: "error".to_string(),
@@ -512,7 +594,10 @@ fn manual_import_assistant_reply(
             created.push(proposal);
         }
 
-        let proposal_ids = created.iter().map(|proposal| proposal.id.clone()).collect::<Vec<_>>();
+        let proposal_ids = created
+            .iter()
+            .map(|proposal| proposal.id.clone())
+            .collect::<Vec<_>>();
         let session = store
             .sessions
             .iter_mut()
@@ -580,7 +665,10 @@ fn approval_accept(
                     .find(|proposal| proposal.id == proposal_id)
                     .ok_or_else(|| "proposal not found".to_string())?;
                 if proposal.status != "pending" {
-                    return Err(format!("该提案当前状态为 `{}`，不能再次应用。", proposal.status));
+                    return Err(format!(
+                        "该提案当前状态为 `{}`，不能再次应用。",
+                        proposal.status
+                    ));
                 }
                 let workspace = store
                     .workspaces
@@ -602,7 +690,9 @@ fn approval_accept(
                     .iter_mut()
                     .find(|session| session.id == proposal.session_id)
                 {
-                    session.pending_approvals.retain(|entry| entry != &proposal_id);
+                    session
+                        .pending_approvals
+                        .retain(|entry| entry != &proposal_id);
                     session.updated_at = now_millis();
                 }
                 let cloned = proposal.clone();
@@ -626,7 +716,10 @@ fn approval_accept(
                     .find(|proposal| proposal.id == proposal_id)
                     .ok_or_else(|| "proposal not found".to_string())?;
                 if proposal.status != "pending" {
-                    return Err(format!("该提案当前状态为 `{}`，不能再次执行。", proposal.status));
+                    return Err(format!(
+                        "该提案当前状态为 `{}`，不能再次执行。",
+                        proposal.status
+                    ));
                 }
                 proposal.status = "approved".to_string();
                 proposal.error = None;
@@ -636,7 +729,9 @@ fn approval_accept(
                     .iter_mut()
                     .find(|session| session.id == proposal.session_id)
                 {
-                    session.pending_approvals.retain(|entry| entry != &proposal_id);
+                    session
+                        .pending_approvals
+                        .retain(|entry| entry != &proposal_id);
                     session.updated_at = now_millis();
                 }
                 let cloned = proposal.clone();
@@ -647,7 +742,13 @@ fn approval_accept(
             let _ = app.emit("approval-updated", &approved);
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = run_command_proposal(app_handle.clone(), state_handle.clone(), proposal_id.clone()).await {
+                if let Err(err) = run_command_proposal(
+                    app_handle.clone(),
+                    state_handle.clone(),
+                    proposal_id.clone(),
+                )
+                .await
+                {
                     let _ = mark_proposal_failed(&state_handle, &proposal_id, &err);
                     let _ = app_handle.emit(
                         "command-finished",
@@ -659,6 +760,40 @@ fn approval_accept(
                 }
             });
             Ok(approved)
+        }
+        ToolProposalPayload::Choice { .. } => {
+            let accepted = state_handle.update(|store| {
+                let proposal = store
+                    .proposals
+                    .iter_mut()
+                    .find(|proposal| proposal.id == proposal_id)
+                    .ok_or_else(|| "proposal not found".to_string())?;
+                if proposal.status != "pending" {
+                    return Err(format!(
+                        "该提案当前状态为 `{}`，不能再次采纳。",
+                        proposal.status
+                    ));
+                }
+                proposal.status = "applied".to_string();
+                proposal.error = None;
+                proposal.latest_output = Some("已采纳这个方向。".to_string());
+                if let Some(session) = store
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == proposal.session_id)
+                {
+                    session
+                        .pending_approvals
+                        .retain(|entry| entry != &proposal_id);
+                    session.updated_at = now_millis();
+                }
+                let cloned = proposal.clone();
+                store.save_proposals()?;
+                store.save_sessions()?;
+                Ok(cloned)
+            })?;
+            let _ = app.emit("approval-updated", &accepted);
+            Ok(accepted)
         }
     }
 }
@@ -676,7 +811,10 @@ fn approval_reject(
             .find(|proposal| proposal.id == proposal_id)
             .ok_or_else(|| "proposal not found".to_string())?;
         if proposal.status != "pending" {
-            return Err(format!("该提案当前状态为 `{}`，不能拒绝。", proposal.status));
+            return Err(format!(
+                "该提案当前状态为 `{}`，不能拒绝。",
+                proposal.status
+            ));
         }
         proposal.status = "rejected".to_string();
         proposal.error = None;
@@ -685,7 +823,9 @@ fn approval_reject(
             .iter_mut()
             .find(|session| session.id == proposal.session_id)
         {
-            session.pending_approvals.retain(|entry| entry != &proposal_id);
+            session
+                .pending_approvals
+                .retain(|entry| entry != &proposal_id);
             session.updated_at = now_millis();
         }
         let cloned = proposal.clone();
@@ -702,8 +842,10 @@ async fn process_chat_turn(
     state: SharedState,
     session_id: String,
     latest_user_message_id: String,
+    latest_user_input: String,
     attachment_paths: Vec<String>,
     effective_provider: String,
+    execution_mode: TurnExecutionMode,
 ) -> Result<(), String> {
     let snapshot = state.read(|store| {
         let settings = store.settings.clone();
@@ -712,13 +854,22 @@ async fn process_chat_turn(
             .iter()
             .find(|session| session.id == session_id)
             .cloned();
-        let workspace = session.as_ref().and_then(|session| {
-            session
-                .workspace_id
-                .as_ref()
-                .and_then(|workspace_id| store.workspaces.iter().find(|workspace| &workspace.id == workspace_id))
-                .cloned()
-        });
+        let workspace = if execution_mode == TurnExecutionMode::Agent {
+            session.as_ref().and_then(|session| {
+                session
+                    .workspace_id
+                    .as_ref()
+                    .and_then(|workspace_id| {
+                        store
+                            .workspaces
+                            .iter()
+                            .find(|workspace| &workspace.id == workspace_id)
+                    })
+                    .cloned()
+            })
+        } else {
+            None
+        };
         (settings, session, workspace)
     });
     let (mut settings, session, workspace) = snapshot;
@@ -737,10 +888,26 @@ async fn process_chat_turn(
         .collect::<Result<Vec<_>, String>>()?;
 
     let system_prompt = if settings.provider == "codex_cli" {
-        "You are ChatGPT. Reply naturally and directly. \
-         Do not introduce yourself unless asked. \
-         Do not mention internal model names unless the user explicitly asks."
-            .to_string()
+        match execution_mode {
+            TurnExecutionMode::QuickChat => {
+                "You are ChatGPT. Reply naturally and directly. \
+                 Treat this as a normal conversation turn, not a coding task. \
+                 A workspace may be attached to the session, but it is out of scope for this turn. \
+                 Do not inspect files, infer repository details, or silently switch into workspace-aware help. \
+                 Do not introduce yourself unless asked. \
+                 Do not mention internal model names unless the user explicitly asks."
+                    .to_string()
+            }
+            TurnExecutionMode::Agent => {
+                "You are ChatGPT in workspace-collaboration mode. \
+                 The current turn explicitly uses the attached workspace as context. \
+                 Be direct, concrete, and task-focused. \
+                 Inspect relevant files first and reference the files you actually looked at. \
+                 Do not give generic placeholder templates when workspace-specific analysis is expected. \
+                 Use the available workspace context when needed, but keep the human in control: frame file changes or command execution as suggestions or previews unless they are explicitly confirmed."
+                    .to_string()
+            }
+        }
     } else {
         build_system_prompt(workspace.as_ref())
     };
@@ -763,6 +930,8 @@ async fn process_chat_turn(
             app.clone(),
             session_id.clone(),
             assistant_message_id.clone(),
+            &latest_user_input,
+            execution_mode,
             &messages,
             workspace.as_ref(),
         )
@@ -805,15 +974,70 @@ async fn process_chat_turn(
         (reply, false)
     };
 
+    let mut generated_proposals = Vec::new();
+    if settings.provider == "codex_cli" {
+        let raw_reply = visible_reply.clone();
+        visible_reply = strip_manual_reply_blocks(&raw_reply).trim().to_string();
+
+        if let Some(active_workspace) = workspace.as_ref() {
+            let parsed_blocks = parse_manual_reply_blocks(&raw_reply).unwrap_or_default();
+            let choice_blocks = if parsed_blocks.is_empty() {
+                parse_reply_choice_blocks(&visible_reply)
+            } else {
+                Vec::new()
+            };
+            let proposal_blocks = if parsed_blocks.is_empty() {
+                choice_blocks
+            } else {
+                parsed_blocks
+            };
+            if !proposal_blocks.is_empty() {
+                generated_proposals = state.update(|store| {
+                    let created = create_reply_proposals(
+                        store,
+                        &session_id,
+                        active_workspace,
+                        proposal_blocks,
+                    )?;
+                    if !created.is_empty() {
+                        store.save_sessions()?;
+                        store.save_proposals()?;
+                    }
+                    Ok(created)
+                })?;
+
+                for proposal in &generated_proposals {
+                    let _ = app.emit("tool-proposal-created", proposal);
+                }
+            }
+        }
+    }
+
+    if !generated_proposals.is_empty() {
+        visible_reply = build_proposal_focused_reply(&visible_reply, &generated_proposals);
+    }
+
     if visible_reply.trim().is_empty() {
-        visible_reply = "我已经分析了当前请求；如果需要副作用操作，会在右侧生成待确认提案。".to_string();
+        visible_reply = if generated_proposals.is_empty() {
+            "我已经整理出当前请求的建议；如果涉及改动项目或运行命令，会先给出预览并等待你确认。".to_string()
+        } else {
+            format!(
+                "我整理了 {} 条建议，已经放到右侧等待你确认。",
+                generated_proposals.len()
+            )
+        };
     }
 
     if !reply_streamed_live {
         emit_streamed_reply(&app, &session_id, &assistant_message_id, &visible_reply).await;
     }
-    let session_title =
-        persist_assistant_message(&state, &session_id, &assistant_message_id, &visible_reply, "done")?;
+    let session_title = persist_assistant_message(
+        &state,
+        &session_id,
+        &assistant_message_id,
+        &visible_reply,
+        "done",
+    )?;
     app.emit(
         "chat-stream-done",
         ChatStreamDoneEvent {
@@ -829,10 +1053,44 @@ async fn process_chat_turn(
     Ok(())
 }
 
+fn build_proposal_focused_reply(reply: &str, proposals: &[ToolProposal]) -> String {
+    let count = proposals.len();
+    let title_summary = proposals
+        .iter()
+        .take(2)
+        .map(|proposal| proposal.title.as_str())
+        .collect::<Vec<_>>()
+        .join("、");
+    let conclusion = first_meaningful_reply_line(reply);
+
+    match conclusion {
+        Some(line) if !title_summary.is_empty() => format!(
+            "我整理了 {count} 条可确认建议，已放到右侧预览：{title_summary}。\n结论：{line}"
+        ),
+        Some(line) => format!("我整理了 {count} 条可确认建议，已放到右侧预览。\n结论：{line}"),
+        None if !title_summary.is_empty() => {
+            format!("我整理了 {count} 条可确认建议，已放到右侧预览：{title_summary}。")
+        }
+        None => format!("我整理了 {count} 条可确认建议，已放到右侧预览。"),
+    }
+}
+
+fn first_meaningful_reply_line(reply: &str) -> Option<String> {
+    reply.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("```"))
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| summarize_status_text(line, 120))
+        .find(|line| !line.is_empty())
+}
+
 async fn run_codex_chat_turn_streaming(
     app: tauri::AppHandle,
     session_id: String,
     message_id: String,
+    latest_user_input: &str,
+    execution_mode: TurnExecutionMode,
     messages: &[CompletionMessage],
     workspace: Option<&Workspace>,
 ) -> Result<(String, bool), String> {
@@ -841,17 +1099,39 @@ async fn run_codex_chat_turn_streaming(
         return Err("未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string());
     }
 
-    let prompt = build_codex_exec_prompt(messages);
+    let prompt = build_codex_exec_prompt(messages, execution_mode);
     let workspace_path = workspace.map(|entry| entry.path.clone());
+    let latest_user_input = latest_user_input.to_string();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let output_file = std::env::temp_dir().join(format!("solo-codex-reply-{}.txt", now_millis()));
+        let output_file =
+            std::env::temp_dir().join(format!("solo-codex-reply-{}.txt", now_millis()));
+        let (max_total_timeout, idle_timeout, no_text_warn_1, no_text_warn_2) =
+            if execution_mode == TurnExecutionMode::QuickChat {
+                (
+                    Duration::from_secs(180),
+                    Duration::from_secs(75),
+                    Duration::from_secs(15),
+                    Duration::from_secs(45),
+                )
+            } else {
+                (
+                    Duration::from_secs(600),
+                    Duration::from_secs(240),
+                    Duration::from_secs(30),
+                    Duration::from_secs(90),
+                )
+            };
         emit_chat_stream_status(
             &app,
             &session_id,
             &message_id,
             "准备",
-            "正在启动模型任务…",
+            if execution_mode == TurnExecutionMode::QuickChat {
+                "进入快速对话模式…"
+            } else {
+                "进入工作区协作模式…"
+            },
             "info",
         );
 
@@ -883,6 +1163,20 @@ async fn run_codex_chat_turn_streaming(
             );
         }
 
+        if execution_mode == TurnExecutionMode::QuickChat {
+            emit_chat_stream_status(
+                &app,
+                &session_id,
+                &message_id,
+                "快答",
+                &format!(
+                    "本轮只做直接回复，不读取工作区：{}",
+                    summarize_status_text(&latest_user_input, 48)
+                ),
+                "info",
+            );
+        }
+
         command.arg(&prompt);
         let mut child = command
             .spawn()
@@ -907,6 +1201,9 @@ async fn run_codex_chat_turn_streaming(
 
         let streamed_reply = Arc::new(Mutex::new(String::new()));
         let streamed_reply_stdout = Arc::clone(&streamed_reply);
+        let last_activity_at = Arc::new(Mutex::new(Instant::now()));
+        let last_activity_stdout = Arc::clone(&last_activity_at);
+        let last_activity_stderr = Arc::clone(&last_activity_at);
         let app_stdout = app.clone();
         let app_status = app.clone();
         let session_for_stdout = session_id.clone();
@@ -917,7 +1214,11 @@ async fn run_codex_chat_turn_streaming(
             let reader = BufReader::new(stdout);
             let mut last_status = String::new();
             for raw_line in reader.lines().map_while(Result::ok) {
-                if let Some((stage, detail, level)) = extract_codex_status_from_json_line(&raw_line) {
+                if let Ok(mut timestamp) = last_activity_stdout.lock() {
+                    *timestamp = Instant::now();
+                }
+                if let Some((stage, detail, level)) = extract_codex_status_from_json_line(&raw_line)
+                {
                     let key = format!("{stage}|{detail}|{level}");
                     if key != last_status {
                         last_status = key;
@@ -964,6 +1265,9 @@ async fn run_codex_chat_turn_streaming(
                 {
                     continue;
                 }
+                if let Ok(mut timestamp) = last_activity_stderr.lock() {
+                    *timestamp = Instant::now();
+                }
                 if let Ok(mut lines) = stderr_lines_capture.lock() {
                     lines.push(trimmed.to_string());
                 }
@@ -985,66 +1289,124 @@ async fn run_codex_chat_turn_streaming(
             }
         });
 
-        let timeout = Duration::from_secs(180);
         let started_at = Instant::now();
         let mut warned_no_text_20s = false;
         let mut warned_no_text_60s = false;
         let mut warned_near_timeout = false;
+        let mut warned_idle = false;
         let exit_status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     let elapsed = started_at.elapsed();
+                    let idle_elapsed = last_activity_at
+                        .lock()
+                        .map(|timestamp| timestamp.elapsed())
+                        .unwrap_or_default();
                     let no_stream_text = streamed_reply
                         .lock()
                         .map(|text| text.trim().is_empty())
                         .unwrap_or(true);
-                    if no_stream_text && !warned_no_text_20s && elapsed >= Duration::from_secs(20) {
+                    if no_stream_text && !warned_no_text_20s && elapsed >= no_text_warn_1 {
                         warned_no_text_20s = true;
                         emit_chat_stream_status(
                             &app,
                             &session_id,
                             &message_id,
                             "监控",
-                            "20 秒仍未收到正文输出，模型可能在长思考。",
+                            &format!(
+                                "{} 秒仍未收到正文输出，模型可能还在整理结果。",
+                                no_text_warn_1.as_secs()
+                            ),
                             "warn",
                         );
                     }
-                    if no_stream_text && !warned_no_text_60s && elapsed >= Duration::from_secs(60) {
+                    if no_stream_text && !warned_no_text_60s && elapsed >= no_text_warn_2 {
                         warned_no_text_60s = true;
                         emit_chat_stream_status(
                             &app,
                             &session_id,
                             &message_id,
                             "监控",
-                            "60 秒仍无正文输出，建议检查网络或重试。",
+                            &format!(
+                                "{} 秒仍无正文输出，继续等待中。",
+                                no_text_warn_2.as_secs()
+                            ),
                             "warn",
                         );
                     }
-                    if !warned_near_timeout && elapsed >= Duration::from_secs(150) {
+                    if !warned_idle && idle_elapsed >= idle_timeout / 2 {
+                        warned_idle = true;
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "监控",
+                            &format!(
+                                "已经 {} 秒没有新进展，仍在等待模型完成。",
+                                idle_elapsed.as_secs()
+                            ),
+                            "warn",
+                        );
+                    }
+                    if !warned_near_timeout
+                        && elapsed
+                            >= max_total_timeout
+                                .checked_sub(Duration::from_secs(60))
+                                .unwrap_or(max_total_timeout)
+                    {
                         warned_near_timeout = true;
                         emit_chat_stream_status(
                             &app,
                             &session_id,
                             &message_id,
                             "监控",
-                            "请求接近超时阈值（180 秒）。",
+                            &format!(
+                                "请求接近超时阈值（{} 秒）。",
+                                max_total_timeout.as_secs()
+                            ),
                             "warn",
                         );
                     }
-                    if started_at.elapsed() >= timeout {
+                    if idle_elapsed >= idle_timeout {
                         emit_chat_stream_status(
                             &app,
                             &session_id,
                             &message_id,
                             "超时",
-                            "180 秒内未收到完成信号。",
+                            &format!(
+                                "{} 秒没有任何新进展，终止本轮请求。",
+                                idle_timeout.as_secs()
+                            ),
                             "error",
                         );
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = fs::remove_file(&output_file);
-                        return Err("请求超时：180 秒内未收到模型完成信号，请重试。".to_string());
+                        return Err(format!(
+                            "请求超时：{} 秒没有任何新进展，请重试。",
+                            idle_timeout.as_secs()
+                        ));
+                    }
+                    if started_at.elapsed() >= max_total_timeout {
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "超时",
+                            &format!(
+                                "{} 秒内未收到模型完成信号。",
+                                max_total_timeout.as_secs()
+                            ),
+                            "error",
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = fs::remove_file(&output_file);
+                        return Err(format!(
+                            "请求超时：{} 秒内未收到模型完成信号，请重试。",
+                            max_total_timeout.as_secs()
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(150));
                 }
@@ -1061,7 +1423,10 @@ async fn run_codex_chat_turn_streaming(
 
         if !exit_status.success() {
             let mut error = if stderr_output.is_empty() {
-                format!("Codex 执行失败，退出码 {}", exit_status.code().unwrap_or(-1))
+                format!(
+                    "Codex 执行失败，退出码 {}",
+                    exit_status.code().unwrap_or(-1)
+                )
             } else {
                 stderr_output
             };
@@ -1169,6 +1534,10 @@ fn extract_codex_status_from_json_line(line: &str) -> Option<(String, String, St
         return None;
     }
 
+    if let Some(item_status) = extract_codex_item_status(event_type, &value) {
+        return Some(item_status);
+    }
+
     let (stage, level) = map_codex_event_stage(event_type);
     let detail = value
         .get("message")
@@ -1225,7 +1594,9 @@ fn extract_status_text(value: &serde_json::Value) -> Option<String> {
             }
         }
         serde_json::Value::Object(map) => {
-            for key in ["message", "summary", "status", "text", "detail", "name", "title"] {
+            for key in [
+                "message", "summary", "status", "text", "detail", "name", "title",
+            ] {
                 if let Some(text) = map.get(key).and_then(json_value_to_string) {
                     return Some(text);
                 }
@@ -1278,6 +1649,117 @@ fn is_noisy_codex_status(event_type: &str, detail: &str) -> bool {
     false
 }
 
+fn extract_codex_item_status(
+    event_type: &str,
+    value: &serde_json::Value,
+) -> Option<(String, String, String)> {
+    let item = value.get("item")?;
+    let item_type = item.get("type").and_then(|entry| entry.as_str()).unwrap_or_default();
+    if item_type.is_empty() {
+        return None;
+    }
+
+    match item_type {
+        "agent_message" => Some((
+            if event_type.contains("complete") || event_type.contains("completed") {
+                "生成回复"
+            } else {
+                "思考"
+            }
+            .to_string(),
+            if event_type.contains("complete") || event_type.contains("completed") {
+                "正在整理给你的建议与预览…"
+            } else {
+                "正在分析当前工作区…"
+            }
+            .to_string(),
+            "info".to_string(),
+        )),
+        "command_execution" => {
+            let command = item
+                .get("command")
+                .and_then(json_value_to_string)
+                .map(|text| summarize_command_execution(&text))
+                .filter(|text| !text.is_empty())?;
+            let started = event_type.contains("start");
+            let detail = if started {
+                command
+            } else {
+                format!("{command} 已完成")
+            };
+            Some(("执行工具".to_string(), detail, "info".to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn summarize_command_execution(command: &str) -> String {
+    let compact = summarize_status_text(command, 160);
+    let lower = compact.to_ascii_lowercase();
+
+    if lower.contains("rg --files") || lower.contains("find ") {
+        return "查找相关文件".to_string();
+    }
+    if lower.contains("git diff") {
+        return "查看当前代码改动".to_string();
+    }
+    if lower.contains("cargo check") {
+        return "检查 Rust 构建状态".to_string();
+    }
+    if lower.contains("cargo test") {
+        return "运行 Rust 测试".to_string();
+    }
+    if lower.contains("npm run build")
+        || lower.contains("pnpm build")
+        || lower.contains("yarn build")
+    {
+        return "检查前端构建状态".to_string();
+    }
+    if lower.contains("npm run lint")
+        || lower.contains("pnpm lint")
+        || lower.contains("yarn lint")
+    {
+        return "检查前端代码规范".to_string();
+    }
+    if lower.contains("npm run")
+        || lower.contains("pnpm ")
+        || lower.contains("yarn ")
+        || lower.contains("bun ")
+    {
+        return "运行项目脚本".to_string();
+    }
+    if let Some(path) = extract_path_like_token(command) {
+        return format!("查看 {}", summarize_status_text(&path, 56));
+    }
+
+    "查看工作区上下文".to_string()
+}
+
+fn extract_path_like_token(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        let cleaned = token.trim_matches(|char| matches!(char, '"' | '\'' | '(' | ')' | '[' | ']'));
+        if cleaned.contains('/') && cleaned.contains('.') {
+            Some(cleaned.to_string())
+        } else if cleaned.ends_with(".rs")
+            || cleaned.ends_with(".js")
+            || cleaned.ends_with(".jsx")
+            || cleaned.ends_with(".ts")
+            || cleaned.ends_with(".tsx")
+            || cleaned.ends_with(".md")
+            || cleaned.ends_with(".json")
+            || cleaned.ends_with(".toml")
+            || cleaned.ends_with(".c")
+            || cleaned.ends_with(".h")
+            || cleaned.ends_with(".cpp")
+            || cleaned.ends_with(".hpp")
+        {
+            Some(cleaned.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn extract_codex_delta_from_json_line(line: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     let event_type = value
@@ -1326,7 +1808,11 @@ fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
                 .iter()
                 .filter_map(|entry| entry.as_str())
                 .collect::<String>();
-            if merged.is_empty() { None } else { Some(merged) }
+            if merged.is_empty() {
+                None
+            } else {
+                Some(merged)
+            }
         }
         _ => None,
     }
@@ -1346,15 +1832,19 @@ fn summarize_status_text(input: &str, max_chars: usize) -> String {
     }
 }
 
-fn build_codex_exec_prompt(messages: &[CompletionMessage]) -> String {
+fn build_codex_exec_prompt(
+    messages: &[CompletionMessage],
+    execution_mode: TurnExecutionMode,
+) -> String {
     let model_hint = read_codex_config_model();
-
-    if let Some(last_user) = messages
+    let latest_user_text = messages
         .iter()
         .rev()
         .find(|message| message.role == "user")
         .and_then(|message| message.content.as_ref())
-    {
+        .map(|text| text.trim().to_string());
+
+    if let Some(last_user) = latest_user_text.as_deref() {
         let lower = last_user.to_lowercase();
         let asks_model =
             lower.contains("什么模型") || lower.contains("哪个模型") || lower.contains("model");
@@ -1362,21 +1852,45 @@ fn build_codex_exec_prompt(messages: &[CompletionMessage]) -> String {
             return if let Some(model) = model_hint {
                 format!("用户问的是当前模型型号。请只回复一句：当前使用的模型是 `{model}`。")
             } else {
-                "用户问的是当前模型型号。请只回复一句：当前无法从本机配置读取模型名称。"
-                    .to_string()
+                "用户问的是当前模型型号。请只回复一句：当前无法从本机配置读取模型名称。".to_string()
             };
         }
     }
 
     let mut lines = Vec::new();
-    lines.push(
-        "你是 ChatGPT。输出规则：\
-         1) 默认用简洁中文，先给结论，再补一句必要解释；\
-         2) 除非用户明确要求，不要长篇、不要分点教程、不要模板化免责声明；\
-         3) 不要自我介绍，不要谈产品归属，不要说“在这个场景里/作为助手”；\
-         4) 如果用户问“你是什么模型/型号”，且上下文里有“当前模型提示”，就直接回答这个模型名。"
+    let base_rules = match execution_mode {
+        TurnExecutionMode::QuickChat => "你是 ChatGPT。当前是快速对话模式。输出规则：\
+             1) 默认用简洁中文，先给结论，再补一句必要解释；\
+             2) 除非用户明确要求，不要长篇、不要分点教程、不要模板化免责声明；\
+             3) 不要自我介绍，不要谈产品归属，不要说“在这个场景里/作为助手”；\
+             4) 把这轮当普通聊天；即使当前会话挂了工作区，这一轮也不要主动分析仓库、代入开发任务或给执行计划；\
+             5) 如果用户问“你是什么模型/型号”，且上下文里有“当前模型提示”，就直接回答这个模型名。"
             .to_string(),
-    );
+        TurnExecutionMode::Agent => "你是 ChatGPT。当前是工作区协作模式。输出规则：\
+             1) 默认用简洁中文，先给结论，再补关键依据；\
+             2) 这一轮已经明确允许结合当前工作区协作，所以先查看相关文件，再回答，并明确提到你看了哪些文件；\
+             3) 优先给基于当前工作区的建议、选项、权衡和预览；\
+             4) 不要在工作区协作模式下给脱离仓库的空泛模板，除非用户明确说只要通用示例；\
+             5) 涉及写文件、执行命令或其他副作用动作时，不要默认替用户执行，应把决策权交给用户；\
+             6) 如果你建议修改文件，请在正常说明之外，附加 ```solo-write path=\"相对路径\" summary=\"一句话摘要\"``` 代码块，代码块内容必须是文件修改后的完整内容；\
+             7) 如果你建议执行命令，请在正常说明之外，附加 ```solo-command cwd=\".\" reason=\"一句话原因\"``` 代码块，代码块内容必须是要执行的命令；\
+             8) 如果用户问“你是什么模型/型号”，且上下文里有“当前模型提示”，就直接回答这个模型名。"
+            .to_string(),
+    };
+    lines.push(base_rules);
+    if execution_mode == TurnExecutionMode::Agent {
+        if let Some(last_user) = latest_user_text.as_deref() {
+            if workspace_collab_prefers_structured_preview(last_user) {
+                lines.push(
+                    "这轮用户期待的是“建议 + 预览”，不要只停留在口头点评。\
+                     如果你针对某个具体文件提出修改建议，至少给出一个 ```solo-write``` 候选改动块；\
+                     如果你建议执行命令，给出 ```solo-command``` 候选命令块；\
+                     即使用户没有明确说“帮我修改”，只要建议已经足够具体，也要把可确认的候选预览一起给出来。"
+                        .to_string(),
+                );
+            }
+        }
+    }
     if let Some(model) = read_codex_config_model() {
         lines.push(format!("当前模型提示：{model}"));
     }
@@ -1404,6 +1918,90 @@ fn build_codex_exec_prompt(messages: &[CompletionMessage]) -> String {
     lines.join("\n")
 }
 
+fn workspace_collab_prefers_structured_preview(input: &str) -> bool {
+    let normalized = input.trim().to_ascii_lowercase();
+    let normalized_zh = input.trim();
+
+    let preview_keywords = [
+        "suggest",
+        "suggestion",
+        "preview",
+        "propose",
+        "proposal",
+        "rewrite",
+        "revise",
+        "edit",
+        "update",
+        "improve",
+        "improvement",
+        "polish",
+        "review",
+        "refine",
+    ];
+    if preview_keywords
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+    {
+        return true;
+    }
+
+    let preview_keywords_zh = [
+        "建议",
+        "预览",
+        "改一下",
+        "改改",
+        "修改",
+        "润色",
+        "优化",
+        "重写",
+        "重构",
+        "审查",
+        "评估",
+        "看看",
+        "review",
+    ];
+    if preview_keywords_zh
+        .iter()
+        .any(|keyword| normalized_zh.contains(keyword))
+    {
+        return true;
+    }
+
+    references_workspace_file(input)
+}
+
+fn references_workspace_file(input: &str) -> bool {
+    let text = input.trim();
+    if text.contains('/') || text.contains('\\') {
+        return true;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let known_file_names = [
+        "readme",
+        "package.json",
+        "cargo.toml",
+        "app.jsx",
+        "app.css",
+        "context.md",
+    ];
+    if known_file_names.iter().any(|name| lower.contains(name)) {
+        return true;
+    }
+
+    lower.contains(".md")
+        || lower.contains(".rs")
+        || lower.contains(".tsx")
+        || lower.contains(".jsx")
+        || lower.contains(".ts")
+        || lower.contains(".js")
+        || lower.contains(".json")
+        || lower.contains(".toml")
+        || lower.contains(".css")
+        || lower.contains(".yml")
+        || lower.contains(".yaml")
+}
+
 fn read_codex_config_model() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let config_path = Path::new(&home).join(".codex").join("config.toml");
@@ -1414,7 +2012,11 @@ fn read_codex_config_model() -> Option<String> {
             continue;
         }
         let (_, value) = trimmed.split_once('=')?;
-        let model = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        let model = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
         if !model.is_empty() {
             return Some(model);
         }
@@ -1445,10 +2047,12 @@ async fn handle_tool_call(
                 return "No active workspace is attached to this session".to_string();
             };
             let root = match &args.path {
-                Some(relative_path) if !relative_path.is_empty() => match resolve_workspace_file(workspace, relative_path) {
-                    Ok(path) => path,
-                    Err(err) => return err,
-                },
+                Some(relative_path) if !relative_path.is_empty() => {
+                    match resolve_workspace_file(workspace, relative_path) {
+                        Ok(path) => path,
+                        Err(err) => return err,
+                    }
+                }
                 _ => Path::new(&workspace.path).to_path_buf(),
             };
             match describe_tree(&root, args.max_depth.unwrap_or(2), 0) {
@@ -1471,13 +2075,21 @@ async fn handle_tool_call(
             match read_workspace_file(workspace, &args.path) {
                 Ok(file) => {
                     let _ = state.update(|store| {
-                        if let Some(workspace) = store.workspaces.iter_mut().find(|entry| entry.id == workspace.id) {
+                        if let Some(workspace) = store
+                            .workspaces
+                            .iter_mut()
+                            .find(|entry| entry.id == workspace.id)
+                        {
                             update_recent_files(workspace, &args.path);
                             store.save_workspaces()?;
                         }
                         Ok(())
                     });
-                    format!("FILE {}\n```text\n{}\n```", args.path, truncate_for_model(&file.content))
+                    format!(
+                        "FILE {}\n```text\n{}\n```",
+                        args.path,
+                        truncate_for_model(&file.content)
+                    )
                 }
                 Err(err) => format!("Failed to read file: {err}"),
             }
@@ -1499,7 +2111,16 @@ async fn handle_tool_call(
             if !settings.confirm_writes {
                 return "Write proposals are disabled because confirm_writes is false".to_string();
             }
-            match create_write_proposal(app, state, session_id, workspace, &args.path, &args.content, args.summary).await
+            match create_write_proposal(
+                app,
+                state,
+                session_id,
+                workspace,
+                &args.path,
+                &args.content,
+                args.summary,
+            )
+            .await
             {
                 Ok(proposal) => format!("Created write proposal {} for {}", proposal.id, args.path),
                 Err(err) => format!("Failed to create write proposal: {err}"),
@@ -1520,7 +2141,8 @@ async fn handle_tool_call(
                 return "No active workspace is attached to this session".to_string();
             };
             if !settings.confirm_commands {
-                return "Command proposals are disabled because confirm_commands is false".to_string();
+                return "Command proposals are disabled because confirm_commands is false"
+                    .to_string();
             }
             let command_args = CommandProposalArgs {
                 command: args.command,
@@ -1548,7 +2170,8 @@ async fn create_write_proposal(
     let proposal = state.update(|store| {
         let absolute = resolve_workspace_file(workspace, relative_path)?;
         let current = if absolute.exists() {
-            fs::read_to_string(&absolute).map_err(|err| format!("read current file failed: {err}"))?
+            fs::read_to_string(&absolute)
+                .map_err(|err| format!("read current file failed: {err}"))?
         } else {
             String::new()
         };
@@ -1571,7 +2194,11 @@ async fn create_write_proposal(
             error: None,
         };
         store.proposals.push(proposal.clone());
-        if let Some(session) = store.sessions.iter_mut().find(|session| session.id == session_id) {
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
             session.pending_approvals.push(proposal.id.clone());
             session.updated_at = now_millis();
         }
@@ -1612,7 +2239,11 @@ async fn create_command_proposal(
             payload: ToolProposalPayload::Command {
                 workspace_id: workspace.id.clone(),
                 cwd: cwd.clone(),
-                argv: vec!["/usr/bin/zsh".to_string(), "-lc".to_string(), args.command.clone()],
+                argv: vec![
+                    "/usr/bin/zsh".to_string(),
+                    "-lc".to_string(),
+                    args.command.clone(),
+                ],
                 display_command: args.command.clone(),
                 reason,
             },
@@ -1620,7 +2251,11 @@ async fn create_command_proposal(
             error: None,
         };
         store.proposals.push(proposal.clone());
-        if let Some(session) = store.sessions.iter_mut().find(|session| session.id == session_id) {
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
             session.pending_approvals.push(proposal.id.clone());
             session.updated_at = now_millis();
         }
@@ -1647,7 +2282,10 @@ async fn run_command_proposal(
     });
     let proposal = proposal.ok_or_else(|| "proposal not found".to_string())?;
     if proposal.status != "approved" {
-        return Err(format!("命令提案状态不是 approved，而是 `{}`。", proposal.status));
+        return Err(format!(
+            "命令提案状态不是 approved，而是 `{}`。",
+            proposal.status
+        ));
     }
 
     let ToolProposalPayload::Command {
@@ -1661,7 +2299,13 @@ async fn run_command_proposal(
     };
 
     let workspace = state
-        .read(|store| store.workspaces.iter().find(|workspace| workspace.id == workspace_id).cloned())
+        .read(|store| {
+            store
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .cloned()
+        })
         .ok_or_else(|| "workspace not found".to_string())?;
     let cwd_path = if cwd.is_empty() {
         Path::new(&workspace.path).to_path_buf()
@@ -1682,8 +2326,14 @@ async fn run_command_proposal(
         .spawn()
         .map_err(|err| format!("spawn command failed: {err}"))?;
 
-    let stdout = child.stdout.take().ok_or_else(|| "failed to capture stdout".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "failed to capture stderr".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture stderr".to_string())?;
     let proposal_id_stdout = proposal_id.clone();
     let proposal_id_stderr = proposal_id.clone();
     let app_stdout = app.clone();
@@ -1724,7 +2374,9 @@ async fn run_command_proposal(
         }
     });
 
-    let status = child.wait().map_err(|err| format!("wait command failed: {err}"))?;
+    let status = child
+        .wait()
+        .map_err(|err| format!("wait command failed: {err}"))?;
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
 
@@ -1759,7 +2411,9 @@ async fn run_command_proposal(
             .iter_mut()
             .find(|session| session.id == proposal.session_id)
         {
-            session.pending_approvals.retain(|entry| entry != &proposal_id);
+            session
+                .pending_approvals
+                .retain(|entry| entry != &proposal_id);
             session.updated_at = now_millis();
         }
         let cloned = proposal.clone();
@@ -1781,7 +2435,11 @@ async fn run_command_proposal(
     Ok(())
 }
 
-fn mark_proposal_failed(state: &SharedState, proposal_id: &str, error: &str) -> Result<ToolProposal, String> {
+fn mark_proposal_failed(
+    state: &SharedState,
+    proposal_id: &str,
+    error: &str,
+) -> Result<ToolProposal, String> {
     state.update(|store| {
         let proposal = store
             .proposals
@@ -1889,6 +2547,37 @@ fn current_session_workspace(
     }))
 }
 
+fn create_reply_proposals(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+    workspace: &Workspace,
+    blocks: Vec<ManualReplyBlock>,
+) -> Result<Vec<ToolProposal>, String> {
+    let mut created = Vec::new();
+    for block in blocks {
+        let proposal = create_manual_proposal(store, session_id, workspace, block)?;
+        created.push(proposal);
+    }
+
+    if created.is_empty() {
+        return Ok(created);
+    }
+
+    let proposal_ids = created
+        .iter()
+        .map(|proposal| proposal.id.clone())
+        .collect::<Vec<_>>();
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    session.pending_approvals.extend(proposal_ids);
+    session.updated_at = now_millis();
+
+    Ok(created)
+}
+
 enum ManualReplyBlock {
     Write {
         path: String,
@@ -1899,6 +2588,10 @@ enum ManualReplyBlock {
         cwd: Option<String>,
         command: String,
         reason: Option<String>,
+    },
+    Choice {
+        option_key: String,
+        detail: String,
     },
 }
 
@@ -1955,15 +2648,180 @@ fn parse_manual_reply_blocks(content: &str) -> Result<Vec<ManualReplyBlock>, Str
     Ok(blocks)
 }
 
+fn strip_manual_reply_blocks(content: &str) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut kept = Vec::new();
+
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if line.starts_with("```solo-write") || line.starts_with("```solo-command") {
+            index += 1;
+            while index < lines.len() && lines[index].trim() != "```" {
+                index += 1;
+            }
+            if index < lines.len() {
+                index += 1;
+            }
+            continue;
+        }
+
+        kept.push(lines[index]);
+        index += 1;
+    }
+
+    kept.join("\n").trim().to_string()
+}
+
+fn parse_reply_choice_blocks(content: &str) -> Vec<ManualReplyBlock> {
+    let lower = content.to_ascii_lowercase();
+    let looks_like_selection = [
+        "你现在直接选",
+        "可以选",
+        "选一个",
+        "两个方向",
+        "两种方案",
+        "下一步可以走",
+        "其中一种预览",
+        "两个版本",
+        "两个方案",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || content.contains("A：")
+        || content.contains("A:")
+        || content.contains("B：")
+        || content.contains("B:");
+
+    if !looks_like_selection {
+        return Vec::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut in_selection_group = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized_line = trimmed.trim_start_matches('-').trim_start_matches('*').trim();
+        let lower_line = normalized_line.to_ascii_lowercase();
+        if [
+            "你现在直接选",
+            "可以选",
+            "选一个",
+            "其中一种预览",
+            "两个方向",
+            "两种方案",
+            "两个版本",
+        ]
+        .iter()
+        .any(|needle| lower_line.contains(needle))
+        {
+            in_selection_group = true;
+            continue;
+        }
+        let normalized = trimmed
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim();
+        let Some((raw_key, detail)) = normalized.split_once([':', '：']) else {
+            if in_selection_group && (trimmed.starts_with('-') || trimmed.starts_with('*')) {
+                blocks.push(ManualReplyBlock::Choice {
+                    option_key: (blocks.len() + 1).to_string(),
+                    detail: summarize_status_text(normalized, 240),
+                });
+                continue;
+            }
+            if in_selection_group {
+                break;
+            }
+            continue;
+        };
+        let key = raw_key.trim().trim_end_matches(['.', '、', ')']).trim();
+        let is_option_key = matches!(key, "A" | "B" | "C" | "1" | "2" | "3");
+        if !is_option_key {
+            continue;
+        }
+        let detail = detail.trim();
+        if detail.is_empty() {
+            continue;
+        }
+        blocks.push(ManualReplyBlock::Choice {
+            option_key: key.to_string(),
+            detail: summarize_status_text(detail, 240),
+        });
+    }
+
+    blocks
+}
+
 fn parse_block_attrs(header: &str) -> Vec<(String, String)> {
-    header
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=')?;
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect()
+    let mut chars = header.chars().peekable();
+    while let Some(ch) = chars.peek() {
+        if ch.is_whitespace() {
+            break;
+        }
+        chars.next();
+    }
+
+    let mut attrs = Vec::new();
+    loop {
+        while let Some(ch) = chars.peek() {
+            if ch.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut key = String::new();
+        while let Some(ch) = chars.peek() {
+            if *ch == '=' || ch.is_whitespace() {
+                break;
+            }
+            key.push(*ch);
+            chars.next();
+        }
+        if key.is_empty() {
+            break;
+        }
+
+        if chars.peek() != Some(&'=') {
+            while let Some(ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                chars.next();
+            }
+            continue;
+        }
+        chars.next();
+
+        let mut value = String::new();
+        let quoted = matches!(chars.peek(), Some('"') | Some('\''));
+        let quote_char = if quoted { chars.next() } else { None };
+
+        while let Some(ch) = chars.peek() {
+            if let Some(quote) = quote_char {
+                if *ch == quote {
+                    chars.next();
+                    break;
+                }
+            } else if ch.is_whitespace() {
+                break;
+            }
+            value.push(*ch);
+            chars.next();
+        }
+
+        attrs.push((key, value));
+    }
+
+    attrs
 }
 
 fn create_manual_proposal(
@@ -1973,10 +2831,15 @@ fn create_manual_proposal(
     block: ManualReplyBlock,
 ) -> Result<ToolProposal, String> {
     match block {
-        ManualReplyBlock::Write { path, content, summary } => {
+        ManualReplyBlock::Write {
+            path,
+            content,
+            summary,
+        } => {
             let absolute = resolve_workspace_file(workspace, &path)?;
             let current = if absolute.exists() {
-                fs::read_to_string(&absolute).map_err(|err| format!("read current file failed: {err}"))?
+                fs::read_to_string(&absolute)
+                    .map_err(|err| format!("read current file failed: {err}"))?
             } else {
                 String::new()
             };
@@ -2001,7 +2864,11 @@ fn create_manual_proposal(
             store.proposals.push(proposal.clone());
             Ok(proposal)
         }
-        ManualReplyBlock::Command { cwd, command, reason } => {
+        ManualReplyBlock::Command {
+            cwd,
+            command,
+            reason,
+        } => {
             if command.trim().is_empty() {
                 return Err("solo-command 代码块不能为空。".to_string());
             }
@@ -2014,17 +2881,43 @@ fn create_manual_proposal(
                 session_id: session_id.to_string(),
                 kind: "command".to_string(),
                 title: format!("运行命令 {}", command.lines().next().unwrap_or("shell")),
-                summary: reason.clone().unwrap_or_else(|| "外部回复建议执行命令".to_string()),
+                summary: reason
+                    .clone()
+                    .unwrap_or_else(|| "外部回复建议执行命令".to_string()),
                 created_at: now_millis(),
                 status: "pending".to_string(),
                 payload: ToolProposalPayload::Command {
                     workspace_id: workspace.id.clone(),
                     cwd,
-                    argv: vec!["/usr/bin/zsh".to_string(), "-lc".to_string(), command.clone()],
+                    argv: vec![
+                        "/usr/bin/zsh".to_string(),
+                        "-lc".to_string(),
+                        command.clone(),
+                    ],
                     display_command: command,
                     reason: reason.unwrap_or_else(|| "外部回复".to_string()),
                 },
                 latest_output: Some(String::new()),
+                error: None,
+            };
+            store.proposals.push(proposal.clone());
+            Ok(proposal)
+        }
+        ManualReplyBlock::Choice { option_key, detail } => {
+            let proposal = ToolProposal {
+                id: make_id("proposal"),
+                session_id: session_id.to_string(),
+                kind: "choice".to_string(),
+                title: format!("采用方向 {option_key}"),
+                summary: detail.clone(),
+                created_at: now_millis(),
+                status: "pending".to_string(),
+                payload: ToolProposalPayload::Choice {
+                    workspace_id: workspace.id.clone(),
+                    option_key,
+                    detail,
+                },
+                latest_output: None,
                 error: None,
             };
             store.proposals.push(proposal.clone());
@@ -2060,7 +2953,11 @@ fn read_codex_auth_snapshot() -> Option<(bool, String, String)> {
     } else {
         auth_mode
     };
-    Some((true, method.clone(), format!("已检测到 Codex 本地会话：{method}")))
+    Some((
+        true,
+        method.clone(),
+        format!("已检测到 Codex 本地会话：{method}"),
+    ))
 }
 
 fn normalize_settings(mut settings: Settings) -> Settings {
@@ -2092,7 +2989,10 @@ fn build_augmented_user_message(input: &str, attachments: &[(String, String)]) -
     let mut content = String::from(input);
     content.push_str("\n\nAttached files:\n");
     for (path, body) in attachments {
-        content.push_str(&format!("\nFile: {path}\n```text\n{}\n```\n", truncate_for_model(body)));
+        content.push_str(&format!(
+            "\nFile: {path}\n```text\n{}\n```\n",
+            truncate_for_model(body)
+        ));
     }
     content
 }
@@ -2161,7 +3061,11 @@ fn describe_tree(path: &Path, max_depth: u8, depth: u8) -> Result<String, String
         lines.push(format!(
             "{}{}{}",
             "  ".repeat((depth + 1) as usize),
-            if entry_path.is_dir() { "📁 " } else { "📄 " },
+            if entry_path.is_dir() {
+                "📁 "
+            } else {
+                "📄 "
+            },
             name
         ));
         if entry_path.is_dir() && depth + 1 < max_depth {

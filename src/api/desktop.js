@@ -12,6 +12,8 @@ export const desktop = {
   sessionsList: () => invoke("sessions_list"),
   sessionCreate: () => invoke("session_create"),
   sessionOpen: (sessionId) => invoke("session_open", { sessionId }),
+  sessionModeSet: (sessionId, interactionMode) =>
+    invoke("session_mode_set", { sessionId, interactionMode }),
   workspacesList: () => invoke("workspaces_list"),
   workspaceAdd: (path) => invoke("workspace_add", { path }),
   workspaceRemove: (workspaceId) => invoke("workspace_remove", { workspaceId }),
@@ -21,8 +23,8 @@ export const desktop = {
     invoke("workspace_tree", { workspaceId, maxDepth }),
   workspaceReadFile: (workspaceId, relativePath) =>
     invoke("workspace_read_file", { workspaceId, relativePath }),
-  chatSend: (sessionId, input, attachmentPaths) =>
-    invoke("chat_send", { sessionId, input, attachmentPaths }),
+  chatSend: (sessionId, input, attachmentPaths, interactionMode) =>
+    invoke("chat_send", { sessionId, input, attachmentPaths, interactionMode }),
   manualImportAssistantReply: (sessionId, content) =>
     invoke("manual_import_assistant_reply", { sessionId, content }),
   approvalList: (sessionId = null) => invoke("approval_list", { sessionId }),

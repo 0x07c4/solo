@@ -1,5 +1,6 @@
 use crate::models::{
-    ChatSession, FileReadResult, FileTreeNode, Settings, ToolProposal, ToolProposalPayload, Workspace,
+    ChatSession, FileReadResult, FileTreeNode, Settings, ToolProposal, ToolProposalPayload,
+    Workspace,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,12 +62,20 @@ impl SharedState {
     }
 
     pub fn read<R>(&self, f: impl FnOnce(&Store) -> R) -> R {
-        let guard = self.0.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self
+            .0
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&guard)
     }
 
     pub fn update<R>(&self, f: impl FnOnce(&mut Store) -> Result<R, String>) -> Result<R, String> {
-        let mut guard = self.0.store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .0
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut guard)
     }
 }
@@ -104,7 +113,11 @@ impl Store {
         let mut proposals = self
             .proposals
             .iter()
-            .filter(|proposal| session_id.map(|id| proposal.session_id == id).unwrap_or(true))
+            .filter(|proposal| {
+                session_id
+                    .map(|id| proposal.session_id == id)
+                    .unwrap_or(true)
+            })
             .cloned()
             .collect::<Vec<_>>();
         proposals.sort_by(|left, right| match right.created_at.cmp(&left.created_at) {
@@ -127,7 +140,8 @@ pub fn make_id(prefix: &str) -> String {
 }
 
 pub fn canonicalize_workspace(path: &str) -> Result<PathBuf, String> {
-    let canonical = fs::canonicalize(path).map_err(|err| format!("open workspace failed: {err}"))?;
+    let canonical =
+        fs::canonicalize(path).map_err(|err| format!("open workspace failed: {err}"))?;
     if !canonical.is_dir() {
         return Err("workspace path is not a directory".to_string());
     }
@@ -154,7 +168,10 @@ pub fn relative_workspace_path(path: &str) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-pub fn resolve_workspace_file(workspace: &Workspace, relative_path: &str) -> Result<PathBuf, String> {
+pub fn resolve_workspace_file(
+    workspace: &Workspace,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
     let relative = relative_workspace_path(relative_path)?;
     Ok(Path::new(&workspace.path).join(relative))
 }
@@ -221,7 +238,10 @@ fn build_node(root: &Path, path: &Path, max_depth: u8) -> Result<FileTreeNode, S
     })
 }
 
-pub fn read_workspace_file(workspace: &Workspace, relative_path: &str) -> Result<FileReadResult, String> {
+pub fn read_workspace_file(
+    workspace: &Workspace,
+    relative_path: &str,
+) -> Result<FileReadResult, String> {
     let absolute = resolve_workspace_file(workspace, relative_path)?;
     let content = fs::read_to_string(&absolute)
         .map_err(|err| format!("read file failed for {}: {err}", absolute.display()))?;
@@ -243,13 +263,16 @@ pub fn preview_file_result(mut file: FileReadResult, max_chars: usize) -> FileRe
         return file;
     }
 
-    file.content = file.content.chars().take(max_chars).collect::<String>() + "\n...[preview truncated]";
+    file.content =
+        file.content.chars().take(max_chars).collect::<String>() + "\n...[preview truncated]";
     file.is_truncated = true;
     file
 }
 
 pub fn update_recent_files(workspace: &mut Workspace, relative_path: &str) {
-    workspace.recent_files.retain(|entry| entry != relative_path);
+    workspace
+        .recent_files
+        .retain(|entry| entry != relative_path);
     workspace.recent_files.insert(0, relative_path.to_string());
     workspace.recent_files.truncate(12);
     workspace.last_opened_at = now_millis();
@@ -277,7 +300,8 @@ pub fn diff_text(relative_path: &str, current: &str, next: &str) -> String {
     let mut suffix = 0usize;
     while suffix + prefix < current_lines.len()
         && suffix + prefix < next_lines.len()
-        && current_lines[current_lines.len() - 1 - suffix] == next_lines[next_lines.len() - 1 - suffix]
+        && current_lines[current_lines.len() - 1 - suffix]
+            == next_lines[next_lines.len() - 1 - suffix]
     {
         suffix += 1;
     }
@@ -332,6 +356,7 @@ pub fn apply_write_proposal(
             Ok((relative_path.clone(), hash_text(next_content_preview)))
         }
         ToolProposalPayload::Command { .. } => Err("proposal is not a write action".to_string()),
+        ToolProposalPayload::Choice { .. } => Err("proposal is not a write action".to_string()),
     }
 }
 
@@ -344,8 +369,7 @@ where
     }
     let raw = fs::read_to_string(&path)
         .map_err(|err| format!("read {} failed: {err}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|err| format!("parse {} failed: {err}", path.display()))
+    serde_json::from_str(&raw).map_err(|err| format!("parse {} failed: {err}", path.display()))
 }
 
 fn write_json<T>(path: PathBuf, value: &T) -> Result<(), String>

@@ -10,6 +10,10 @@ const DEFAULT_THEME = "tokyonight";
 const MAX_STREAM_PROGRESS_ITEMS = 12;
 const STREAM_NO_TOKEN_WARN_S = 12;
 const STREAM_STALL_WARN_S = 25;
+const STREAM_NO_TOKEN_WARN_S_WORKSPACE = 30;
+const STREAM_STALL_WARN_S_WORKSPACE = 90;
+const SESSION_MODE_CONVERSATION = "conversation";
+const SESSION_MODE_WORKSPACE = "workspaceCollaboration";
 const THEME_OPTIONS = [
   { value: "tokyonight", label: "TokyoNight" },
   { value: "catppuccin-mocha", label: "Catppuccin Mocha" },
@@ -41,6 +45,39 @@ function normalizeError(error) {
     return error.message;
   }
   return String(error);
+}
+
+function normalizeSessionMode(mode) {
+  return mode === SESSION_MODE_WORKSPACE ? SESSION_MODE_WORKSPACE : SESSION_MODE_CONVERSATION;
+}
+
+function sessionModeLabel(mode) {
+  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "工作区协作" : "对话";
+}
+
+function sessionModeTrailLabel(mode) {
+  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "协作" : "对话";
+}
+
+function pendingAssistantLabel(seconds, sessionMode) {
+  const normalizedMode = normalizeSessionMode(sessionMode);
+  if (normalizedMode === SESSION_MODE_WORKSPACE) {
+    if (seconds >= 20) {
+      return `正在查看工作区并整理建议…（${seconds}s）`;
+    }
+    if (seconds >= 3) {
+      return `正在整理建议与预览…（${seconds}s）`;
+    }
+    return "正在整理建议与预览…";
+  }
+
+  if (seconds >= 20) {
+    return `正在生成回复…（${seconds}s，回复时间稍长）`;
+  }
+  if (seconds >= 3) {
+    return `正在生成回复…（${seconds}s）`;
+  }
+  return "正在生成回复…";
 }
 
 function normalizeLoginStatus(status) {
@@ -88,6 +125,122 @@ function upsertSession(sessions, nextSession) {
   );
 }
 
+function proposalStatusRank(status) {
+  if (status === "pending") {
+    return 0;
+  }
+  if (status === "approved") {
+    return 1;
+  }
+  if (status === "failed") {
+    return 2;
+  }
+  if (status === "rejected") {
+    return 3;
+  }
+  if (status === "applied" || status === "executed") {
+    return 4;
+  }
+  return 5;
+}
+
+function sortProposals(proposals) {
+  return [...proposals].sort((left, right) => {
+    const rankDiff = proposalStatusRank(left.status) - proposalStatusRank(right.status);
+    if (rankDiff !== 0) {
+      return rankDiff;
+    }
+    return (right.createdAt ?? 0) - (left.createdAt ?? 0);
+  });
+}
+
+function upsertProposal(proposals, nextProposal) {
+  const found = proposals.some((proposal) => proposal.id === nextProposal.id);
+  if (!found) {
+    return sortProposals([nextProposal, ...proposals]);
+  }
+  return sortProposals(
+    proposals.map((proposal) => (proposal.id === nextProposal.id ? { ...proposal, ...nextProposal } : proposal))
+  );
+}
+
+function patchProposalById(proposalsBySession, proposalId, updater) {
+  let changed = false;
+  const nextEntries = Object.entries(proposalsBySession).map(([sessionId, proposals]) => {
+    let sessionChanged = false;
+    const nextProposals = proposals.map((proposal) => {
+      if (proposal.id !== proposalId) {
+        return proposal;
+      }
+      sessionChanged = true;
+      changed = true;
+      return updater(proposal);
+    });
+    return [sessionId, sessionChanged ? sortProposals(nextProposals) : proposals];
+  });
+
+  if (!changed) {
+    return proposalsBySession;
+  }
+
+  return Object.fromEntries(nextEntries);
+}
+
+function proposalStatusLabel(status) {
+  if (status === "pending") {
+    return "待确认";
+  }
+  if (status === "approved") {
+    return "执行中";
+  }
+  if (status === "applied") {
+    return "已应用";
+  }
+  if (status === "executed") {
+    return "已执行";
+  }
+  if (status === "rejected") {
+    return "已拒绝";
+  }
+  if (status === "failed") {
+    return "失败";
+  }
+  return status || "未知";
+}
+
+function proposalStatusTone(status) {
+  if (status === "approved") {
+    return "active";
+  }
+  if (status === "applied" || status === "executed") {
+    return "ready";
+  }
+  if (status === "failed" || status === "rejected") {
+    return "error";
+  }
+  if (status === "pending") {
+    return "loading";
+  }
+  return "idle";
+}
+
+function proposalPrimaryActionLabel(proposal) {
+  if (proposal.kind === "choice") {
+    return "采纳这个方向";
+  }
+  if (proposal.kind === "command") {
+    return "执行命令";
+  }
+  return "应用改动";
+}
+
+function truncateBlock(text, maxChars = 1800) {
+  if (typeof text !== "string" || text.length <= maxChars) {
+    return text || "";
+  }
+  return `${text.slice(0, maxChars)}\n…[已截断]`;
+}
+
 function messageStatusLabel(status) {
   if (status === "streaming") {
     return "生成中";
@@ -96,6 +249,76 @@ function messageStatusLabel(status) {
     return "失败";
   }
   return "已完成";
+}
+
+function humanizeProgressDetail(entry) {
+  const detail = String(entry?.detail ?? "").trim();
+  if (!detail) {
+    return "";
+  }
+  if (entry?.stage === "思考") {
+    return "";
+  }
+  if (entry?.stage === "生成回复") {
+    return "正在整理建议与预览";
+  }
+  if (entry?.stage === "执行工具" && detail.endsWith("已完成")) {
+    return "";
+  }
+  if (detail.includes("秒仍未收到正文输出")) {
+    return "模型还在整理结果";
+  }
+  if (detail.includes("没有任何新进展")) {
+    return "本轮等待过久，准备终止";
+  }
+  return detail;
+}
+
+function summarizeProgress(progress) {
+  const latest = progress.at(-1);
+  if (!latest) {
+    return {
+      title: "正在准备建议与预览…",
+      items: [],
+    };
+  }
+
+  const latestDetail = humanizeProgressDetail(latest);
+  if (latest.level === "error") {
+    return {
+      title: latestDetail || "当前回合可能卡住了",
+      items: progress
+        .slice(-2)
+        .map((entry) => humanizeProgressDetail(entry))
+        .filter(Boolean),
+    };
+  }
+
+  const detailItems = [];
+  for (const entry of progress) {
+    const text = humanizeProgressDetail(entry);
+    if (!text) {
+      continue;
+    }
+    if (detailItems.at(-1) === text) {
+      continue;
+    }
+    detailItems.push(text);
+  }
+
+  let title = latestDetail || "正在准备建议与预览…";
+  if (latest.stage === "思考" || latest.stage === "生成回复") {
+    title = "正在整理建议与预览…";
+  } else if (latest.stage === "执行工具") {
+    title = "正在查看相关文件和上下文…";
+  } else if (latest.stage === "工作区") {
+    title = latestDetail || "正在接入当前工作区…";
+  }
+
+  return {
+    title,
+    items: detailItems.slice(-3),
+  };
 }
 
 function normalizeProgressLevel(level) {
@@ -336,6 +559,7 @@ function MessageBubble({ message, progress = [] }) {
     message.role === "assistant" &&
     (message.status === "streaming" || message.status === "error") &&
     progress.length > 0;
+  const progressSummary = showProgress ? summarizeProgress(progress) : null;
   return (
     <article className={`message message-${message.role} message-${message.status}`}>
       <div className="message-meta">
@@ -347,13 +571,107 @@ function MessageBubble({ message, progress = [] }) {
       </div>
       {showProgress ? (
         <div className="message-progress" aria-live="polite">
-          {progress.map((entry) => (
-            <div key={entry.id} className={`message-progress-item level-${entry.level}`}>
-              <span className="message-progress-dot" aria-hidden="true" />
-              <span className="message-progress-stage">{entry.stage}</span>
-              <span className="message-progress-detail">{entry.detail}</span>
+          <div className={`message-progress-summary level-${progress.at(-1)?.level ?? "info"}`}>
+            <span className="message-progress-dot" aria-hidden="true" />
+            <span className="message-progress-title">{progressSummary?.title}</span>
+          </div>
+          {progressSummary?.items?.length ? (
+            <div className="message-progress-list">
+              {progressSummary.items.map((item) => (
+                <div key={item} className="message-progress-item">
+                  <span className="message-progress-bullet" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="message-progress-detail">{item}</span>
+                </div>
+              ))}
             </div>
-          ))}
+          ) : null}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function ProposalCard({ proposal, busy, onAccept, onReject }) {
+  const payload = proposal.payload ?? {};
+  const statusLabel = proposalStatusLabel(proposal.status);
+  const statusTone = proposalStatusTone(proposal.status);
+  const isWrite = proposal.kind === "write" || payload.type === "write";
+  const isChoice = proposal.kind === "choice" || payload.type === "choice";
+  const previewText = isWrite ? truncateBlock(payload.diffText ?? payload.nextContentPreview ?? "") : "";
+  const commandText = isWrite || isChoice ? "" : truncateBlock(payload.displayCommand ?? "");
+  const outputText = isWrite || isChoice ? "" : truncateBlock(proposal.latestOutput ?? "", 1400);
+
+  return (
+    <article className={`proposal-card proposal-${proposal.status}`}>
+      <div className="proposal-card-head">
+        <div className="proposal-card-title">
+          <span className="section-eyebrow">
+            {isWrite ? "Edit Suggestion" : isChoice ? "Decision Suggestion" : "Command Suggestion"}
+          </span>
+          <strong>{proposal.title}</strong>
+        </div>
+        <span className={`drawer-chip drawer-chip-${statusTone}`}>{statusLabel}</span>
+      </div>
+      <div className="proposal-card-body">
+        <p className="proposal-summary">{proposal.summary}</p>
+        {isWrite ? (
+          <>
+            <div className="proposal-meta-row">
+              <span className="proposal-meta-label">文件</span>
+              <span className="proposal-meta-value">{payload.relativePath ?? "未提供"}</span>
+            </div>
+            {previewText ? (
+              <div className="proposal-preview-block">
+                <span className="proposal-block-label">改动预览</span>
+                <pre>{previewText}</pre>
+              </div>
+            ) : null}
+          </>
+        ) : isChoice ? (
+          <>
+            <div className="proposal-meta-row">
+              <span className="proposal-meta-label">方向</span>
+              <span className="proposal-meta-value">{payload.optionKey ?? "未提供"}</span>
+            </div>
+            {payload.detail ? (
+              <div className="proposal-preview-block">
+                <span className="proposal-block-label">建议内容</span>
+                <pre>{truncateBlock(payload.detail, 1200)}</pre>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <div className="proposal-meta-row">
+              <span className="proposal-meta-label">命令</span>
+              <span className="proposal-meta-value">{payload.reason ?? "命令建议"}</span>
+            </div>
+            {commandText ? (
+              <div className="proposal-preview-block">
+                <span className="proposal-block-label">执行预览</span>
+                <pre>{commandText}</pre>
+              </div>
+            ) : null}
+            {outputText ? (
+              <div className="proposal-preview-block">
+                <span className="proposal-block-label">最近输出</span>
+                <pre>{outputText}</pre>
+              </div>
+            ) : null}
+          </>
+        )}
+        {proposal.error ? <p className="proposal-error">{proposal.error}</p> : null}
+      </div>
+      {proposal.status === "pending" ? (
+        <div className="proposal-actions">
+          <button type="button" className="primary-button" disabled={busy} onClick={() => onAccept(proposal)}>
+            {busy ? "处理中…" : proposalPrimaryActionLabel(proposal)}
+          </button>
+          <button type="button" className="ghost-button" disabled={busy} onClick={() => onReject(proposal)}>
+            拒绝
+          </button>
         </div>
       ) : null}
     </article>
@@ -391,6 +709,9 @@ export default function App() {
   const [selectedFilePath, setSelectedFilePath] = useState("");
   const [filePreview, setFilePreview] = useState(null);
   const [previewState, setPreviewState] = useState({ loading: false, error: "" });
+  const [proposalsBySession, setProposalsBySession] = useState({});
+  const [proposalPanelState, setProposalPanelState] = useState({ loading: false, error: "" });
+  const [proposalActionId, setProposalActionId] = useState("");
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -403,10 +724,17 @@ export default function App() {
     () => workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null,
     [workspaces, activeWorkspaceId]
   );
+  const activeProposals = useMemo(
+    () => (activeSessionId ? proposalsBySession[activeSessionId] ?? [] : []),
+    [proposalsBySession, activeSessionId]
+  );
+  const activeSessionMode = normalizeSessionMode(activeSession?.interactionMode);
   const activeSessionWorkspaceId = activeSession?.workspaceId ?? "";
-  const layoutMode = activeSessionWorkspaceId ? "workbench" : "chat";
+  const layoutMode = activeSessionMode === SESSION_MODE_WORKSPACE ? "workbench" : "chat";
   const hasCustomWindowChrome =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const pendingProposalCount = activeProposals.filter((proposal) => proposal.status === "pending").length;
+  const inlineProposals = activeProposals.filter((proposal) => proposal.status === "pending").slice(0, 3);
 
   const fetchCodexStatus = async ({ showNotice = false } = {}) => {
     const status = normalizeLoginStatus(await desktop.codexLoginStatus());
@@ -420,6 +748,38 @@ export default function App() {
       });
     }
     return status;
+  };
+
+  const loadSessionProposals = async (sessionId, { silent = false } = {}) => {
+    if (!sessionId) {
+      if (!silent) {
+        setProposalPanelState({ loading: false, error: "" });
+      }
+      return [];
+    }
+
+    if (!silent) {
+      setProposalPanelState({ loading: true, error: "" });
+    }
+
+    try {
+      const proposals = sortProposals(await desktop.approvalList(sessionId));
+      if (mountedRef.current) {
+        setProposalsBySession((current) => ({
+          ...current,
+          [sessionId]: proposals,
+        }));
+        if (!silent) {
+          setProposalPanelState({ loading: false, error: "" });
+        }
+      }
+      return proposals;
+    } catch (error) {
+      if (mountedRef.current && !silent) {
+        setProposalPanelState({ loading: false, error: normalizeError(error) });
+      }
+      throw error;
+    }
   };
 
   useEffect(() => {
@@ -579,9 +939,34 @@ export default function App() {
   }, [activeWorkspace]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    if (!activeSessionId) {
+      setProposalPanelState({ loading: false, error: "" });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void loadSessionProposals(activeSessionId).catch((error) => {
+      if (!cancelled) {
+        setNotice({ kind: "error", text: `建议列表加载失败：${normalizeError(error)}` });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId]);
+
+  useEffect(() => {
     let unlistenStatus = null;
     let unlistenToken = null;
     let unlistenDone = null;
+    let unlistenProposalCreated = null;
+    let unlistenApprovalUpdated = null;
+    let unlistenCommandOutput = null;
+    let unlistenCommandFinished = null;
 
     const patchSession = (sessionId, updater) => {
       setSessions((current) =>
@@ -746,6 +1131,7 @@ export default function App() {
         if (payload.status === "error") {
           setNotice({ kind: "error", text: payload.content || "请求失败。" });
         }
+        setProposalPanelState((current) => ({ ...current, loading: false, error: "" }));
         setStreamProgressBySession((current) => {
           if (!current[payload.sessionId]) {
             return current;
@@ -763,6 +1149,58 @@ export default function App() {
           return next;
         });
       });
+
+      unlistenProposalCreated = await desktop.listen("tool-proposal-created", (event) => {
+        const payload = event.payload;
+        if (!payload?.sessionId || !payload?.id) {
+          return;
+        }
+        setProposalPanelState((current) => ({ ...current, loading: false, error: "" }));
+        setProposalsBySession((current) => ({
+          ...current,
+          [payload.sessionId]: upsertProposal(current[payload.sessionId] ?? [], payload),
+        }));
+      });
+
+      unlistenApprovalUpdated = await desktop.listen("approval-updated", (event) => {
+        const payload = event.payload;
+        if (!payload?.sessionId || !payload?.id) {
+          return;
+        }
+        setProposalPanelState((current) => ({ ...current, loading: false, error: "" }));
+        setProposalsBySession((current) => ({
+          ...current,
+          [payload.sessionId]: upsertProposal(current[payload.sessionId] ?? [], payload),
+        }));
+      });
+
+      unlistenCommandOutput = await desktop.listen("command-output", (event) => {
+        const payload = event.payload;
+        if (!payload?.proposalId || typeof payload.chunk !== "string") {
+          return;
+        }
+        setProposalsBySession((current) =>
+          patchProposalById(current, payload.proposalId, (proposal) => ({
+            ...proposal,
+            latestOutput: `${proposal.latestOutput ?? ""}${payload.chunk}`,
+          }))
+        );
+      });
+
+      unlistenCommandFinished = await desktop.listen("command-finished", (event) => {
+        const payload = event.payload;
+        if (!payload?.proposalId) {
+          return;
+        }
+        setProposalsBySession((current) =>
+          patchProposalById(current, payload.proposalId, (proposal) => ({
+            ...proposal,
+            latestOutput:
+              proposal.latestOutput ??
+              `命令执行结束，exit code ${payload.exitCode ?? -1}`,
+          }))
+        );
+      });
     };
 
     void register();
@@ -776,6 +1214,18 @@ export default function App() {
       }
       if (typeof unlistenDone === "function") {
         unlistenDone();
+      }
+      if (typeof unlistenProposalCreated === "function") {
+        unlistenProposalCreated();
+      }
+      if (typeof unlistenApprovalUpdated === "function") {
+        unlistenApprovalUpdated();
+      }
+      if (typeof unlistenCommandOutput === "function") {
+        unlistenCommandOutput();
+      }
+      if (typeof unlistenCommandFinished === "function") {
+        unlistenCommandFinished();
       }
     };
   }, []);
@@ -797,6 +1247,11 @@ export default function App() {
     if (!chatSending || !activeSessionId) {
       return undefined;
     }
+
+    const noTokenWarnS =
+      activeSessionMode === SESSION_MODE_WORKSPACE ? STREAM_NO_TOKEN_WARN_S_WORKSPACE : STREAM_NO_TOKEN_WARN_S;
+    const stallWarnS =
+      activeSessionMode === SESSION_MODE_WORKSPACE ? STREAM_STALL_WARN_S_WORKSPACE : STREAM_STALL_WARN_S;
 
     const timer = window.setInterval(() => {
       const monitor = streamMonitorRef.current[activeSessionId];
@@ -820,12 +1275,15 @@ export default function App() {
         !monitor.warnedNoToken &&
         (monitor.tokenCount ?? 0) === 0 &&
         (monitor.statusCount ?? 0) > 0 &&
-        elapsedMs >= STREAM_NO_TOKEN_WARN_S * 1000
+        elapsedMs >= noTokenWarnS * 1000
       ) {
         updates.warnedNoToken = true;
         syntheticEntries.push({
           stage: "监控",
-          detail: `已收到内部状态，但 ${STREAM_NO_TOKEN_WARN_S}s 仍无正文输出。`,
+          detail:
+            activeSessionMode === SESSION_MODE_WORKSPACE
+              ? `已进入工作区协作，${noTokenWarnS}s 仍在整理建议与预览。`
+              : `已收到内部状态，但 ${noTokenWarnS}s 仍无正文输出。`,
           level: "warn",
         });
       }
@@ -853,12 +1311,15 @@ export default function App() {
         }
       }
 
-      if (!monitor.warnedStall && idleMs >= STREAM_STALL_WARN_S * 1000) {
+      if (!monitor.warnedStall && idleMs >= stallWarnS * 1000) {
         updates.warnedStall = true;
         syntheticEntries.push({
           stage: "监控",
-          detail: `${STREAM_STALL_WARN_S}s 无新进展，可能卡住。可重试。`,
-          level: "error",
+          detail:
+            activeSessionMode === SESSION_MODE_WORKSPACE
+              ? `${stallWarnS}s 没有新进展，工作区协作仍在等待结果。`
+              : `${stallWarnS}s 无新进展，回复时间偏长。`,
+          level: "warn",
         });
       }
 
@@ -897,7 +1358,7 @@ export default function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [chatSending, activeSessionId]);
+  }, [chatSending, activeSessionId, activeSessionMode]);
 
   const resetPreview = () => {
     setSelectedFilePath("");
@@ -972,6 +1433,40 @@ export default function App() {
     setActiveWorkspaceId(session?.workspaceId ?? "");
   };
 
+  const handleSetSessionMode = async (nextMode) => {
+    if (!activeSessionId) {
+      return;
+    }
+    const normalizedNextMode = normalizeSessionMode(nextMode);
+    if (normalizedNextMode === activeSessionMode) {
+      return;
+    }
+    if (
+      normalizedNextMode === SESSION_MODE_WORKSPACE &&
+      !activeSessionWorkspaceId
+    ) {
+      setNotice({
+        kind: "info",
+        text: "先为当前会话挂载工作区，再进入工作区协作。",
+      });
+      return;
+    }
+
+    try {
+      const updated = await desktop.sessionModeSet(activeSessionId, normalizedNextMode);
+      setSessions((current) => upsertSession(current, updated));
+      setNotice({
+        kind: "info",
+        text:
+          normalizedNextMode === SESSION_MODE_WORKSPACE
+            ? "当前会话已切到工作区协作。"
+            : "当前会话已切回对话模式。",
+      });
+    } catch (error) {
+      setNotice({ kind: "error", text: normalizeError(error) });
+    }
+  };
+
   const handleSend = async () => {
     if (!activeSessionId) {
       return;
@@ -1000,7 +1495,7 @@ export default function App() {
       return next;
     });
     try {
-      const updatedSession = await desktop.chatSend(activeSessionId, input, []);
+      const updatedSession = await desktop.chatSend(activeSessionId, input, [], activeSessionMode);
       setSessions((current) => upsertSession(current, updatedSession));
     } catch (error) {
       setChatSending(false);
@@ -1025,7 +1520,10 @@ export default function App() {
     }
 
     setWorkspaceModalOpen(false);
-    setNotice({ kind: "success", text: `已添加工作区：${workspace.name}` });
+    setNotice({
+      kind: "success",
+      text: `已添加工作区：${workspace.name}。需要代码上下文时可切到工作区协作。`,
+    });
   };
 
   const handleRemoveWorkspace = async (workspaceId) => {
@@ -1052,6 +1550,10 @@ export default function App() {
     try {
       const updated = await desktop.workspaceSelect(activeSessionId, workspaceId);
       setSessions((current) => upsertSession(current, updated));
+      setNotice({
+        kind: "info",
+        text: "工作区已挂载到当前会话。是否使用它，由你切换模式决定。",
+      });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
     }
@@ -1069,7 +1571,7 @@ export default function App() {
       setSessions((current) => upsertSession(current, updated));
       setActiveWorkspaceId("");
       resetPreview();
-      setNotice({ kind: "info", text: "当前会话已切换为纯对话模式。" });
+      setNotice({ kind: "info", text: "已解除工作区挂载，当前会话回到对话模式。" });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
     }
@@ -1090,6 +1592,52 @@ export default function App() {
       setSelectedFilePath(relativePath);
       setFilePreview(null);
       setPreviewState({ loading: false, error: normalizeError(error) });
+    }
+  };
+
+  const handleAcceptProposal = async (proposal) => {
+    setProposalActionId(proposal.id);
+    try {
+      const updated = await desktop.approvalAccept(proposal.id);
+      setProposalsBySession((current) => ({
+        ...current,
+        [updated.sessionId]: upsertProposal(current[updated.sessionId] ?? [], updated),
+      }));
+
+      if (updated.kind === "write") {
+        if (activeWorkspace?.id === updated.payload?.workspaceId) {
+          const nextTree = await desktop.workspaceTree(activeWorkspace.id);
+          setWorkspaceTree(nextTree);
+          if (selectedFilePath && selectedFilePath === updated.payload?.relativePath) {
+            const preview = await desktop.workspaceReadFile(activeWorkspace.id, selectedFilePath);
+            setFilePreview(preview);
+            setPreviewState({ loading: false, error: "" });
+          }
+        }
+        setNotice({ kind: "success", text: "已应用建议改动。" });
+      } else {
+        setNotice({ kind: "info", text: "已确认命令建议，正在执行。" });
+      }
+    } catch (error) {
+      setNotice({ kind: "error", text: normalizeError(error) });
+    } finally {
+      setProposalActionId("");
+    }
+  };
+
+  const handleRejectProposal = async (proposal) => {
+    setProposalActionId(proposal.id);
+    try {
+      const updated = await desktop.approvalReject(proposal.id);
+      setProposalsBySession((current) => ({
+        ...current,
+        [updated.sessionId]: upsertProposal(current[updated.sessionId] ?? [], updated),
+      }));
+      setNotice({ kind: "info", text: "已拒绝这条建议。" });
+    } catch (error) {
+      setNotice({ kind: "error", text: normalizeError(error) });
+    } finally {
+      setProposalActionId("");
     }
   };
 
@@ -1122,21 +1670,16 @@ export default function App() {
   const activeStreamInfo = activeSessionId ? streamProgressBySession[activeSessionId] ?? null : null;
   const activeStreamMessageId = activeStreamInfo?.messageId ?? "";
   const activeStreamProgress = activeStreamInfo?.items ?? [];
-  const pendingAssistantText =
-    pendingSeconds >= 20
-      ? `正在生成回复…（${pendingSeconds}s，网络可能较慢）`
-      : pendingSeconds >= 3
-        ? `正在生成回复…（${pendingSeconds}s）`
-        : "正在生成回复…";
+  const pendingAssistantText = pendingAssistantLabel(pendingSeconds, activeSessionMode);
   const composerHint = !codexAuth.loggedIn
     ? "先登录 ChatGPT 才能发送。"
     : "Enter 发送，Shift+Enter 换行。";
   const sessionMessageCount = activeSession?.messages?.length ?? 0;
   const workspaceStatusText = activeSessionWorkspaceId
     ? activeWorkspace?.name ?? "已挂载"
-    : "纯对话";
-  const modeLabel = layoutMode === "workbench" ? "Workbench" : "Chat";
-  const topbarContextLabel = layoutMode === "workbench" ? "workspace" : "chat";
+    : "未挂载";
+  const modeLabel = sessionModeLabel(activeSessionMode);
+  const topbarContextLabel = sessionModeTrailLabel(activeSessionMode);
   const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
   const inspectorSessionState = activeSession ? "active" : "idle";
   const previewTitle = selectedFilePath || "暂无文件";
@@ -1147,6 +1690,40 @@ export default function App() {
       : filePreview
         ? "ready"
         : "empty";
+  const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "已挂载" : "未挂载";
+  const inspectorSessionStateText = activeSession ? "当前会话" : "空闲";
+  const previewStateText = previewState.loading
+    ? "读取中"
+    : previewState.error
+      ? "错误"
+      : filePreview
+        ? "就绪"
+        : "空";
+  const collaborationEnabled = activeSessionMode === SESSION_MODE_WORKSPACE;
+  const collaborationAvailable = Boolean(activeSessionWorkspaceId);
+  const composerPlaceholder = collaborationEnabled
+    ? "描述你想让 Solo 结合当前工作区讨论的事；它会先给建议和预览。"
+    : collaborationAvailable
+      ? "直接提问；如果这轮需要当前工作区，请先切到工作区协作。"
+      : "直接提问；需要代码上下文时先挂载工作区，再切到工作区协作。";
+  const chatSubtitle = collaborationEnabled
+    ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先给建议和预览，再由你决定。`
+    : collaborationAvailable
+      ? `当前为对话模式。工作区 ${activeWorkspace?.name ?? "当前项目"} 已挂载，只有切到工作区协作时才会参与。`
+      : "当前为对话模式。需要代码上下文时再挂载工作区并切到工作区协作。";
+  const workspaceContextText = collaborationAvailable
+    ? `${activeWorkspace?.name ?? "当前项目"} 已挂载到当前会话`
+    : "当前会话还没有挂载工作区";
+  const modeIntentText = collaborationEnabled
+    ? "这一轮会结合工作区"
+    : collaborationAvailable
+      ? "这一轮只对话，不自动读工作区"
+      : "当前为普通对话";
+  const modeGuidanceText = collaborationEnabled
+    ? "Solo 会先查看相关文件，再给建议、权衡和改动预览。"
+    : collaborationAvailable
+      ? "工作区只是可用上下文。只有你切到“工作区协作”后，它才会真正参与回答。"
+      : "先挂载工作区，再进入工作区协作。";
 
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
@@ -1301,7 +1878,7 @@ export default function App() {
                     <span className="session-title">{session.title}</span>
                     <span className="list-badge">{session.messages?.length ?? 0}</span>
                   </div>
-                  <span className="session-meta">{session.workspaceId ? "工作区" : "聊天"}</span>
+                  <span className="session-meta">{sessionModeLabel(session.interactionMode)}</span>
                 </button>
               ))}
             </div>
@@ -1315,6 +1892,7 @@ export default function App() {
                   <h2>工作区</h2>
                   <span className="section-count">{workspaces.length}</span>
                 </div>
+                <p className="section-note">点击工作区只会挂载到当前会话，不会自动进入协作。</p>
               </div>
               <button
                 type="button"
@@ -1344,6 +1922,13 @@ export default function App() {
                       ) : null}
                     </div>
                     <span className="workspace-path">{workspace.path}</span>
+                    <span className="workspace-caption">
+                      {workspace.id === activeSessionWorkspaceId
+                        ? collaborationEnabled
+                          ? "当前会话正结合这个工作区协作"
+                          : "当前会话已挂载这个工作区"
+                        : "点击挂载到当前会话"}
+                    </span>
                   </button>
                   <button
                     type="button"
@@ -1402,16 +1987,49 @@ export default function App() {
               <div className="chat-head-main">
                 <p className="section-eyebrow">Conversation</p>
                 <h2>{activeSession?.title ?? "新会话"}</h2>
-                <p className="chat-subtitle">
-                  {layoutMode === "workbench"
-                    ? `已挂载工作区 ${activeWorkspace?.name ?? "workspace"}`
-                    : "当前为纯对话模式"}
-                </p>
+                <p className="chat-subtitle">{chatSubtitle}</p>
+                <div className="chat-context-strip">
+                  <div className="chat-context-item">
+                    <span className="chat-context-label">工作区</span>
+                    <strong className="chat-context-value">{workspaceContextText}</strong>
+                  </div>
+                  <div className="chat-context-item">
+                    <span className="chat-context-label">当前方式</span>
+                    <strong className="chat-context-value">{modeIntentText}</strong>
+                  </div>
+                  <p className="chat-context-note">{modeGuidanceText}</p>
+                </div>
               </div>
               <div className="compact-row">
-                {layoutMode === "workbench" ? (
+                <div className="mode-switch" role="tablist" aria-label="会话模式">
+                  <button
+                    type="button"
+                    className={`ghost-button mode-switch-button ${
+                      activeSessionMode === SESSION_MODE_CONVERSATION ? "is-active" : ""
+                    }`}
+                    onClick={() => void handleSetSessionMode(SESSION_MODE_CONVERSATION)}
+                    aria-pressed={activeSessionMode === SESSION_MODE_CONVERSATION}
+                  >
+                    对话
+                  </button>
+                  <button
+                    type="button"
+                    className={`ghost-button mode-switch-button ${
+                      activeSessionMode === SESSION_MODE_WORKSPACE ? "is-active" : ""
+                    }`}
+                    disabled={!collaborationAvailable}
+                    onClick={() => void handleSetSessionMode(SESSION_MODE_WORKSPACE)}
+                    aria-pressed={activeSessionMode === SESSION_MODE_WORKSPACE}
+                    title={
+                      collaborationAvailable ? "结合当前工作区协作" : "先挂载工作区，再进入工作区协作"
+                    }
+                  >
+                    工作区协作
+                  </button>
+                </div>
+                {activeSessionWorkspaceId ? (
                   <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                    纯对话
+                    解除工作区
                   </button>
                 ) : null}
                 <button type="button" className="ghost-button" onClick={handleCreateSession}>
@@ -1481,15 +2099,39 @@ export default function App() {
                       progress={activeStreamProgress}
                     />
                   ) : null}
+                  {inlineProposals.length > 0 ? (
+                    <section className="shell-card inline-proposals">
+                      <div className="inline-proposals-head">
+                        <div>
+                          <p className="section-eyebrow">Options</p>
+                          <h3>直接选下一步</h3>
+                        </div>
+                        <p className="inline-proposals-note">不再藏在右栏，这里直接给你候选方向。</p>
+                      </div>
+                      <div className="proposal-stack">
+                        {inlineProposals.map((proposal) => (
+                          <ProposalCard
+                            key={proposal.id}
+                            proposal={proposal}
+                            busy={proposalActionId === proposal.id}
+                            onAccept={handleAcceptProposal}
+                            onReject={handleRejectProposal}
+                          />
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
                 </>
               ) : (
                 <div className="empty-state hero">
-                  <p className="section-eyebrow">Chat</p>
-                  <h2>直接在应用里对话。</h2>
+                  <p className="section-eyebrow">Conversation</p>
+                  <h2>直接开始对话，需要时再进入工作区协作。</h2>
                   <p>
-                    {layoutMode === "workbench"
-                      ? "你已经登录 ChatGPT，现在可以直接提问，也可以让 Solo 结合当前工作区继续分析。"
-                      : "你已经登录 ChatGPT，现在可以直接提问；需要代码上下文时再挂载工作区。"}
+                    {collaborationEnabled
+                      ? "你已经进入工作区协作。Solo 会先查看相关文件，再给出建议、权衡和改动预览。"
+                      : collaborationAvailable
+                        ? "你已经登录 ChatGPT。现在可以继续直接提问；如果需要代码上下文，再显式切到工作区协作。"
+                        : "你已经登录 ChatGPT。现在可以直接提问；需要代码上下文时先挂载工作区，再切到工作区协作。"}
                   </p>
                 </div>
               )}
@@ -1504,7 +2146,7 @@ export default function App() {
                 disabled={!codexAuth.loggedIn || codexChecking || chatSending}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
-                placeholder="描述你要做的事，或者让 Solo 分析当前工作区。"
+                placeholder={composerPlaceholder}
               />
               <div className="composer-actions">
                 <p className="composer-hint">{composerHint}</p>
@@ -1527,7 +2169,7 @@ export default function App() {
           <div className="inspector-head">
             <div>
               <p className="section-eyebrow">Inspector</p>
-              <h2>工具抽屉</h2>
+              <h2>上下文与预览</h2>
             </div>
             <span className="section-count">{modeLabel}</span>
           </div>
@@ -1535,7 +2177,7 @@ export default function App() {
           <div className="inspector-summary">
             <div className="inspector-summary-item">
               <span className="section-eyebrow">workspace</span>
-              <strong>{activeWorkspace?.name ?? "none"}</strong>
+              <strong>{activeWorkspace?.name ?? "未选择"}</strong>
             </div>
             <div className="inspector-summary-item">
               <span className="section-eyebrow">messages</span>
@@ -1551,7 +2193,7 @@ export default function App() {
                   <strong>{activeWorkspace?.name ?? "未选择"}</strong>
                 </div>
                 <span className={`drawer-chip drawer-chip-${inspectorWorkspaceState}`}>
-                  {inspectorWorkspaceState}
+                  {inspectorWorkspaceStateText}
                 </span>
               </div>
               <div className="drawer-meta-grid">
@@ -1562,8 +2204,10 @@ export default function App() {
                   </span>
                 </div>
                 <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">模式</span>
-                  <span className="drawer-meta-value">{layoutMode === "workbench" ? "workspace" : "chat-only"}</span>
+                  <span className="drawer-meta-label">参与</span>
+                  <span className="drawer-meta-value">
+                    {collaborationEnabled ? "当前会话会结合这个工作区" : "已挂载，当前这轮不自动参与"}
+                  </span>
                 </div>
               </div>
             </section>
@@ -1575,7 +2219,7 @@ export default function App() {
                   <strong>{activeSession?.title ?? "暂无会话"}</strong>
                 </div>
                 <span className={`drawer-chip drawer-chip-${inspectorSessionState}`}>
-                  {inspectorSessionState}
+                  {inspectorSessionStateText}
                 </span>
               </div>
               <div className="drawer-meta-grid">
@@ -1586,11 +2230,49 @@ export default function App() {
                   </span>
                 </div>
                 <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">上下文</span>
-                  <span className="drawer-meta-value">
-                    {activeSessionWorkspaceId ? "挂载工作区" : "纯对话会话"}
-                  </span>
+                  <span className="drawer-meta-label">模式</span>
+                  <span className="drawer-meta-value">{modeLabel}</span>
                 </div>
+              </div>
+            </section>
+
+            <section className="drawer-panel drawer-panel-proposals">
+              <div className="drawer-panel-head">
+                <div className="drawer-panel-title">
+                  <span className="section-eyebrow">Suggestions</span>
+                  <strong>建议与确认</strong>
+                </div>
+                <span className={`drawer-chip drawer-chip-${pendingProposalCount > 0 ? "loading" : "idle"}`}>
+                  {pendingProposalCount > 0 ? `${pendingProposalCount} 待确认` : "无待确认"}
+                </span>
+              </div>
+              <div className="drawer-preview-body">
+                <p className="proposal-panel-note">AI 先给建议和预览，是否应用由你决定。</p>
+                {proposalPanelState.loading ? <p>正在加载建议列表…</p> : null}
+                {proposalPanelState.error ? (
+                  <div className="status-banner status-banner-error">
+                    <strong>加载失败</strong>
+                    <span>{proposalPanelState.error}</span>
+                  </div>
+                ) : null}
+                {!proposalPanelState.loading && !proposalPanelState.error && activeProposals.length === 0 ? (
+                  <div className="proposal-empty">
+                    <p>当前会话还没有需要你确认的建议。</p>
+                  </div>
+                ) : null}
+                {activeProposals.length > 0 ? (
+                  <div className="proposal-stack">
+                    {activeProposals.map((proposal) => (
+                      <ProposalCard
+                        key={proposal.id}
+                        proposal={proposal}
+                        busy={proposalActionId === proposal.id}
+                        onAccept={handleAcceptProposal}
+                        onReject={handleRejectProposal}
+                      />
+                    ))}
+                  </div>
+                ) : null}
               </div>
             </section>
 
@@ -1600,7 +2282,7 @@ export default function App() {
                   <span className="section-eyebrow">Preview</span>
                   <strong>{previewTitle}</strong>
                 </div>
-                <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateLabel}</span>
+                <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
               </div>
               <div className="drawer-preview-body">
               {previewState.loading ? <p>正在读取文件…</p> : null}

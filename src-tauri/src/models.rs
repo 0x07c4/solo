@@ -56,6 +56,14 @@ pub struct ChatMessage {
     pub attachments: Vec<MessageAttachment>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionInteractionMode {
+    #[default]
+    Conversation,
+    WorkspaceCollaboration,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatSession {
@@ -63,6 +71,8 @@ pub struct ChatSession {
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub interaction_mode: SessionInteractionMode,
     pub workspace_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub pending_approvals: Vec<String>,
@@ -153,6 +163,11 @@ pub enum ToolProposalPayload {
         argv: Vec<String>,
         display_command: String,
         reason: String,
+    },
+    Choice {
+        workspace_id: String,
+        option_key: String,
+        detail: String,
     },
 }
 

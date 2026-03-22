@@ -180,7 +180,10 @@ pub async fn test_connection(
         .json()
         .await
         .map_err(|err| format!("连接成功，但模型列表解析失败：{err}"))?;
-    let model_available = parsed.data.iter().any(|model| model.id == settings.model_id);
+    let model_available = parsed
+        .data
+        .iter()
+        .any(|model| model.id == settings.model_id);
 
     if !model_available {
         return Err(format!(
@@ -201,7 +204,10 @@ pub async fn chat_completion(
     settings: &Settings,
     messages: &[CompletionMessage],
 ) -> Result<CompletionAssistantMessage, String> {
-    let url = format!("{}/chat/completions", settings.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        settings.base_url.trim_end_matches('/')
+    );
     let response = client
         .post(url)
         .bearer_auth(&settings.api_key)
