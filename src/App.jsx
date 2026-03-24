@@ -14,6 +14,9 @@ const STREAM_NO_TOKEN_WARN_S_WORKSPACE = 30;
 const STREAM_STALL_WARN_S_WORKSPACE = 90;
 const SESSION_MODE_CONVERSATION = "conversation";
 const SESSION_MODE_WORKSPACE = "workspaceCollaboration";
+const TURN_INTENT_AUTO = "auto";
+const TURN_INTENT_CHOICE = "choice";
+const TURN_INTENT_PREVIEW = "preview";
 const THEME_OPTIONS = [
   { value: "tokyonight", label: "TokyoNight" },
   { value: "catppuccin-mocha", label: "Catppuccin Mocha" },
@@ -59,16 +62,53 @@ function sessionModeTrailLabel(mode) {
   return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "协作" : "对话";
 }
 
-function pendingAssistantLabel(seconds, sessionMode) {
+function normalizeTurnIntent(intent) {
+  if (intent === TURN_INTENT_CHOICE || intent === TURN_INTENT_PREVIEW) {
+    return intent;
+  }
+  return TURN_INTENT_AUTO;
+}
+
+function turnIntentLabel(intent) {
+  const normalized = normalizeTurnIntent(intent);
+  if (normalized === TURN_INTENT_CHOICE) {
+    return "方向建议";
+  }
+  if (normalized === TURN_INTENT_PREVIEW) {
+    return "具体预览";
+  }
+  return "协作分析";
+}
+
+function pendingAssistantLabel(seconds, sessionMode, turnIntent = TURN_INTENT_AUTO) {
   const normalizedMode = normalizeSessionMode(sessionMode);
   if (normalizedMode === SESSION_MODE_WORKSPACE) {
+    const normalizedIntent = normalizeTurnIntent(turnIntent);
+    if (normalizedIntent === TURN_INTENT_CHOICE) {
+      if (seconds >= 20) {
+        return `正在查看工作区并整理方向建议…（${seconds}s）`;
+      }
+      if (seconds >= 3) {
+        return `正在整理方向建议…（${seconds}s）`;
+      }
+      return "正在整理方向建议…";
+    }
+    if (normalizedIntent === TURN_INTENT_PREVIEW) {
+      if (seconds >= 20) {
+        return `正在查看工作区并展开具体预览…（${seconds}s）`;
+      }
+      if (seconds >= 3) {
+        return `正在展开具体预览…（${seconds}s）`;
+      }
+      return "正在展开具体预览…";
+    }
     if (seconds >= 20) {
-      return `正在查看工作区并整理建议…（${seconds}s）`;
+      return `正在查看工作区并整理协作分析…（${seconds}s）`;
     }
     if (seconds >= 3) {
-      return `正在整理建议与预览…（${seconds}s）`;
+      return `正在整理协作分析…（${seconds}s）`;
     }
-    return "正在整理建议与预览…";
+    return "正在整理协作分析…";
   }
 
   if (seconds >= 20) {
@@ -129,19 +169,22 @@ function proposalStatusRank(status) {
   if (status === "pending") {
     return 0;
   }
-  if (status === "approved") {
+  if (status === "selected") {
     return 1;
   }
-  if (status === "failed") {
+  if (status === "approved") {
     return 2;
   }
-  if (status === "rejected") {
+  if (status === "failed") {
     return 3;
   }
-  if (status === "applied" || status === "executed") {
+  if (status === "rejected") {
     return 4;
   }
-  return 5;
+  if (status === "applied" || status === "executed") {
+    return 5;
+  }
+  return 6;
 }
 
 function sortProposals(proposals) {
@@ -190,6 +233,9 @@ function proposalStatusLabel(status) {
   if (status === "pending") {
     return "待确认";
   }
+  if (status === "selected") {
+    return "已选择";
+  }
   if (status === "approved") {
     return "执行中";
   }
@@ -209,6 +255,9 @@ function proposalStatusLabel(status) {
 }
 
 function proposalStatusTone(status) {
+  if (status === "selected") {
+    return "active";
+  }
   if (status === "approved") {
     return "active";
   }
@@ -226,12 +275,12 @@ function proposalStatusTone(status) {
 
 function proposalPrimaryActionLabel(proposal) {
   if (proposal.kind === "choice") {
-    return "采纳这个方向";
+    return "选择这个方向";
   }
   if (proposal.kind === "command") {
-    return "执行命令";
+    return "确认执行命令";
   }
-  return "应用改动";
+  return "确认应用改动";
 }
 
 function truncateBlock(text, maxChars = 1800) {
@@ -678,6 +727,65 @@ function ProposalCard({ proposal, busy, onAccept, onReject }) {
   );
 }
 
+function DecisionOptionCard({ proposal, active, onPreview }) {
+  const optionKey = proposal.payload?.optionKey ?? proposal.title;
+  return (
+    <article className={`decision-option-card ${active ? "is-active" : ""}`}>
+      <button
+        type="button"
+        className="decision-option-surface"
+        onClick={() => onPreview(proposal)}
+        aria-pressed={active}
+      >
+        <div className="decision-option-head">
+          <span className="section-eyebrow">方向 {optionKey}</span>
+          {active ? <span className="drawer-chip drawer-chip-active">预览中</span> : null}
+        </div>
+        <strong>{proposal.title}</strong>
+        <p>{proposal.summary}</p>
+        <span className="decision-option-hint">点击卡片先查看这个方向的预览</span>
+      </button>
+    </article>
+  );
+}
+
+function DecisionPreviewPanel({ proposal, busy, onConfirm }) {
+  if (!proposal) {
+    return null;
+  }
+
+  const optionKey = proposal.payload?.optionKey ?? proposal.title;
+  const detail = truncateBlock(proposal.payload?.detail ?? proposal.summary, 2200);
+
+  return (
+    <div className="decision-preview-panel">
+      <div className="decision-preview-head">
+        <div>
+          <p className="section-eyebrow">方向预览</p>
+          <h4>正在查看方向 {optionKey}</h4>
+        </div>
+        <span className="drawer-chip drawer-chip-idle">仅预览</span>
+      </div>
+      <p className="decision-preview-summary">{proposal.summary}</p>
+      <div className="proposal-preview-block">
+        <span className="proposal-block-label">方向预览</span>
+        <pre>{detail}</pre>
+      </div>
+      <div className="decision-preview-footer">
+        <p>这里只展示方向说明，不会执行命令或修改文件。确认选择后，Solo 才会继续生成更具体的改动预览。</p>
+        <button
+          type="button"
+          className="primary-button"
+          disabled={busy}
+          onClick={() => onConfirm(proposal)}
+        >
+          {busy ? "处理中…" : "确认选择这个方向"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const mountedRef = useRef(true);
   const activeSessionIdRef = useRef("");
@@ -712,6 +820,8 @@ export default function App() {
   const [proposalsBySession, setProposalsBySession] = useState({});
   const [proposalPanelState, setProposalPanelState] = useState({ loading: false, error: "" });
   const [proposalActionId, setProposalActionId] = useState("");
+  const [decisionPreviewBySession, setDecisionPreviewBySession] = useState({});
+  const [turnIntentBySession, setTurnIntentBySession] = useState({});
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -729,12 +839,32 @@ export default function App() {
     [proposalsBySession, activeSessionId]
   );
   const activeSessionMode = normalizeSessionMode(activeSession?.interactionMode);
+  const activeTurnIntent = activeSessionId
+    ? normalizeTurnIntent(
+        turnIntentBySession[activeSessionId] ??
+          (activeSessionMode === SESSION_MODE_WORKSPACE ? TURN_INTENT_CHOICE : TURN_INTENT_AUTO)
+      )
+    : TURN_INTENT_AUTO;
   const activeSessionWorkspaceId = activeSession?.workspaceId ?? "";
   const layoutMode = activeSessionMode === SESSION_MODE_WORKSPACE ? "workbench" : "chat";
   const hasCustomWindowChrome =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  const pendingProposalCount = activeProposals.filter((proposal) => proposal.status === "pending").length;
-  const inlineProposals = activeProposals.filter((proposal) => proposal.status === "pending").slice(0, 3);
+  const decisionProposals = activeProposals
+    .filter((proposal) => proposal.status === "pending" && proposal.kind === "choice")
+    .slice(0, 3);
+  const previewProposals = activeProposals.filter(
+    (proposal) => proposal.status === "pending" && proposal.kind !== "choice"
+  );
+  const selectedChoiceProposal =
+    [...activeProposals]
+      .filter((proposal) => proposal.kind === "choice" && proposal.status === "selected")
+      .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))[0] ?? null;
+  const activeDecisionPreviewId = activeSessionId ? decisionPreviewBySession[activeSessionId] ?? "" : "";
+  const activeDecisionPreviewProposal =
+    decisionProposals.find((proposal) => proposal.id === activeDecisionPreviewId) ?? decisionProposals[0] ?? null;
+  const showDecisionDeck = decisionProposals.length > 0 && !selectedChoiceProposal;
+  const showPreviewCards =
+    previewProposals.length > 0 && (!showDecisionDeck || Boolean(selectedChoiceProposal));
 
   const fetchCodexStatus = async ({ showNotice = false } = {}) => {
     const status = normalizeLoginStatus(await desktop.codexLoginStatus());
@@ -960,6 +1090,22 @@ export default function App() {
   }, [activeSessionId]);
 
   useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+
+    const stillExists = decisionProposals.some((proposal) => proposal.id === activeDecisionPreviewId);
+    if (stillExists || decisionProposals.length === 0) {
+      return;
+    }
+
+    setDecisionPreviewBySession((current) => ({
+      ...current,
+      [activeSessionId]: decisionProposals[0].id,
+    }));
+  }, [activeSessionId, activeDecisionPreviewId, decisionProposals]);
+
+  useEffect(() => {
     let unlistenStatus = null;
     let unlistenToken = null;
     let unlistenDone = null;
@@ -1033,9 +1179,6 @@ export default function App() {
         const payload = event.payload;
         if (!payload?.sessionId || !payload?.messageId || !payload.delta) {
           return;
-        }
-        if (payload.sessionId === activeSessionIdRef.current) {
-          setChatSending(false);
         }
         const now = Date.now();
         patchSession(payload.sessionId, (session) => {
@@ -1455,11 +1598,17 @@ export default function App() {
     try {
       const updated = await desktop.sessionModeSet(activeSessionId, normalizedNextMode);
       setSessions((current) => upsertSession(current, updated));
+      if (normalizedNextMode === SESSION_MODE_WORKSPACE) {
+        setTurnIntentBySession((current) => ({
+          ...current,
+          [activeSessionId]: current[activeSessionId] ?? TURN_INTENT_CHOICE,
+        }));
+      }
       setNotice({
         kind: "info",
         text:
           normalizedNextMode === SESSION_MODE_WORKSPACE
-            ? "当前会话已切到工作区协作。"
+            ? "当前会话已切到工作区协作，默认先给方向建议。"
             : "当前会话已切回对话模式。",
       });
     } catch (error) {
@@ -1472,7 +1621,7 @@ export default function App() {
       return;
     }
     const input = draft.trim();
-    if (!input || chatSending || codexChecking || !codexAuth.loggedIn) {
+    if (!input || chatSending || hasStreamingAssistant || codexChecking || !codexAuth.loggedIn) {
       return;
     }
 
@@ -1494,8 +1643,42 @@ export default function App() {
       delete next[activeSessionId];
       return next;
     });
+    setDecisionPreviewBySession((current) => {
+      if (!current[activeSessionId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[activeSessionId];
+      return next;
+    });
+    setProposalsBySession((current) => {
+      const previous = current[activeSessionId];
+      if (!previous?.length) {
+        return current;
+      }
+      const nextProposals = previous.map((proposal) => {
+        if (proposal.status !== "pending" && proposal.status !== "selected") {
+          return proposal;
+        }
+        return {
+          ...proposal,
+          status: "rejected",
+          latestOutput: "当前会话已开始新一轮协作。",
+        };
+      });
+      return {
+        ...current,
+        [activeSessionId]: sortProposals(nextProposals),
+      };
+    });
     try {
-      const updatedSession = await desktop.chatSend(activeSessionId, input, [], activeSessionMode);
+      const updatedSession = await desktop.chatSend(
+        activeSessionId,
+        input,
+        [],
+        activeSessionMode,
+        activeTurnIntent
+      );
       setSessions((current) => upsertSession(current, updatedSession));
     } catch (error) {
       setChatSending(false);
@@ -1595,9 +1778,68 @@ export default function App() {
     }
   };
 
+  const handlePreviewDecision = (proposal) => {
+    if (!activeSessionId) {
+      return;
+    }
+    setDecisionPreviewBySession((current) => ({
+      ...current,
+      [activeSessionId]: proposal.id,
+    }));
+  };
+
   const handleAcceptProposal = async (proposal) => {
     setProposalActionId(proposal.id);
     try {
+      if (proposal.kind === "choice") {
+        setChatSending(true);
+        setProposalPanelState({ loading: true, error: "" });
+        setTurnIntentBySession((current) => ({
+          ...current,
+          [proposal.sessionId]: TURN_INTENT_PREVIEW,
+        }));
+        setStreamProgressBySession((current) => {
+          if (!current[proposal.sessionId]) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[proposal.sessionId];
+          return next;
+        });
+        setStreamMonitorBySession((current) => {
+          if (!current[proposal.sessionId]) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[proposal.sessionId];
+          return next;
+        });
+        const result = await desktop.proposalChoose(proposal.id);
+        setSessions((current) => upsertSession(current, result.session));
+        setProposalsBySession((current) => {
+          const previous = current[result.proposal.sessionId] ?? [];
+          const nextProposals = previous.map((entry) => {
+            if (entry.id === result.proposal.id) {
+              return { ...entry, ...result.proposal };
+            }
+            if (entry.kind === "choice" && entry.status === "pending") {
+              return {
+                ...entry,
+                status: "rejected",
+                latestOutput: "当前会话已选择其他方向。",
+              };
+            }
+            return entry;
+          });
+          return {
+            ...current,
+            [result.proposal.sessionId]: sortProposals(nextProposals),
+          };
+        });
+        setNotice({ kind: "info", text: "已选择这个方向，正在展开具体预览。" });
+        return;
+      }
+
       const updated = await desktop.approvalAccept(proposal.id);
       setProposalsBySession((current) => ({
         ...current,
@@ -1619,6 +1861,14 @@ export default function App() {
         setNotice({ kind: "info", text: "已确认命令建议，正在执行。" });
       }
     } catch (error) {
+      if (proposal.kind === "choice") {
+        setChatSending(false);
+        setProposalPanelState({ loading: false, error: "" });
+        setTurnIntentBySession((current) => ({
+          ...current,
+          [proposal.sessionId]: TURN_INTENT_CHOICE,
+        }));
+      }
       setNotice({ kind: "error", text: normalizeError(error) });
     } finally {
       setProposalActionId("");
@@ -1642,6 +1892,9 @@ export default function App() {
   };
 
   const handleComposerKeyDown = (event) => {
+    if (event.nativeEvent?.isComposing) {
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void handleSend();
@@ -1658,11 +1911,18 @@ export default function App() {
     }
   };
 
-  const canSend = Boolean(activeSessionId && draft.trim() && codexAuth.loggedIn && !codexChecking && !chatSending);
   const hasStreamingAssistant = Boolean(
     activeSession?.messages?.some(
       (message) => message.role === "assistant" && message.status === "streaming"
     )
+  );
+  const canSend = Boolean(
+    activeSessionId &&
+      draft.trim() &&
+      codexAuth.loggedIn &&
+      !codexChecking &&
+      !chatSending &&
+      !hasStreamingAssistant
   );
   const showPendingAssistant = Boolean(
     chatSending && codexAuth.loggedIn && activeSessionId && !hasStreamingAssistant
@@ -1670,7 +1930,11 @@ export default function App() {
   const activeStreamInfo = activeSessionId ? streamProgressBySession[activeSessionId] ?? null : null;
   const activeStreamMessageId = activeStreamInfo?.messageId ?? "";
   const activeStreamProgress = activeStreamInfo?.items ?? [];
-  const pendingAssistantText = pendingAssistantLabel(pendingSeconds, activeSessionMode);
+  const pendingAssistantText = pendingAssistantLabel(
+    pendingSeconds,
+    activeSessionMode,
+    activeTurnIntent
+  );
   const composerHint = !codexAuth.loggedIn
     ? "先登录 ChatGPT 才能发送。"
     : "Enter 发送，Shift+Enter 换行。";
@@ -1701,13 +1965,41 @@ export default function App() {
         : "空";
   const collaborationEnabled = activeSessionMode === SESSION_MODE_WORKSPACE;
   const collaborationAvailable = Boolean(activeSessionWorkspaceId);
+  const selectedChoiceLabel = selectedChoiceProposal?.payload?.optionKey ?? selectedChoiceProposal?.title ?? "";
+  const previewDeckActive = showPreviewCards;
+  const suggestionInspectorTone = proposalPanelState.error
+    ? "error"
+    : decisionProposals.length > 0 || previewDeckActive || proposalPanelState.loading
+      ? "loading"
+      : selectedChoiceProposal
+        ? "active"
+        : "idle";
+  const suggestionInspectorStatus = proposalPanelState.error
+    ? "加载失败"
+    : showDecisionDeck
+      ? `${decisionProposals.length} 个方向`
+      : previewDeckActive
+        ? `${previewProposals.length} 张预览`
+        : proposalPanelState.loading
+          ? "展开中"
+          : selectedChoiceProposal
+            ? "已选择"
+            : "无待确认";
   const composerPlaceholder = collaborationEnabled
-    ? "描述你想让 Solo 结合当前工作区讨论的事；它会先给建议和预览。"
+    ? activeTurnIntent === TURN_INTENT_CHOICE
+      ? "描述你想让 Solo 给出的方向建议；它会先生成方向卡，再由你点开预览。"
+      : activeTurnIntent === TURN_INTENT_PREVIEW
+        ? "描述你想直接展开的具体预览；Solo 会先给改动范围和影响点，不会直接应用。"
+        : "描述你想让 Solo 结合当前工作区分析的事；它会先查看相关文件再回答。"
     : collaborationAvailable
       ? "直接提问；如果这轮需要当前工作区，请先切到工作区协作。"
       : "直接提问；需要代码上下文时先挂载工作区，再切到工作区协作。";
   const chatSubtitle = collaborationEnabled
-    ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先给建议和预览，再由你决定。`
+    ? activeTurnIntent === TURN_INTENT_CHOICE
+      ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先给方向建议，再由你点开预览并确认。`
+      : activeTurnIntent === TURN_INTENT_PREVIEW
+        ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，直接沿当前方向展开具体预览。`
+        : `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先看相关文件，再给结论和依据。`
     : collaborationAvailable
       ? `当前为对话模式。工作区 ${activeWorkspace?.name ?? "当前项目"} 已挂载，只有切到工作区协作时才会参与。`
       : "当前为对话模式。需要代码上下文时再挂载工作区并切到工作区协作。";
@@ -1715,12 +2007,16 @@ export default function App() {
     ? `${activeWorkspace?.name ?? "当前项目"} 已挂载到当前会话`
     : "当前会话还没有挂载工作区";
   const modeIntentText = collaborationEnabled
-    ? "这一轮会结合工作区"
+    ? `这一轮会结合工作区，当前阶段：${turnIntentLabel(activeTurnIntent)}`
     : collaborationAvailable
       ? "这一轮只对话，不自动读工作区"
       : "当前为普通对话";
   const modeGuidanceText = collaborationEnabled
-    ? "Solo 会先查看相关文件，再给建议、权衡和改动预览。"
+    ? activeTurnIntent === TURN_INTENT_CHOICE
+      ? "Solo 会先查看相关文件，再把多个方向整理成可点开的方向卡。"
+      : activeTurnIntent === TURN_INTENT_PREVIEW
+        ? "Solo 会直接展开更具体的改动预览，但仍然不会自动应用。"
+        : "Solo 会先查看相关文件，再给结论、依据和下一步建议。"
     : collaborationAvailable
       ? "工作区只是可用上下文。只有你切到“工作区协作”后，它才会真正参与回答。"
       : "先挂载工作区，再进入工作区协作。";
@@ -2027,6 +2323,55 @@ export default function App() {
                     工作区协作
                   </button>
                 </div>
+                {collaborationEnabled ? (
+                  <div className="mode-switch turn-intent-switch" role="tablist" aria-label="当前回合阶段">
+                    <button
+                      type="button"
+                      className={`ghost-button mode-switch-button ${
+                        activeTurnIntent === TURN_INTENT_AUTO ? "is-active" : ""
+                      }`}
+                      onClick={() =>
+                        setTurnIntentBySession((current) => ({
+                          ...current,
+                          [activeSessionId]: TURN_INTENT_AUTO,
+                        }))
+                      }
+                      aria-pressed={activeTurnIntent === TURN_INTENT_AUTO}
+                    >
+                      协作分析
+                    </button>
+                    <button
+                      type="button"
+                      className={`ghost-button mode-switch-button ${
+                        activeTurnIntent === TURN_INTENT_CHOICE ? "is-active" : ""
+                      }`}
+                      onClick={() =>
+                        setTurnIntentBySession((current) => ({
+                          ...current,
+                          [activeSessionId]: TURN_INTENT_CHOICE,
+                        }))
+                      }
+                      aria-pressed={activeTurnIntent === TURN_INTENT_CHOICE}
+                    >
+                      方向建议
+                    </button>
+                    <button
+                      type="button"
+                      className={`ghost-button mode-switch-button ${
+                        activeTurnIntent === TURN_INTENT_PREVIEW ? "is-active" : ""
+                      }`}
+                      onClick={() =>
+                        setTurnIntentBySession((current) => ({
+                          ...current,
+                          [activeSessionId]: TURN_INTENT_PREVIEW,
+                        }))
+                      }
+                      aria-pressed={activeTurnIntent === TURN_INTENT_PREVIEW}
+                    >
+                      具体预览
+                    </button>
+                  </div>
+                ) : null}
                 {activeSessionWorkspaceId ? (
                   <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
                     解除工作区
@@ -2099,17 +2444,65 @@ export default function App() {
                       progress={activeStreamProgress}
                     />
                   ) : null}
-                  {inlineProposals.length > 0 ? (
-                    <section className="shell-card inline-proposals">
+                  {showDecisionDeck ? (
+                    <section className="shell-card inline-proposals decision-deck">
                       <div className="inline-proposals-head">
                         <div>
-                          <p className="section-eyebrow">Options</p>
-                          <h3>直接选下一步</h3>
+                          <p className="section-eyebrow">Decisions</p>
+                          <h3>先选一个方向</h3>
                         </div>
-                        <p className="inline-proposals-note">不再藏在右栏，这里直接给你候选方向。</p>
+                        <p className="inline-proposals-note">
+                          {decisionProposals.length > 1
+                            ? "左右浏览方向卡，先点开预览，再确认选择。"
+                            : "先点开这个方向的预览，再确认选择。"}
+                        </p>
                       </div>
-                      <div className="proposal-stack">
-                        {inlineProposals.map((proposal) => (
+                      <div
+                        className={`proposal-stack decision-deck-grid ${
+                          decisionProposals.length > 1 ? "is-multi" : ""
+                        }`}
+                      >
+                        {decisionProposals.map((proposal) => (
+                          <DecisionOptionCard
+                            key={proposal.id}
+                            proposal={proposal}
+                            active={activeDecisionPreviewProposal?.id === proposal.id}
+                            onPreview={handlePreviewDecision}
+                          />
+                        ))}
+                      </div>
+                      <DecisionPreviewPanel
+                        proposal={activeDecisionPreviewProposal}
+                        busy={proposalActionId === activeDecisionPreviewProposal?.id}
+                        onConfirm={handleAcceptProposal}
+                      />
+                    </section>
+                  ) : null}
+                  {selectedChoiceProposal ? (
+                    <section className="shell-card selected-choice-banner">
+                      <div className="selected-choice-banner-head">
+                        <p className="section-eyebrow">Selected</p>
+                        <span className="drawer-chip drawer-chip-active">已选择</span>
+                      </div>
+                      <h3>{selectedChoiceLabel || "已选择一个方向"}</h3>
+                      <p>
+                        {previewDeckActive
+                          ? "这个方向的预览已经展开在下方，确认后才会应用。"
+                          : "正在沿这个方向生成更具体的预览。"}
+                      </p>
+                    </section>
+                  ) : null}
+                  {showPreviewCards ? (
+                    <section className="shell-card inline-proposals preview-card-set">
+                      <div className="inline-proposals-head">
+                        <div>
+                          <p className="section-eyebrow">Preview</p>
+                          <h3>确认具体预览</h3>
+                        </div>
+                        <p className="inline-proposals-note">这些都只是预览，确认后才会真正应用。</p>
+                      </div>
+                      <div className="proposal-stack preview-card-grid">
+                        {previewProposals.map((proposal) => (
                           <ProposalCard
                             key={proposal.id}
                             proposal={proposal}
@@ -2143,7 +2536,7 @@ export default function App() {
               <textarea
                 className="composer-input"
                 value={draft}
-                disabled={!codexAuth.loggedIn || codexChecking || chatSending}
+                disabled={!codexAuth.loggedIn || codexChecking || chatSending || hasStreamingAssistant}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
                 placeholder={composerPlaceholder}
@@ -2242,35 +2635,31 @@ export default function App() {
                   <span className="section-eyebrow">Suggestions</span>
                   <strong>建议与确认</strong>
                 </div>
-                <span className={`drawer-chip drawer-chip-${pendingProposalCount > 0 ? "loading" : "idle"}`}>
-                  {pendingProposalCount > 0 ? `${pendingProposalCount} 待确认` : "无待确认"}
+                <span className={`drawer-chip drawer-chip-${suggestionInspectorTone}`}>
+                  {suggestionInspectorStatus}
                 </span>
               </div>
               <div className="drawer-preview-body">
                 <p className="proposal-panel-note">AI 先给建议和预览，是否应用由你决定。</p>
-                {proposalPanelState.loading ? <p>正在加载建议列表…</p> : null}
                 {proposalPanelState.error ? (
                   <div className="status-banner status-banner-error">
                     <strong>加载失败</strong>
                     <span>{proposalPanelState.error}</span>
                   </div>
                 ) : null}
-                {!proposalPanelState.loading && !proposalPanelState.error && activeProposals.length === 0 ? (
+                {!proposalPanelState.error ? (
                   <div className="proposal-empty">
-                    <p>当前会话还没有需要你确认的建议。</p>
-                  </div>
-                ) : null}
-                {activeProposals.length > 0 ? (
-                  <div className="proposal-stack">
-                    {activeProposals.map((proposal) => (
-                      <ProposalCard
-                        key={proposal.id}
-                        proposal={proposal}
-                        busy={proposalActionId === proposal.id}
-                        onAccept={handleAcceptProposal}
-                        onReject={handleRejectProposal}
-                      />
-                    ))}
+                    <p>
+                      {showDecisionDeck
+                        ? `主区有 ${decisionProposals.length} 个方向卡，先选一个方向。`
+                        : previewDeckActive
+                          ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
+                          : proposalPanelState.loading
+                            ? "正在根据你刚选的方向展开具体预览…"
+                            : selectedChoiceProposal
+                              ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
+                              : "当前会话还没有需要你确认的建议。"}
+                    </p>
                   </div>
                 ) : null}
               </div>

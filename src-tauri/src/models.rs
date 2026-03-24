@@ -64,6 +64,15 @@ pub enum SessionInteractionMode {
     WorkspaceCollaboration,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnIntent {
+    #[default]
+    Auto,
+    Choice,
+    Preview,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatSession {
@@ -211,4 +220,11 @@ pub struct CommandOutputEvent {
 pub struct CommandFinishedEvent {
     pub proposal_id: String,
     pub exit_code: i32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalChooseResult {
+    pub session: ChatSession,
+    pub proposal: ToolProposal,
 }

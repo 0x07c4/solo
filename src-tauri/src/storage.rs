@@ -8,7 +8,10 @@ use std::{
     cmp::Ordering,
     fs,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
@@ -17,6 +20,7 @@ const SETTINGS_FILE: &str = "settings.json";
 const SESSIONS_FILE: &str = "sessions.json";
 const WORKSPACES_FILE: &str = "workspaces.json";
 const PROPOSALS_FILE: &str = "approvals.json";
+static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct SharedState(pub Arc<InnerState>);
@@ -136,7 +140,8 @@ pub fn now_millis() -> i64 {
 }
 
 pub fn make_id(prefix: &str) -> String {
-    format!("{prefix}_{}", now_millis())
+    let sequence = ID_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    format!("{prefix}_{}_{}", now_millis(), sequence)
 }
 
 pub fn canonicalize_workspace(path: &str) -> Result<PathBuf, String> {
@@ -178,10 +183,16 @@ pub fn resolve_workspace_file(
 
 pub fn build_workspace_tree(workspace: &Workspace, max_depth: u8) -> Result<FileTreeNode, String> {
     let root = Path::new(&workspace.path);
-    build_node(root, root, max_depth)
+    let ignore_patterns = read_workspace_ignore_patterns(workspace);
+    build_node(root, root, max_depth, &ignore_patterns)
 }
 
-fn build_node(root: &Path, path: &Path, max_depth: u8) -> Result<FileTreeNode, String> {
+fn build_node(
+    root: &Path,
+    path: &Path,
+    max_depth: u8,
+    ignore_patterns: &[String],
+) -> Result<FileTreeNode, String> {
     let name = if path == root {
         root.file_name()
             .and_then(|name| name.to_str())
@@ -227,7 +238,20 @@ fn build_node(root: &Path, path: &Path, max_depth: u8) -> Result<FileTreeNode, S
 
     for entry in entries {
         let child_path = entry.path();
-        children.push(build_node(root, &child_path, max_depth.saturating_sub(1))?);
+        let child_relative = child_path
+            .strip_prefix(root)
+            .ok()
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if is_workspace_path_ignored(&child_relative, ignore_patterns) {
+            continue;
+        }
+        children.push(build_node(
+            root,
+            &child_path,
+            max_depth.saturating_sub(1),
+            ignore_patterns,
+        )?);
     }
 
     Ok(FileTreeNode {
@@ -242,6 +266,10 @@ pub fn read_workspace_file(
     workspace: &Workspace,
     relative_path: &str,
 ) -> Result<FileReadResult, String> {
+    let ignore_patterns = read_workspace_ignore_patterns(workspace);
+    if is_workspace_path_ignored(relative_path, &ignore_patterns) {
+        return Err(format!("path `{relative_path}` is ignored by .ignore"));
+    }
     let absolute = resolve_workspace_file(workspace, relative_path)?;
     let content = fs::read_to_string(&absolute)
         .map_err(|err| format!("read file failed for {}: {err}", absolute.display()))?;
@@ -336,6 +364,10 @@ pub fn apply_write_proposal(
             next_content_preview,
             ..
         } => {
+            let ignore_patterns = read_workspace_ignore_patterns(workspace);
+            if is_workspace_path_ignored(relative_path, &ignore_patterns) {
+                return Err(format!("path `{relative_path}` is ignored by .ignore"));
+            }
             let absolute = resolve_workspace_file(workspace, relative_path)?;
             let current = if absolute.exists() {
                 fs::read_to_string(&absolute)
@@ -358,6 +390,50 @@ pub fn apply_write_proposal(
         ToolProposalPayload::Command { .. } => Err("proposal is not a write action".to_string()),
         ToolProposalPayload::Choice { .. } => Err("proposal is not a write action".to_string()),
     }
+}
+
+pub fn read_workspace_ignore_patterns(workspace: &Workspace) -> Vec<String> {
+    let ignore_path = Path::new(&workspace.path).join(".ignore");
+    let Ok(content) = fs::read_to_string(ignore_path) else {
+        return Vec::new();
+    };
+
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            line.trim_start_matches("./")
+                .trim_matches('/')
+                .replace('\\', "/")
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+pub fn is_workspace_path_ignored(relative_path: &str, ignore_patterns: &[String]) -> bool {
+    let normalized = relative_path
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('/');
+    if normalized.is_empty() {
+        return false;
+    }
+
+    ignore_patterns.iter().any(|pattern| {
+        let normalized_pattern = pattern.trim().trim_start_matches("./").trim_matches('/');
+        if normalized_pattern.is_empty() {
+            return false;
+        }
+        if normalized_pattern.contains('/') {
+            normalized == normalized_pattern
+                || normalized.starts_with(&format!("{normalized_pattern}/"))
+        } else {
+            normalized
+                .split('/')
+                .any(|segment| segment == normalized_pattern)
+        }
+    })
 }
 
 fn read_json_or_default<T>(path: PathBuf) -> Result<T, String>

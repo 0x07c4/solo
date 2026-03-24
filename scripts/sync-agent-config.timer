@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Codex agent config sync daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=sync-agent-config.service
+
+[Install]
+WantedBy=timers.target

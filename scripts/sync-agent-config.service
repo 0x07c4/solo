@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync Codex agent config snapshot
+
+[Service]
+Type=oneshot
+ExecStart=%h/.codex/bin/sync-agent-config.sh

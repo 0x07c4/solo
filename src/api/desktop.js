@@ -23,11 +23,12 @@ export const desktop = {
     invoke("workspace_tree", { workspaceId, maxDepth }),
   workspaceReadFile: (workspaceId, relativePath) =>
     invoke("workspace_read_file", { workspaceId, relativePath }),
-  chatSend: (sessionId, input, attachmentPaths, interactionMode) =>
-    invoke("chat_send", { sessionId, input, attachmentPaths, interactionMode }),
+  chatSend: (sessionId, input, attachmentPaths, interactionMode, turnIntent) =>
+    invoke("chat_send", { sessionId, input, attachmentPaths, interactionMode, turnIntent }),
   manualImportAssistantReply: (sessionId, content) =>
     invoke("manual_import_assistant_reply", { sessionId, content }),
   approvalList: (sessionId = null) => invoke("approval_list", { sessionId }),
+  proposalChoose: (proposalId) => invoke("proposal_choose", { proposalId }),
   approvalAccept: (proposalId) => invoke("approval_accept", { proposalId }),
   approvalReject: (proposalId) => invoke("approval_reject", { proposalId }),
 };

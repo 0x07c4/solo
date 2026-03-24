@@ -5,14 +5,14 @@ mod storage;
 use crate::models::{
     ChatMessage, ChatSession, ChatStreamDoneEvent, ChatStreamStatusEvent, ChatStreamTokenEvent,
     CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent, ConnectionTestResult,
-    ManualImportResult, MessageAttachment, SessionInteractionMode, Settings, SettingsUpdate,
-    ToolProposal, ToolProposalPayload, Workspace,
+    ManualImportResult, MessageAttachment, ProposalChooseResult, SessionInteractionMode, Settings,
+    SettingsUpdate, ToolProposal, ToolProposalPayload, TurnIntent, Workspace,
 };
 use crate::openai::{chat_completion, test_connection, CompletionMessage};
 use crate::storage::{
     apply_write_proposal, build_workspace_tree, canonicalize_workspace, diff_text, make_id,
-    now_millis, preview_file_result, read_workspace_file, resolve_workspace_file,
-    update_recent_files, SharedState,
+    now_millis, preview_file_result, read_workspace_file, read_workspace_ignore_patterns,
+    resolve_workspace_file, update_recent_files, SharedState,
 };
 use serde::Deserialize;
 use std::{
@@ -20,7 +20,10 @@ use std::{
     io::{BufRead, BufReader},
     path::Path,
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager, State};
@@ -74,6 +77,7 @@ pub fn run() {
             chat_send,
             manual_import_assistant_reply,
             approval_list,
+            proposal_choose,
             approval_accept,
             approval_reject
         ])
@@ -458,6 +462,7 @@ async fn chat_send(
     input: String,
     attachment_paths: Option<Vec<String>>,
     interaction_mode: SessionInteractionMode,
+    turn_intent: Option<TurnIntent>,
     app: tauri::AppHandle,
     state: State<'_, SharedState>,
 ) -> Result<ChatSession, String> {
@@ -479,22 +484,45 @@ async fn chat_send(
             validate_model_settings(&store.settings)?;
         }
 
-        let session = store
+        let session_index = store
             .sessions
             .iter_mut()
-            .find(|session| session.id == session_id)
+            .position(|session| session.id == session_id)
             .ok_or_else(|| "session not found".to_string())?;
 
         if interaction_mode == SessionInteractionMode::WorkspaceCollaboration
-            && session.workspace_id.is_none()
+            && store.sessions[session_index].workspace_id.is_none()
         {
             return Err("请先为当前会话挂载工作区，再进入工作区协作。".to_string());
         }
 
+        let archived_proposal_ids = store
+            .proposals
+            .iter_mut()
+            .filter(|proposal| {
+                proposal.session_id == session_id
+                    && matches!(proposal.status.as_str(), "pending" | "selected")
+            })
+            .map(|proposal| {
+                proposal.status = "rejected".to_string();
+                proposal.error = None;
+                proposal.latest_output = Some("当前会话已开始新一轮协作。".to_string());
+                proposal.id.clone()
+            })
+            .collect::<Vec<_>>();
+
+        let session = &mut store.sessions[session_index];
         if session.title == "新会话" && !input.trim().is_empty() {
             session.title = derive_session_title(&input);
         }
         session.interaction_mode = interaction_mode.clone();
+        if !archived_proposal_ids.is_empty() {
+            session.pending_approvals.retain(|proposal_id| {
+                !archived_proposal_ids
+                    .iter()
+                    .any(|entry| entry == proposal_id)
+            });
+        }
 
         let message_id = make_id("message");
         let attachment_refs = attachments
@@ -505,18 +533,28 @@ async fn chat_send(
             })
             .collect::<Vec<_>>();
 
-        session.messages.push(ChatMessage {
-            id: message_id.clone(),
-            role: "user".to_string(),
-            content: input.clone(),
-            timestamp: now_millis(),
-            status: "done".to_string(),
-            attachments: attachment_refs,
-        });
+        let latest_user_message_id = if let Some(existing_message_id) =
+            reuse_retry_user_message(session, &input, &attachment_refs)
+        {
+            existing_message_id
+        } else {
+            session.messages.push(ChatMessage {
+                id: message_id.clone(),
+                role: "user".to_string(),
+                content: input.clone(),
+                timestamp: now_millis(),
+                status: "done".to_string(),
+                attachments: attachment_refs,
+            });
+            message_id
+        };
         session.updated_at = now_millis();
         let cloned = session.clone();
+        if !archived_proposal_ids.is_empty() {
+            store.save_proposals()?;
+        }
         store.save_sessions()?;
-        Ok((cloned, message_id))
+        Ok((cloned, latest_user_message_id))
     })?;
 
     if effective_provider == "manual" {
@@ -526,6 +564,7 @@ async fn chat_send(
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let execution_mode = TurnExecutionMode::from(interaction_mode);
+        let turn_intent = turn_intent.unwrap_or_default();
         if let Err(err) = process_chat_turn(
             app_handle.clone(),
             state_handle.clone(),
@@ -535,6 +574,8 @@ async fn chat_send(
             attachments,
             effective_provider,
             execution_mode,
+            turn_intent,
+            None,
         )
         .await
         {
@@ -638,6 +679,137 @@ fn approval_list(
     state: State<'_, SharedState>,
 ) -> Result<Vec<ToolProposal>, String> {
     Ok(state.read(|store| store.sorted_proposals(session_id.as_deref())))
+}
+
+#[tauri::command]
+async fn proposal_choose(
+    proposal_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<ProposalChooseResult, String> {
+    let state_handle = state.inner().clone();
+    let provider = state_handle.read(|store| store.settings.provider.clone());
+    let effective_provider = if provider == "openai" {
+        match codex_login_status() {
+            Ok(status) if status.logged_in => "codex_cli".to_string(),
+            _ => "openai".to_string(),
+        }
+    } else {
+        provider.clone()
+    };
+
+    let (session, proposal, latest_user_message_id, followup_input) =
+        state_handle.update(|store| {
+            let proposal = store
+                .proposals
+                .iter_mut()
+                .find(|proposal| proposal.id == proposal_id)
+                .ok_or_else(|| "proposal not found".to_string())?;
+
+            let ToolProposalPayload::Choice {
+                workspace_id,
+                option_key,
+                detail,
+            } = &proposal.payload
+            else {
+                return Err("只有方向建议支持展开预览。".to_string());
+            };
+
+            if proposal.status != "pending" {
+                return Err(format!(
+                    "该提案当前状态为 `{}`，不能继续展开。",
+                    proposal.status
+                ));
+            }
+
+            let session = store
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == proposal.session_id)
+                .ok_or_else(|| "session not found".to_string())?;
+
+            if session.workspace_id.as_deref() != Some(workspace_id.as_str()) {
+                return Err("当前方向建议绑定的工作区已变化，请重新生成建议。".to_string());
+            }
+
+            proposal.status = "selected".to_string();
+            proposal.error = None;
+            proposal.latest_output = Some("已选择这个方向，正在展开具体预览。".to_string());
+            session
+                .pending_approvals
+                .retain(|entry| entry != &proposal_id);
+            session.interaction_mode = SessionInteractionMode::WorkspaceCollaboration;
+
+            let message_id = make_id("message");
+            let user_content = format!("已选择方向 {}，展开具体预览。", option_key);
+            session.messages.push(ChatMessage {
+                id: message_id.clone(),
+                role: "user".to_string(),
+                content: user_content,
+                timestamp: now_millis(),
+                status: "done".to_string(),
+                attachments: Vec::new(),
+            });
+            session.updated_at = now_millis();
+
+            let followup_input = build_choice_followup_input(option_key, detail);
+            let cloned_session = session.clone();
+            let cloned_proposal = proposal.clone();
+            store.save_proposals()?;
+            store.save_sessions()?;
+            Ok((cloned_session, cloned_proposal, message_id, followup_input))
+        })?;
+
+    let _ = app.emit("approval-updated", &proposal);
+
+    if effective_provider != "manual" {
+        let app_handle = app.clone();
+        let session_id = session.id.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) = process_chat_turn(
+                app_handle.clone(),
+                state_handle.clone(),
+                session_id.clone(),
+                latest_user_message_id,
+                followup_input.clone(),
+                Vec::new(),
+                effective_provider,
+                TurnExecutionMode::Agent,
+                TurnIntent::Preview,
+                Some(followup_input),
+            )
+            .await
+            {
+                let assistant_message_id = make_id("message");
+                let _ = persist_assistant_message(
+                    &state_handle,
+                    &session_id,
+                    &assistant_message_id,
+                    &format!("请求失败：{err}"),
+                    "error",
+                );
+                let _ = app_handle.emit(
+                    "chat-stream-done",
+                    ChatStreamDoneEvent {
+                        session_id: session_id.clone(),
+                        session_title: state_handle.read(|store| {
+                            store
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == session_id)
+                                .map(|session| session.title.clone())
+                                .unwrap_or_else(|| "新会话".to_string())
+                        }),
+                        message_id: assistant_message_id,
+                        content: format!("请求失败：{err}"),
+                        status: "error".to_string(),
+                    },
+                );
+            }
+        });
+    }
+
+    Ok(ProposalChooseResult { session, proposal })
 }
 
 #[tauri::command]
@@ -846,6 +1018,8 @@ async fn process_chat_turn(
     attachment_paths: Vec<String>,
     effective_provider: String,
     execution_mode: TurnExecutionMode,
+    turn_intent: TurnIntent,
+    model_input_override: Option<String>,
 ) -> Result<(), String> {
     let snapshot = state.read(|store| {
         let settings = store.settings.clone();
@@ -875,6 +1049,10 @@ async fn process_chat_turn(
     let (mut settings, session, workspace) = snapshot;
     settings.provider = effective_provider;
     let session = session.ok_or_else(|| "session not found".to_string())?;
+    let workspace_ignore_patterns = workspace
+        .as_ref()
+        .map(read_workspace_ignore_patterns)
+        .unwrap_or_default();
 
     let attachment_blobs = attachment_paths
         .iter()
@@ -915,6 +1093,9 @@ async fn process_chat_turn(
     for message in &session.messages {
         let mut content = message.content.clone();
         if message.role == "user" && message.id == latest_user_message_id {
+            if let Some(override_input) = model_input_override.as_ref() {
+                content = override_input.clone();
+            }
             content = build_augmented_user_message(&content, &attachment_blobs);
         }
         match message.role.as_str() {
@@ -932,8 +1113,10 @@ async fn process_chat_turn(
             assistant_message_id.clone(),
             &latest_user_input,
             execution_mode,
+            turn_intent.clone(),
             &messages,
             workspace.as_ref(),
+            &workspace_ignore_patterns,
         )
         .await?
     } else {
@@ -981,12 +1164,22 @@ async fn process_chat_turn(
 
         if let Some(active_workspace) = workspace.as_ref() {
             let parsed_blocks = parse_manual_reply_blocks(&raw_reply).unwrap_or_default();
-            let choice_blocks = if parsed_blocks.is_empty() {
-                parse_reply_choice_blocks(&visible_reply)
+            let parsed_choice_blocks = parsed_blocks
+                .iter()
+                .filter_map(|block| {
+                    matches!(block, ManualReplyBlock::Choice { .. }).then_some(block.clone())
+                })
+                .collect::<Vec<_>>();
+            let choice_blocks = if !parsed_choice_blocks.is_empty() {
+                parsed_choice_blocks
             } else {
-                Vec::new()
+                parse_reply_choice_blocks(&visible_reply)
             };
-            let proposal_blocks = if parsed_blocks.is_empty() {
+            let proposal_blocks = if execution_mode == TurnExecutionMode::Agent
+                && turn_intent == TurnIntent::Choice
+            {
+                choice_blocks
+            } else if parsed_blocks.is_empty() {
                 choice_blocks
             } else {
                 parsed_blocks
@@ -1019,10 +1212,11 @@ async fn process_chat_turn(
 
     if visible_reply.trim().is_empty() {
         visible_reply = if generated_proposals.is_empty() {
-            "我已经整理出当前请求的建议；如果涉及改动项目或运行命令，会先给出预览并等待你确认。".to_string()
+            "我已经整理出当前请求的建议；如果涉及改动项目或运行命令，会先给出预览并等待你确认。"
+                .to_string()
         } else {
             format!(
-                "我整理了 {} 条建议，已经放到右侧等待你确认。",
+                "我整理了 {} 条建议，已经放到主区卡片里，等你确认。",
                 generated_proposals.len()
             )
         };
@@ -1062,21 +1256,39 @@ fn build_proposal_focused_reply(reply: &str, proposals: &[ToolProposal]) -> Stri
         .collect::<Vec<_>>()
         .join("、");
     let conclusion = first_meaningful_reply_line(reply);
+    let all_choices = proposals.iter().all(|proposal| proposal.kind == "choice");
 
     match conclusion {
-        Some(line) if !title_summary.is_empty() => format!(
-            "我整理了 {count} 条可确认建议，已放到右侧预览：{title_summary}。\n结论：{line}"
-        ),
-        Some(line) => format!("我整理了 {count} 条可确认建议，已放到右侧预览。\n结论：{line}"),
-        None if !title_summary.is_empty() => {
-            format!("我整理了 {count} 条可确认建议，已放到右侧预览：{title_summary}。")
+        Some(line) if all_choices && !title_summary.is_empty() => {
+            format!("我整理了 {count} 个可选方向，先看下方方向卡：{title_summary}。\n结论：{line}")
         }
-        None => format!("我整理了 {count} 条可确认建议，已放到右侧预览。"),
+        Some(line) if all_choices => {
+            format!("我整理了 {count} 个可选方向，先看下方方向卡。\n结论：{line}")
+        }
+        Some(line) if !title_summary.is_empty() => format!(
+            "我把这个方向整理成 {count} 张预览卡，直接看下方：{title_summary}。\n结论：{line}"
+        ),
+        Some(line) => format!("我把这个方向整理成 {count} 张预览卡，直接看下方。\n结论：{line}"),
+        None if !title_summary.is_empty() => {
+            if all_choices {
+                format!("我整理了 {count} 个可选方向，先看下方方向卡：{title_summary}。")
+            } else {
+                format!("我把这个方向整理成 {count} 张预览卡，直接看下方：{title_summary}。")
+            }
+        }
+        None => {
+            if all_choices {
+                format!("我整理了 {count} 个可选方向，先看下方方向卡。")
+            } else {
+                format!("我把这个方向整理成 {count} 张预览卡，直接看下方。")
+            }
+        }
     }
 }
 
 fn first_meaningful_reply_line(reply: &str) -> Option<String> {
-    reply.lines()
+    reply
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter(|line| !line.starts_with("```"))
@@ -1091,17 +1303,25 @@ async fn run_codex_chat_turn_streaming(
     message_id: String,
     latest_user_input: &str,
     execution_mode: TurnExecutionMode,
+    turn_intent: TurnIntent,
     messages: &[CompletionMessage],
     workspace: Option<&Workspace>,
+    workspace_ignore_patterns: &[String],
 ) -> Result<(String, bool), String> {
     let status = codex_login_status()?;
     if !status.logged_in {
         return Err("未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string());
     }
 
-    let prompt = build_codex_exec_prompt(messages, execution_mode);
+    let prompt = build_codex_exec_prompt(
+        messages,
+        execution_mode,
+        turn_intent,
+        workspace_ignore_patterns,
+    );
     let workspace_path = workspace.map(|entry| entry.path.clone());
     let latest_user_input = latest_user_input.to_string();
+    let workspace_ignore_patterns = workspace_ignore_patterns.to_vec();
 
     tauri::async_runtime::spawn_blocking(move || {
         let output_file =
@@ -1161,6 +1381,19 @@ async fn run_codex_chat_turn_streaming(
                 &format!("使用工作区：{workspace_name}"),
                 "info",
             );
+            if !workspace_ignore_patterns.is_empty() {
+                emit_chat_stream_status(
+                    &app,
+                    &session_id,
+                    &message_id,
+                    "工作区",
+                    &format!(
+                        "已应用 .ignore，默认跳过 {}",
+                        summarize_ignore_patterns(&workspace_ignore_patterns, 3)
+                    ),
+                    "info",
+                );
+            }
         }
 
         if execution_mode == TurnExecutionMode::QuickChat {
@@ -1252,11 +1485,14 @@ async fn run_codex_chat_turn_streaming(
 
         let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let stderr_lines_capture = Arc::clone(&stderr_lines);
+        let reconnect_exhausted = Arc::new(AtomicBool::new(false));
+        let reconnect_exhausted_stderr = Arc::clone(&reconnect_exhausted);
         let app_stderr = app.clone();
         let session_for_stderr = session_id.clone();
         let message_for_stderr = message_id.clone();
         let stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
+            let mut last_status = String::new();
             for raw_line in reader.lines().map_while(Result::ok) {
                 let trimmed = raw_line.trim();
                 if trimmed.is_empty()
@@ -1271,19 +1507,36 @@ async fn run_codex_chat_turn_streaming(
                 if let Ok(mut lines) = stderr_lines_capture.lock() {
                     lines.push(trimmed.to_string());
                 }
-                let level = if trimmed.to_ascii_lowercase().contains("error") {
-                    "error"
-                } else {
-                    "warn"
-                };
+                let (stage, detail, level, terminal) = classify_codex_cli_stderr(trimmed)
+                    .unwrap_or_else(|| {
+                        let level = if trimmed.to_ascii_lowercase().contains("error") {
+                            "error".to_string()
+                        } else {
+                            "warn".to_string()
+                        };
+                        (
+                            "CLI".to_string(),
+                            summarize_status_text(trimmed, 96),
+                            level,
+                            false,
+                        )
+                    });
+                if terminal {
+                    reconnect_exhausted_stderr.store(true, Ordering::Relaxed);
+                }
+                let key = format!("{stage}|{detail}|{level}");
+                if key == last_status {
+                    continue;
+                }
+                last_status = key;
                 let _ = app_stderr.emit(
                     "chat-stream-status",
                     ChatStreamStatusEvent {
                         session_id: session_for_stderr.clone(),
                         message_id: message_for_stderr.clone(),
-                        stage: "CLI".to_string(),
-                        detail: summarize_status_text(trimmed, 96),
-                        level: level.to_string(),
+                        stage,
+                        detail,
+                        level,
                     },
                 );
             }
@@ -1307,6 +1560,20 @@ async fn run_codex_chat_turn_streaming(
                         .lock()
                         .map(|text| text.trim().is_empty())
                         .unwrap_or(true);
+                    if reconnect_exhausted.load(Ordering::Relaxed) {
+                        emit_chat_stream_status(
+                            &app,
+                            &session_id,
+                            &message_id,
+                            "失败",
+                            "Codex CLI 重连失败，本轮请求已终止。",
+                            "error",
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = fs::remove_file(&output_file);
+                        return Err("Codex CLI 重连失败，请重试。".to_string());
+                    }
                     if no_stream_text && !warned_no_text_20s && elapsed >= no_text_warn_1 {
                         warned_no_text_20s = true;
                         emit_chat_stream_status(
@@ -1328,10 +1595,7 @@ async fn run_codex_chat_turn_streaming(
                             &session_id,
                             &message_id,
                             "监控",
-                            &format!(
-                                "{} 秒仍无正文输出，继续等待中。",
-                                no_text_warn_2.as_secs()
-                            ),
+                            &format!("{} 秒仍无正文输出，继续等待中。", no_text_warn_2.as_secs()),
                             "warn",
                         );
                     }
@@ -1361,10 +1625,7 @@ async fn run_codex_chat_turn_streaming(
                             &session_id,
                             &message_id,
                             "监控",
-                            &format!(
-                                "请求接近超时阈值（{} 秒）。",
-                                max_total_timeout.as_secs()
-                            ),
+                            &format!("请求接近超时阈值（{} 秒）。", max_total_timeout.as_secs()),
                             "warn",
                         );
                     }
@@ -1394,10 +1655,7 @@ async fn run_codex_chat_turn_streaming(
                             &session_id,
                             &message_id,
                             "超时",
-                            &format!(
-                                "{} 秒内未收到模型完成信号。",
-                                max_total_timeout.as_secs()
-                            ),
+                            &format!("{} 秒内未收到模型完成信号。", max_total_timeout.as_secs()),
                             "error",
                         );
                         let _ = child.kill();
@@ -1654,7 +1912,10 @@ fn extract_codex_item_status(
     value: &serde_json::Value,
 ) -> Option<(String, String, String)> {
     let item = value.get("item")?;
-    let item_type = item.get("type").and_then(|entry| entry.as_str()).unwrap_or_default();
+    let item_type = item
+        .get("type")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or_default();
     if item_type.is_empty() {
         return None;
     }
@@ -1715,9 +1976,7 @@ fn summarize_command_execution(command: &str) -> String {
     {
         return "检查前端构建状态".to_string();
     }
-    if lower.contains("npm run lint")
-        || lower.contains("pnpm lint")
-        || lower.contains("yarn lint")
+    if lower.contains("npm run lint") || lower.contains("pnpm lint") || lower.contains("yarn lint")
     {
         return "检查前端代码规范".to_string();
     }
@@ -1733,6 +1992,32 @@ fn summarize_command_execution(command: &str) -> String {
     }
 
     "查看工作区上下文".to_string()
+}
+
+fn classify_codex_cli_stderr(line: &str) -> Option<(String, String, String, bool)> {
+    let lower = line.to_ascii_lowercase();
+
+    if lower.contains("reconnecting")
+        && (lower.contains("5/5") || lower.contains("timeout waiting for child process to exit"))
+    {
+        return Some((
+            "连接".to_string(),
+            "Codex CLI 与模型连接异常，重连已耗尽。".to_string(),
+            "error".to_string(),
+            true,
+        ));
+    }
+
+    if lower.contains("reconnecting") {
+        return Some((
+            "连接".to_string(),
+            "连接出现波动，正在重试…".to_string(),
+            "warn".to_string(),
+            false,
+        ));
+    }
+
+    None
 }
 
 fn extract_path_like_token(text: &str) -> Option<String> {
@@ -1835,6 +2120,8 @@ fn summarize_status_text(input: &str, max_chars: usize) -> String {
 fn build_codex_exec_prompt(
     messages: &[CompletionMessage],
     execution_mode: TurnExecutionMode,
+    turn_intent: TurnIntent,
+    workspace_ignore_patterns: &[String],
 ) -> String {
     let model_hint = read_codex_config_model();
     let latest_user_text = messages
@@ -1872,15 +2159,58 @@ fn build_codex_exec_prompt(
              3) 优先给基于当前工作区的建议、选项、权衡和预览；\
              4) 不要在工作区协作模式下给脱离仓库的空泛模板，除非用户明确说只要通用示例；\
              5) 涉及写文件、执行命令或其他副作用动作时，不要默认替用户执行，应把决策权交给用户；\
-             6) 如果你建议修改文件，请在正常说明之外，附加 ```solo-write path=\"相对路径\" summary=\"一句话摘要\"``` 代码块，代码块内容必须是文件修改后的完整内容；\
-             7) 如果你建议执行命令，请在正常说明之外，附加 ```solo-command cwd=\".\" reason=\"一句话原因\"``` 代码块，代码块内容必须是要执行的命令；\
-             8) 如果用户问“你是什么模型/型号”，且上下文里有“当前模型提示”，就直接回答这个模型名。"
+             6) 只有当前轮次明确进入“方向建议”或“具体预览”阶段时，才输出结构化代码块；\
+             7) 如果用户问“你是什么模型/型号”，且上下文里有“当前模型提示”，就直接回答这个模型名。"
             .to_string(),
     };
     lines.push(base_rules);
     if execution_mode == TurnExecutionMode::Agent {
+        if !workspace_ignore_patterns.is_empty() {
+            lines.push(format!(
+                "当前工作区存在 .ignore 规则。默认不要查看这些路径，除非用户明确点名要求：{}。",
+                summarize_ignore_patterns(workspace_ignore_patterns, 5)
+            ));
+        }
         if let Some(last_user) = latest_user_text.as_deref() {
-            if workspace_collab_prefers_structured_preview(last_user) {
+            let wants_choices = match turn_intent {
+                TurnIntent::Choice => true,
+                TurnIntent::Preview => false,
+                TurnIntent::Auto => {
+                    wants_direction_choices(last_user) && !is_choice_preview_request(last_user)
+                }
+            };
+            let wants_preview = match turn_intent {
+                TurnIntent::Preview => true,
+                TurnIntent::Choice => false,
+                TurnIntent::Auto => is_choice_preview_request(last_user),
+            };
+            if wants_choices {
+                lines.push(
+                    "这轮用户要的是多个方向，而不是立刻落地改动。\
+                     输出规则再收紧：\
+                     1) 先用一句极短结论说明你整理了几个方向；\
+                     2) 然后附加 2 到 3 个 ```solo-choice key=\"A\" title=\"方向标题\" summary=\"一句话摘要\"``` 代码块；\
+                     3) 每个 solo-choice 代码块正文写这个方向的预览，包括：改动目标、涉及文件、收益、风险；\
+                     4) 这一轮不要输出 ```solo-write``` 或 ```solo-command```；\
+                     5) 不要把多个方向压成一张写文件预览卡。"
+                        .to_string(),
+                );
+            }
+            if wants_preview {
+                lines.push(
+                    "这轮不是继续发散多个方向，而是沿用户刚选中的方向继续。\
+                     输出规则再收紧：\
+                     1) 只保留一句极短结论；\
+                     2) 直接进入结构化预览，优先给出目标文件/范围、改动目的、影响点、风险提示、预期结果；\
+                     3) 如果已经足够具体，至少给出一个 ```solo-write``` 或 ```solo-command``` 候选块；\
+                     4) 不要重复前一轮的大段分析，不要再给 A/B 多方向。"
+                        .to_string(),
+                );
+            }
+            if !wants_choices
+                && !wants_preview
+                && workspace_collab_prefers_structured_preview(last_user)
+            {
                 lines.push(
                     "这轮用户期待的是“建议 + 预览”，不要只停留在口头点评。\
                      如果你针对某个具体文件提出修改建议，至少给出一个 ```solo-write``` 候选改动块；\
@@ -1968,6 +2298,109 @@ fn workspace_collab_prefers_structured_preview(input: &str) -> bool {
     }
 
     references_workspace_file(input)
+}
+
+fn is_choice_preview_request(input: &str) -> bool {
+    input.contains("已选择方向") || input.contains("展开具体预览") || input.contains("继续这一方向")
+}
+
+fn wants_direction_choices(input: &str) -> bool {
+    let normalized = input.to_ascii_lowercase();
+    [
+        "两个方向",
+        "两种方向",
+        "两个方案",
+        "两种方案",
+        "几个方向",
+        "几个方案",
+        "先让我选",
+        "先给我选项",
+        "先给建议",
+        "不要直接应用",
+        "先不要直接应用",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
+}
+
+fn build_choice_followup_input(option_key: &str, detail: &str) -> String {
+    format!(
+        "已选择方向 {option_key}：{detail}\n\
+         请直接继续这一方向，并给出结构化预览。\
+         输出重点：目标文件或范围、改动目的、影响点、风险提示、预期结果。\
+         如果你已经能给出具体候选，至少附加一个 ```solo-write``` 或 ```solo-command```。\
+         不要再给多个方向，也不要重复前面的长篇分析。"
+    )
+}
+
+fn attachments_match(message: &ChatMessage, attachments: &[MessageAttachment]) -> bool {
+    if message.attachments.len() != attachments.len() {
+        return false;
+    }
+
+    message
+        .attachments
+        .iter()
+        .zip(attachments.iter())
+        .all(|(left, right)| left.relative_path == right.relative_path && left.label == right.label)
+}
+
+fn reuse_retry_user_message(
+    session: &mut ChatSession,
+    input: &str,
+    attachments: &[MessageAttachment],
+) -> Option<String> {
+    let trimmed_input = input.trim();
+    if trimmed_input.is_empty() {
+        return None;
+    }
+
+    if let Some(last) = session.messages.last() {
+        if last.role == "user"
+            && last.content.trim() == trimmed_input
+            && attachments_match(last, attachments)
+        {
+            return Some(last.id.clone());
+        }
+    }
+
+    if session.messages.len() < 2 {
+        return None;
+    }
+
+    let last_index = session.messages.len() - 1;
+    let last_is_error = session.messages[last_index].role == "assistant"
+        && session.messages[last_index].status == "error";
+    let previous = &session.messages[last_index - 1];
+    if last_is_error
+        && previous.role == "user"
+        && previous.content.trim() == trimmed_input
+        && attachments_match(previous, attachments)
+    {
+        let message_id = previous.id.clone();
+        session.messages.pop();
+        return Some(message_id);
+    }
+
+    None
+}
+
+fn summarize_ignore_patterns(patterns: &[String], max_items: usize) -> String {
+    if patterns.is_empty() {
+        return "无".to_string();
+    }
+
+    let shown = patterns
+        .iter()
+        .take(max_items)
+        .map(|pattern| format!("`{pattern}`"))
+        .collect::<Vec<_>>();
+
+    if patterns.len() > max_items {
+        format!("{} 等 {} 项路径", shown.join("、"), patterns.len())
+    } else {
+        shown.join("、")
+    }
 }
 
 fn references_workspace_file(input: &str) -> bool {
@@ -2578,6 +3011,7 @@ fn create_reply_proposals(
     Ok(created)
 }
 
+#[derive(Clone)]
 enum ManualReplyBlock {
     Write {
         path: String,
@@ -2591,6 +3025,8 @@ enum ManualReplyBlock {
     },
     Choice {
         option_key: String,
+        title: Option<String>,
+        summary: Option<String>,
         detail: String,
     },
 }
@@ -2602,7 +3038,10 @@ fn parse_manual_reply_blocks(content: &str) -> Result<Vec<ManualReplyBlock>, Str
 
     while index < lines.len() {
         let line = lines[index].trim();
-        if line.starts_with("```solo-write") || line.starts_with("```solo-command") {
+        if line.starts_with("```solo-write")
+            || line.starts_with("```solo-command")
+            || line.starts_with("```solo-choice")
+        {
             let header = line.trim_start_matches("```").trim();
             let mut body = Vec::new();
             index += 1;
@@ -2628,7 +3067,7 @@ fn parse_manual_reply_blocks(content: &str) -> Result<Vec<ManualReplyBlock>, Str
                     content: body.join("\n"),
                     summary,
                 });
-            } else {
+            } else if header.starts_with("solo-command") {
                 let cwd = attrs
                     .iter()
                     .find_map(|(key, value)| (key == "cwd").then(|| value.clone()));
@@ -2639,6 +3078,30 @@ fn parse_manual_reply_blocks(content: &str) -> Result<Vec<ManualReplyBlock>, Str
                     cwd,
                     command: body.join("\n").trim().to_string(),
                     reason,
+                });
+            } else {
+                let option_key = attrs
+                    .iter()
+                    .find_map(|(key, value)| {
+                        (key == "key" || key == "option" || key == "option_key")
+                            .then(|| value.clone())
+                    })
+                    .ok_or_else(|| "solo-choice 代码块缺少 key=...".to_string())?;
+                let title = attrs
+                    .iter()
+                    .find_map(|(key, value)| (key == "title").then(|| value.clone()));
+                let summary = attrs
+                    .iter()
+                    .find_map(|(key, value)| (key == "summary").then(|| value.clone()));
+                let detail = body.join("\n").trim().to_string();
+                if detail.is_empty() {
+                    return Err("solo-choice 代码块内容不能为空。".to_string());
+                }
+                blocks.push(ManualReplyBlock::Choice {
+                    option_key,
+                    title,
+                    summary,
+                    detail,
                 });
             }
         }
@@ -2655,7 +3118,10 @@ fn strip_manual_reply_blocks(content: &str) -> String {
 
     while index < lines.len() {
         let line = lines[index].trim();
-        if line.starts_with("```solo-write") || line.starts_with("```solo-command") {
+        if line.starts_with("```solo-write")
+            || line.starts_with("```solo-command")
+            || line.starts_with("```solo-choice")
+        {
             index += 1;
             while index < lines.len() && lines[index].trim() != "```" {
                 index += 1;
@@ -2685,6 +3151,8 @@ fn parse_reply_choice_blocks(content: &str) -> Vec<ManualReplyBlock> {
         "其中一种预览",
         "两个版本",
         "两个方案",
+        "两个优化方向",
+        "两种优化方向",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -2699,12 +3167,38 @@ fn parse_reply_choice_blocks(content: &str) -> Vec<ManualReplyBlock> {
 
     let mut blocks = Vec::new();
     let mut in_selection_group = false;
+    let mut current_key: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    let push_current = |blocks: &mut Vec<ManualReplyBlock>,
+                        current_key: &mut Option<String>,
+                        current_lines: &mut Vec<String>| {
+        let Some(option_key) = current_key.take() else {
+            return;
+        };
+        let detail = summarize_status_text(&current_lines.join("\n"), 420);
+        current_lines.clear();
+        if detail.is_empty() {
+            return;
+        }
+        let title = derive_choice_title(&detail, &option_key);
+        blocks.push(ManualReplyBlock::Choice {
+            option_key,
+            title: Some(title),
+            summary: Some(summarize_status_text(&detail, 72)),
+            detail,
+        });
+    };
+
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let normalized_line = trimmed.trim_start_matches('-').trim_start_matches('*').trim();
+        let normalized_line = trimmed
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim();
         let lower_line = normalized_line.to_ascii_lowercase();
         if [
             "你现在直接选",
@@ -2721,39 +3215,86 @@ fn parse_reply_choice_blocks(content: &str) -> Vec<ManualReplyBlock> {
             in_selection_group = true;
             continue;
         }
+
         let normalized = trimmed
             .trim_start_matches('-')
             .trim_start_matches('*')
             .trim();
-        let Some((raw_key, detail)) = normalized.split_once([':', '：']) else {
-            if in_selection_group && (trimmed.starts_with('-') || trimmed.starts_with('*')) {
-                blocks.push(ManualReplyBlock::Choice {
-                    option_key: (blocks.len() + 1).to_string(),
-                    detail: summarize_status_text(normalized, 240),
-                });
+        if let Some((raw_key, detail)) = normalized
+            .split_once([':', '：'])
+            .or_else(|| extract_choice_prefix(normalized))
+        {
+            let key = raw_key.trim().trim_end_matches(['.', '、', ')']).trim();
+            if matches!(key, "A" | "B" | "C" | "1" | "2" | "3") {
+                in_selection_group = true;
+                push_current(&mut blocks, &mut current_key, &mut current_lines);
+                current_key = Some(key.to_string());
+                if !detail.trim().is_empty() {
+                    current_lines.push(detail.trim().to_string());
+                }
                 continue;
             }
-            if in_selection_group {
-                break;
-            }
-            continue;
-        };
-        let key = raw_key.trim().trim_end_matches(['.', '、', ')']).trim();
-        let is_option_key = matches!(key, "A" | "B" | "C" | "1" | "2" | "3");
-        if !is_option_key {
+        }
+
+        if in_selection_group
+            && current_key.is_none()
+            && (trimmed.starts_with('-') || trimmed.starts_with('*'))
+        {
+            let option_key = (blocks.len() + 1).to_string();
+            let title = derive_choice_title(normalized, &option_key);
+            blocks.push(ManualReplyBlock::Choice {
+                option_key,
+                title: Some(title.clone()),
+                summary: Some(summarize_status_text(normalized, 72)),
+                detail: summarize_status_text(normalized, 240),
+            });
             continue;
         }
-        let detail = detail.trim();
-        if detail.is_empty() {
-            continue;
+
+        if current_key.is_some() {
+            current_lines.push(normalized.to_string());
+        } else if in_selection_group {
+            break;
         }
-        blocks.push(ManualReplyBlock::Choice {
-            option_key: key.to_string(),
-            detail: summarize_status_text(detail, 240),
-        });
     }
 
+    push_current(&mut blocks, &mut current_key, &mut current_lines);
     blocks
+}
+
+fn extract_choice_prefix(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    for separator in [")", "）", ".", "、"] {
+        if let Some((left, right)) = trimmed.split_once(separator) {
+            let key = left.trim();
+            if matches!(key, "A" | "B" | "C" | "1" | "2" | "3") {
+                let detail = right.trim();
+                if !detail.is_empty() {
+                    return Some((key, detail));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn derive_choice_title(detail: &str, option_key: &str) -> String {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return format!("方向 {option_key}");
+    }
+
+    let first = trimmed
+        .split(['，', ',', '。', ';', '；', '\n'])
+        .find(|entry| !entry.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let compact = summarize_status_text(first, 36);
+    if compact.is_empty() {
+        format!("方向 {option_key}")
+    } else {
+        compact
+    }
 }
 
 fn parse_block_attrs(header: &str) -> Vec<(String, String)> {
@@ -2903,13 +3444,21 @@ fn create_manual_proposal(
             store.proposals.push(proposal.clone());
             Ok(proposal)
         }
-        ManualReplyBlock::Choice { option_key, detail } => {
+        ManualReplyBlock::Choice {
+            option_key,
+            title,
+            summary,
+            detail,
+        } => {
+            let title = title
+                .filter(|entry| !entry.trim().is_empty())
+                .unwrap_or_else(|| format!("方向 {option_key}"));
             let proposal = ToolProposal {
                 id: make_id("proposal"),
                 session_id: session_id.to_string(),
                 kind: "choice".to_string(),
-                title: format!("采用方向 {option_key}"),
-                summary: detail.clone(),
+                title,
+                summary: summary.unwrap_or_else(|| summarize_status_text(&detail, 84)),
                 created_at: now_millis(),
                 status: "pending".to_string(),
                 payload: ToolProposalPayload::Choice {
