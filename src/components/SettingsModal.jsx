@@ -20,6 +20,16 @@ function validateForm(form) {
   return errors;
 }
 
+function proxyModeLabel(mode) {
+  if (mode === "direct") {
+    return "直连：不跟随环境变量。";
+  }
+  if (mode === "manual") {
+    return "手动代理：只注入给 ChatGPT / Codex 通道，不影响 Solo 页面。";
+  }
+  return "跟随环境：继续使用当前 shell / 系统里的代理变量。";
+}
+
 export function SettingsModal({
   open,
   settings,
@@ -55,6 +65,7 @@ export function SettingsModal({
     }
     return "保存后请先测试连接，再开始聊天。";
   }, [connectionState, form.provider]);
+  const proxyMode = form.codexProxyMode || "inherit";
 
   if (!open) {
     return null;
@@ -168,6 +179,66 @@ export function SettingsModal({
             </span>
           </div>
         )}
+
+        {form.provider === "codex_cli" ? (
+          <>
+            <label className="field">
+              <span>Codex 代理</span>
+              <select
+                value={proxyMode}
+                onChange={(event) => updateField("codexProxyMode", event.target.value)}
+              >
+                <option value="direct">直连</option>
+                <option value="inherit">跟随环境</option>
+                <option value="manual">手动配置</option>
+              </select>
+              <small className="field-hint">{proxyModeLabel(proxyMode)}</small>
+            </label>
+
+            {proxyMode === "manual" ? (
+              <>
+                <label className="field">
+                  <span>HTTP Proxy</span>
+                  <input
+                    value={form.codexHttpProxy || ""}
+                    placeholder="http://127.0.0.1:7897"
+                    onChange={(event) => updateField("codexHttpProxy", event.target.value)}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>HTTPS Proxy</span>
+                  <input
+                    value={form.codexHttpsProxy || ""}
+                    placeholder="http://127.0.0.1:7897"
+                    onChange={(event) => updateField("codexHttpsProxy", event.target.value)}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>ALL_PROXY</span>
+                  <input
+                    value={form.codexAllProxy || ""}
+                    placeholder="socks5://127.0.0.1:7897"
+                    onChange={(event) => updateField("codexAllProxy", event.target.value)}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>NO_PROXY</span>
+                  <input
+                    value={form.codexNoProxy || ""}
+                    placeholder="localhost,127.0.0.1,::1"
+                    onChange={(event) => updateField("codexNoProxy", event.target.value)}
+                  />
+                  <small className="field-hint">
+                    这里只作用于 ChatGPT / Codex 子进程，不会影响 Solo 自己的页面加载。
+                  </small>
+                </label>
+              </>
+            ) : null}
+          </>
+        ) : null}
 
         <div className="toggle-row">
           <label>

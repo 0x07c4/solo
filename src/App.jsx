@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { desktop } from "./api/desktop";
+import { SettingsModal } from "./components/SettingsModal";
 import { WorkspaceModal } from "./components/WorkspaceModal";
 import "./App.css";
 
@@ -26,6 +27,20 @@ const THEME_OPTIONS = [
   { value: "dracula", label: "Dracula" },
   { value: "kanagawa", label: "Kanagawa" },
 ];
+const DEFAULT_SETTINGS = {
+  provider: "codex_cli",
+  baseUrl: "https://api.openai.com/v1",
+  apiKey: "",
+  modelId: "",
+  theme: DEFAULT_THEME,
+  confirmWrites: true,
+  confirmCommands: true,
+  codexProxyMode: "inherit",
+  codexHttpProxy: "",
+  codexHttpsProxy: "",
+  codexAllProxy: "",
+  codexNoProxy: "",
+};
 
 const SUPPORTED_THEMES = new Set(THEME_OPTIONS.map((theme) => theme.value));
 
@@ -35,6 +50,34 @@ function normalizeTheme(theme) {
   }
   const normalized = theme.trim().toLowerCase();
   return SUPPORTED_THEMES.has(normalized) ? normalized : DEFAULT_THEME;
+}
+
+function normalizeSettings(settings) {
+  if (!settings || typeof settings !== "object") {
+    return { ...DEFAULT_SETTINGS };
+  }
+  return {
+    ...DEFAULT_SETTINGS,
+    ...settings,
+    provider: typeof settings.provider === "string" && settings.provider.trim()
+      ? settings.provider.trim()
+      : DEFAULT_SETTINGS.provider,
+    baseUrl: typeof settings.baseUrl === "string" ? settings.baseUrl.trim() : DEFAULT_SETTINGS.baseUrl,
+    apiKey: typeof settings.apiKey === "string" ? settings.apiKey.trim() : "",
+    modelId: typeof settings.modelId === "string" ? settings.modelId.trim() : "",
+    theme: normalizeTheme(settings.theme),
+    confirmWrites: settings.confirmWrites !== false,
+    confirmCommands: settings.confirmCommands !== false,
+    codexProxyMode:
+      settings.codexProxyMode === "direct" || settings.codexProxyMode === "manual"
+        ? settings.codexProxyMode
+        : "inherit",
+    codexHttpProxy: typeof settings.codexHttpProxy === "string" ? settings.codexHttpProxy.trim() : "",
+    codexHttpsProxy:
+      typeof settings.codexHttpsProxy === "string" ? settings.codexHttpsProxy.trim() : "",
+    codexAllProxy: typeof settings.codexAllProxy === "string" ? settings.codexAllProxy.trim() : "",
+    codexNoProxy: typeof settings.codexNoProxy === "string" ? settings.codexNoProxy.trim() : "",
+  };
 }
 
 function normalizeError(error) {
@@ -305,6 +348,7 @@ function humanizeProgressDetail(entry) {
   if (!detail) {
     return "";
   }
+  const lower = detail.toLowerCase();
   if (entry?.stage === "思考") {
     return "";
   }
@@ -313,6 +357,15 @@ function humanizeProgressDetail(entry) {
   }
   if (entry?.stage === "执行工具" && detail.endsWith("已完成")) {
     return "";
+  }
+  if (lower.includes("reconnecting") && lower.includes("timeout waiting for child process to exit")) {
+    return "Codex CLI 子进程回收超时，正在结束这轮请求。";
+  }
+  if (lower.includes("reconnecting")) {
+    return "Codex CLI 正在重新建立连接。";
+  }
+  if (lower.includes("timeout waiting for child process to exit")) {
+    return "Codex CLI 子进程回收超时。";
   }
   if (detail.includes("秒仍未收到正文输出")) {
     return "模型还在整理结果";
@@ -803,6 +856,9 @@ export default function App() {
   const [streamMonitorBySession, setStreamMonitorBySession] = useState({});
   const [draft, setDraft] = useState("");
   const [theme, setTheme] = useState(DEFAULT_THEME);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [connectionState, setConnectionState] = useState({ status: "idle", message: "" });
 
   const streamProgressRef = useRef({});
   const streamMonitorRef = useRef({});
@@ -990,17 +1046,14 @@ export default function App() {
           nextSessions = [createdSession];
         }
 
-        const normalizedTheme = normalizeTheme(loadedSettings?.theme);
+        let normalizedSettings = normalizeSettings(loadedSettings);
         const settingsPatch = {};
-        if (loadedSettings.provider !== "codex_cli") {
+        if (normalizedSettings.provider !== "codex_cli") {
           settingsPatch.provider = "codex_cli";
-        }
-        if (loadedSettings.theme !== normalizedTheme) {
-          settingsPatch.theme = normalizedTheme;
         }
         if (Object.keys(settingsPatch).length > 0) {
           try {
-            await desktop.settingsUpdate(settingsPatch);
+            normalizedSettings = normalizeSettings(await desktop.settingsUpdate(settingsPatch));
           } catch {
             // Non-fatal: UI can continue with local fallback state.
           }
@@ -1010,7 +1063,8 @@ export default function App() {
           return;
         }
 
-        setTheme(normalizedTheme);
+        setTheme(normalizedSettings.theme);
+        setSettings(normalizedSettings);
         setWorkspaces(loadedWorkspaces);
         setSessions(sortSessions(nextSessions));
         setActiveSessionId(nextSessions[0]?.id ?? "");
@@ -1906,8 +1960,45 @@ export default function App() {
     setTheme(nextTheme);
     try {
       await desktop.settingsUpdate({ theme: nextTheme });
+      setSettings((current) => ({ ...current, theme: nextTheme }));
     } catch (error) {
       setNotice({ kind: "error", text: `主题保存失败：${normalizeError(error)}` });
+    }
+  };
+
+  const handleSaveSettings = async (form) => {
+    const normalized = normalizeSettings(form);
+    const saved = normalizeSettings(await desktop.settingsUpdate(normalized));
+    setSettings(saved);
+    setTheme(saved.theme);
+    setConnectionState({
+      status: "success",
+      message: saved.provider === "codex_cli"
+        ? "设置已保存。后续 ChatGPT / Codex 子进程会使用新的代理规则。"
+        : "设置已保存。",
+    });
+    setSettingsModalOpen(false);
+    setNotice({
+      kind: "success",
+      text:
+        saved.provider === "codex_cli"
+          ? "设置已保存。新的代理配置会直接用于后续 ChatGPT / Codex 请求。"
+          : "设置已保存。",
+    });
+  };
+
+  const handleTestSettings = async (form) => {
+    const normalized = normalizeSettings(form);
+    setConnectionState({ status: "testing", message: "正在测试连接…" });
+    try {
+      const result = await desktop.settingsTestConnection(normalized);
+      setConnectionState({
+        status: result.success ? "success" : "error",
+        message: result.message,
+      });
+    } catch (error) {
+      setConnectionState({ status: "error", message: normalizeError(error) });
+      throw error;
     }
   };
 
@@ -2105,6 +2196,17 @@ export default function App() {
             <span className="status-pill-label">工作区</span>
             <strong className="status-pill-value status-pill-code">{workspaceStatusText}</strong>
           </div>
+          <button
+            type="button"
+            className="status-pill status-pill-button"
+            onClick={() => {
+              setConnectionState({ status: "idle", message: "" });
+              setSettingsModalOpen(true);
+            }}
+          >
+            <span className="status-pill-label">设置</span>
+            <strong className="status-pill-value">网络</strong>
+          </button>
         </div>
         {hasCustomWindowChrome ? (
           <div className="window-controls">
@@ -2135,6 +2237,18 @@ export default function App() {
           </div>
         ) : null}
       </header>
+
+      <SettingsModal
+        open={settingsModalOpen}
+        settings={settings}
+        connectionState={connectionState}
+        onClose={() => {
+          setConnectionState({ status: "idle", message: "" });
+          setSettingsModalOpen(false);
+        }}
+        onSave={handleSaveSettings}
+        onTest={handleTestSettings}
+      />
 
       {notice ? (
         <section className={`status-banner status-banner-${notice.kind}`}>
@@ -2457,11 +2571,7 @@ export default function App() {
                             : "先点开这个方向的预览，再确认选择。"}
                         </p>
                       </div>
-                      <div
-                        className={`proposal-stack decision-deck-grid ${
-                          decisionProposals.length > 1 ? "is-multi" : ""
-                        }`}
-                      >
+                      <div className={`decision-deck-grid ${decisionProposals.length > 1 ? "is-multi" : ""}`}>
                         {decisionProposals.map((proposal) => (
                           <DecisionOptionCard
                             key={proposal.id}

@@ -1,6 +1,6 @@
 # Solo 上下文与计划
 
-最后更新：2026-03-24
+最后更新：2026-03-26
 
 ## 1. 当前目标
 
@@ -122,6 +122,12 @@
    - 只有用户明确点击“确认选择这个方向”后，Solo 才沿该方向继续生成更具体的改动预览。
    - `应用改动 / 执行命令` 只能出现在真正的预览卡阶段，不能在方向选择阶段提前出现。
 
+25. **代理优先只注入给 `codex` 子进程，不污染整个桌面应用**
+   - 开发环境里全局设置 `http_proxy/https_proxy/all_proxy` 会把 `localhost` 和 Vite dev server 一起代理走，导致 Tauri 白屏。
+   - Solo 应优先读取 `SOLO_CODEX_HTTP_PROXY / SOLO_CODEX_HTTPS_PROXY / SOLO_CODEX_ALL_PROXY / SOLO_CODEX_NO_PROXY`，并只把这些变量注入给 `codex` 子进程。
+   - 若用户仍使用普通 `http_proxy/https_proxy/...` 启动应用，则必须同时设置 `NO_PROXY=localhost,127.0.0.1,::1`。
+   - 正式产品路径不是要求用户手动 `export`；而是通过设置页保存 `直连 / 跟随环境 / 手动代理`，再由后端只注入给 `codex` 子进程。
+
 ## 3. 当前实现快照
 
 - 前端：React + Vite（`src/App.jsx`, `src/App.css`）
@@ -138,10 +144,13 @@
 - Sidebar：已去掉大部分文件树 badge 和过亮列表装饰，继续往更安静的 editor list 收敛
 - Window：已切换为自绘深色标题栏，避免 Linux 默认白色系统栏破坏主题
 - Behavior：普通聊天与工作区协作已改成显式模式切换，不再靠输入内容猜测
+- Proxy：`codex login status` / `codex login` / `codex exec` 已支持独立的 `SOLO_CODEX_*` 代理环境变量，并回退到普通代理变量
+- Settings：设置弹窗已重新接回主界面，并新增 `Codex 代理` 模式（直连 / 跟随环境 / 手动配置），保存后立即作用于后续 `codex` 子进程
 - UX：工作区列表与聊天头部已明确区分“挂载上下文”和“进入协作”
 - Streaming：已开始解析 `codex --json` 的 `item.*` 事件，让工作区协作时的读文件/执行命令/中间说明能显示成可读进度，而不是只看到 thread/turn started
 - Streaming：工作区协作不再沿用统一 180 秒总超时；已改成按模式区分的“总超时 + 空闲超时”，并优先显示产品化阶段摘要，而不是原始 `zsh/sed/rg` 命令细节
 - Streaming：前端等待文案与监控阈值也按模式区分；工作区协作不得再笼统提示“网络较慢”，而应明确说明正在查看工作区、整理建议与预览
+- Streaming：`Reconnecting... (timeout waiting for child process to exit)` 这类 Codex CLI 重连噪声不应被当成“有进展”；它不再刷新活动时间，并且会更早触发失败，避免工作区协作假活着卡几百秒
 - Suggestions：当建议卡片通过事件流到达时，右侧抽屉会立即结束 loading 状态，不再出现“卡片已出现但仍在加载列表”
 - Suggestions：当回复里已经明确给出 A/B 方向选择但没有 `solo-write` / `solo-command` 结构块时，右侧也应生成“方向建议”卡，避免主消息有选项而抽屉为空
 - Suggestions：即使当前回合没有产出 proposal，流式结束后右侧“建议与确认”也必须停止 loading，避免出现“回复结束了但抽屉还在转”的假状态

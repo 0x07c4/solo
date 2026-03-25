@@ -21,7 +21,7 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -101,9 +101,115 @@ fn open_chatgpt_in_browser() -> Result<bool, String> {
     Err(format!("无法打开默认浏览器：{last_error}"))
 }
 
-#[tauri::command]
-fn codex_login_status() -> Result<CodexLoginStatus, String> {
-    let command_output = Command::new("codex").args(["login", "status"]).output();
+fn first_env_value(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn normalize_codex_proxy_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "direct" => "direct",
+        "manual" => "manual",
+        _ => "inherit",
+    }
+}
+
+fn clear_codex_proxy_env(command: &mut Command) {
+    for key in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn set_proxy_var(command: &mut Command, lower: &str, upper: &str, value: Option<&str>) {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            command.env(lower, value);
+            command.env(upper, value);
+        }
+        None => {
+            command.env_remove(lower);
+            command.env_remove(upper);
+        }
+    }
+}
+
+fn apply_codex_proxy_env(command: &mut Command, settings: Option<&Settings>) {
+    let mode = settings
+        .map(|settings| normalize_codex_proxy_mode(&settings.codex_proxy_mode))
+        .unwrap_or("inherit");
+
+    clear_codex_proxy_env(command);
+
+    match mode {
+        "direct" => {}
+        "manual" => {
+            let settings = settings.cloned().unwrap_or_default();
+            set_proxy_var(
+                command,
+                "http_proxy",
+                "HTTP_PROXY",
+                Some(settings.codex_http_proxy.as_str()),
+            );
+            set_proxy_var(
+                command,
+                "https_proxy",
+                "HTTPS_PROXY",
+                Some(settings.codex_https_proxy.as_str()),
+            );
+            set_proxy_var(
+                command,
+                "all_proxy",
+                "ALL_PROXY",
+                Some(settings.codex_all_proxy.as_str()),
+            );
+            set_proxy_var(
+                command,
+                "no_proxy",
+                "NO_PROXY",
+                Some(settings.codex_no_proxy.as_str()),
+            );
+        }
+        _ => {
+            let http_proxy = first_env_value(&[
+                "SOLO_CODEX_HTTP_PROXY",
+                "SOLO_CODEX_PROXY",
+                "http_proxy",
+                "HTTP_PROXY",
+            ]);
+            let https_proxy = first_env_value(&[
+                "SOLO_CODEX_HTTPS_PROXY",
+                "SOLO_CODEX_PROXY",
+                "https_proxy",
+                "HTTPS_PROXY",
+            ]);
+            let all_proxy = first_env_value(&["SOLO_CODEX_ALL_PROXY", "all_proxy", "ALL_PROXY"]);
+            let no_proxy = first_env_value(&["SOLO_CODEX_NO_PROXY", "no_proxy", "NO_PROXY"]);
+
+            set_proxy_var(command, "http_proxy", "HTTP_PROXY", http_proxy.as_deref());
+            set_proxy_var(command, "https_proxy", "HTTPS_PROXY", https_proxy.as_deref());
+            set_proxy_var(command, "all_proxy", "ALL_PROXY", all_proxy.as_deref());
+            set_proxy_var(command, "no_proxy", "NO_PROXY", no_proxy.as_deref());
+        }
+    }
+}
+
+fn run_codex_login_status(settings: &Settings) -> Result<CodexLoginStatus, String> {
+    let mut command = Command::new("codex");
+    apply_codex_proxy_env(&mut command, Some(settings));
+    let command_output = command.args(["login", "status"]).output();
 
     match command_output {
         Ok(output) => {
@@ -171,8 +277,17 @@ fn codex_login_status() -> Result<CodexLoginStatus, String> {
 }
 
 #[tauri::command]
-fn codex_login_start() -> Result<bool, String> {
-    Command::new("codex")
+fn codex_login_status(state: State<'_, SharedState>) -> Result<CodexLoginStatus, String> {
+    let settings = state.read(|store| store.settings.clone());
+    run_codex_login_status(&settings)
+}
+
+#[tauri::command]
+fn codex_login_start(state: State<'_, SharedState>) -> Result<bool, String> {
+    let settings = state.read(|store| store.settings.clone());
+    let mut command = Command::new("codex");
+    apply_codex_proxy_env(&mut command, Some(&settings));
+    command
         .arg("login")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -213,6 +328,22 @@ fn settings_update(
         if let Some(value) = update.confirm_commands {
             store.settings.confirm_commands = value;
         }
+        if let Some(value) = update.codex_proxy_mode {
+            store.settings.codex_proxy_mode = normalize_codex_proxy_mode(&value).to_string();
+        }
+        if let Some(value) = update.codex_http_proxy {
+            store.settings.codex_http_proxy = value.trim().to_string();
+        }
+        if let Some(value) = update.codex_https_proxy {
+            store.settings.codex_https_proxy = value.trim().to_string();
+        }
+        if let Some(value) = update.codex_all_proxy {
+            store.settings.codex_all_proxy = value.trim().to_string();
+        }
+        if let Some(value) = update.codex_no_proxy {
+            store.settings.codex_no_proxy = value.trim().to_string();
+        }
+        store.settings = normalize_settings(store.settings.clone());
         store.save_settings()?;
         Ok(store.settings.clone())
     })
@@ -225,7 +356,7 @@ async fn settings_test_connection(
 ) -> Result<ConnectionTestResult, String> {
     let normalized = normalize_settings(settings);
     if normalized.provider == "codex_cli" {
-        let status = codex_login_status()?;
+        let status = run_codex_login_status(&normalized)?;
         if status.logged_in {
             return Ok(ConnectionTestResult {
                 success: true,
@@ -469,9 +600,10 @@ async fn chat_send(
     let state_handle = state.inner().clone();
     let attachments = attachment_paths.unwrap_or_default();
 
-    let provider = state_handle.read(|store| store.settings.provider.clone());
+    let settings_snapshot = state_handle.read(|store| store.settings.clone());
+    let provider = settings_snapshot.provider.clone();
     let effective_provider = if provider == "openai" {
-        match codex_login_status() {
+        match run_codex_login_status(&settings_snapshot) {
             Ok(status) if status.logged_in => "codex_cli".to_string(),
             _ => "openai".to_string(),
         }
@@ -688,9 +820,10 @@ async fn proposal_choose(
     state: State<'_, SharedState>,
 ) -> Result<ProposalChooseResult, String> {
     let state_handle = state.inner().clone();
-    let provider = state_handle.read(|store| store.settings.provider.clone());
+    let settings_snapshot = state_handle.read(|store| store.settings.clone());
+    let provider = settings_snapshot.provider.clone();
     let effective_provider = if provider == "openai" {
-        match codex_login_status() {
+        match run_codex_login_status(&settings_snapshot) {
             Ok(status) if status.logged_in => "codex_cli".to_string(),
             _ => "openai".to_string(),
         }
@@ -1111,6 +1244,7 @@ async fn process_chat_turn(
             app.clone(),
             session_id.clone(),
             assistant_message_id.clone(),
+            &settings,
             &latest_user_input,
             execution_mode,
             turn_intent.clone(),
@@ -1301,6 +1435,7 @@ async fn run_codex_chat_turn_streaming(
     app: tauri::AppHandle,
     session_id: String,
     message_id: String,
+    settings: &Settings,
     latest_user_input: &str,
     execution_mode: TurnExecutionMode,
     turn_intent: TurnIntent,
@@ -1308,7 +1443,7 @@ async fn run_codex_chat_turn_streaming(
     workspace: Option<&Workspace>,
     workspace_ignore_patterns: &[String],
 ) -> Result<(String, bool), String> {
-    let status = codex_login_status()?;
+    let status = run_codex_login_status(settings)?;
     if !status.logged_in {
         return Err("未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string());
     }
@@ -1320,6 +1455,7 @@ async fn run_codex_chat_turn_streaming(
         workspace_ignore_patterns,
     );
     let workspace_path = workspace.map(|entry| entry.path.clone());
+    let codex_settings = settings.clone();
     let latest_user_input = latest_user_input.to_string();
     let workspace_ignore_patterns = workspace_ignore_patterns.to_vec();
 
@@ -1356,6 +1492,7 @@ async fn run_codex_chat_turn_streaming(
         );
 
         let mut command = Command::new("codex");
+        apply_codex_proxy_env(&mut command, Some(&codex_settings));
         command
             .arg("exec")
             .arg("--skip-git-repo-check")
@@ -1487,6 +1624,8 @@ async fn run_codex_chat_turn_streaming(
         let stderr_lines_capture = Arc::clone(&stderr_lines);
         let reconnect_exhausted = Arc::new(AtomicBool::new(false));
         let reconnect_exhausted_stderr = Arc::clone(&reconnect_exhausted);
+        let reconnect_attempts = Arc::new(AtomicUsize::new(0));
+        let reconnect_attempts_stderr = Arc::clone(&reconnect_attempts);
         let app_stderr = app.clone();
         let session_for_stderr = session_id.clone();
         let message_for_stderr = message_id.clone();
@@ -1501,15 +1640,19 @@ async fn run_codex_chat_turn_streaming(
                 {
                     continue;
                 }
-                if let Ok(mut timestamp) = last_activity_stderr.lock() {
-                    *timestamp = Instant::now();
+                let is_noise = is_codex_cli_noise_status(trimmed);
+                if !is_noise {
+                    if let Ok(mut timestamp) = last_activity_stderr.lock() {
+                        *timestamp = Instant::now();
+                    }
                 }
                 if let Ok(mut lines) = stderr_lines_capture.lock() {
                     lines.push(trimmed.to_string());
                 }
+                let lower = trimmed.to_ascii_lowercase();
                 let (stage, detail, level, terminal) = classify_codex_cli_stderr(trimmed)
                     .unwrap_or_else(|| {
-                        let level = if trimmed.to_ascii_lowercase().contains("error") {
+                        let level = if lower.contains("error") {
                             "error".to_string()
                         } else {
                             "warn".to_string()
@@ -1521,14 +1664,19 @@ async fn run_codex_chat_turn_streaming(
                             false,
                         )
                     });
-                if terminal {
-                    reconnect_exhausted_stderr.store(true, Ordering::Relaxed);
-                }
                 let key = format!("{stage}|{detail}|{level}");
                 if key == last_status {
                     continue;
                 }
                 last_status = key;
+                if lower.contains("reconnecting") {
+                    let attempts = reconnect_attempts_stderr.fetch_add(1, Ordering::Relaxed) + 1;
+                    if terminal || attempts >= 2 {
+                        reconnect_exhausted_stderr.store(true, Ordering::Relaxed);
+                    }
+                } else if terminal {
+                    reconnect_exhausted_stderr.store(true, Ordering::Relaxed);
+                }
                 let _ = app_stderr.emit(
                     "chat-stream-status",
                     ChatStreamStatusEvent {
@@ -1560,19 +1708,28 @@ async fn run_codex_chat_turn_streaming(
                         .lock()
                         .map(|text| text.trim().is_empty())
                         .unwrap_or(true);
+                    let reconnect_attempts = reconnect_attempts.load(Ordering::Relaxed);
                     if reconnect_exhausted.load(Ordering::Relaxed) {
                         emit_chat_stream_status(
                             &app,
                             &session_id,
                             &message_id,
                             "失败",
-                            "Codex CLI 重连失败，本轮请求已终止。",
+                            if reconnect_attempts > 0 {
+                                "Codex CLI 连续重连且未恢复，本轮请求已提前终止。"
+                            } else {
+                                "Codex CLI 重连失败，本轮请求已终止。"
+                            },
                             "error",
                         );
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = fs::remove_file(&output_file);
-                        return Err("Codex CLI 重连失败，请重试。".to_string());
+                        return Err(if reconnect_attempts > 0 {
+                            "Codex CLI 多次重连仍未恢复，请重试。".to_string()
+                        } else {
+                            "Codex CLI 重连失败，请重试。".to_string()
+                        });
                     }
                     if no_stream_text && !warned_no_text_20s && elapsed >= no_text_warn_1 {
                         warned_no_text_20s = true;
@@ -1997,9 +2154,16 @@ fn summarize_command_execution(command: &str) -> String {
 fn classify_codex_cli_stderr(line: &str) -> Option<(String, String, String, bool)> {
     let lower = line.to_ascii_lowercase();
 
-    if lower.contains("reconnecting")
-        && (lower.contains("5/5") || lower.contains("timeout waiting for child process to exit"))
-    {
+    if lower.contains("timeout waiting for child process to exit") {
+        return Some((
+            "连接".to_string(),
+            "Codex CLI 子进程退出超时，本轮请求准备终止。".to_string(),
+            "error".to_string(),
+            true,
+        ));
+    }
+
+    if lower.contains("reconnecting") && lower.contains("5/5") {
         return Some((
             "连接".to_string(),
             "Codex CLI 与模型连接异常，重连已耗尽。".to_string(),
@@ -2018,6 +2182,11 @@ fn classify_codex_cli_stderr(line: &str) -> Option<(String, String, String, bool
     }
 
     None
+}
+
+fn is_codex_cli_noise_status(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("reconnecting") || lower.contains("timeout waiting for child process to exit")
 }
 
 fn extract_path_like_token(text: &str) -> Option<String> {
@@ -3514,6 +3683,11 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     settings.base_url = settings.base_url.trim().trim_end_matches('/').to_string();
     settings.api_key = settings.api_key.trim().to_string();
     settings.model_id = settings.model_id.trim().to_string();
+    settings.codex_proxy_mode = normalize_codex_proxy_mode(&settings.codex_proxy_mode).to_string();
+    settings.codex_http_proxy = settings.codex_http_proxy.trim().to_string();
+    settings.codex_https_proxy = settings.codex_https_proxy.trim().to_string();
+    settings.codex_all_proxy = settings.codex_all_proxy.trim().to_string();
+    settings.codex_no_proxy = settings.codex_no_proxy.trim().to_string();
     settings
 }
 

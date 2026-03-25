@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub provider: String,
     pub base_url: String,
@@ -10,6 +10,11 @@ pub struct Settings {
     pub theme: String,
     pub confirm_writes: bool,
     pub confirm_commands: bool,
+    pub codex_proxy_mode: String,
+    pub codex_http_proxy: String,
+    pub codex_https_proxy: String,
+    pub codex_all_proxy: String,
+    pub codex_no_proxy: String,
 }
 
 impl Default for Settings {
@@ -22,6 +27,11 @@ impl Default for Settings {
             theme: "tokyonight".to_string(),
             confirm_writes: true,
             confirm_commands: true,
+            codex_proxy_mode: "inherit".to_string(),
+            codex_http_proxy: String::new(),
+            codex_https_proxy: String::new(),
+            codex_all_proxy: String::new(),
+            codex_no_proxy: String::new(),
         }
     }
 }
@@ -36,6 +46,11 @@ pub struct SettingsUpdate {
     pub theme: Option<String>,
     pub confirm_writes: Option<bool>,
     pub confirm_commands: Option<bool>,
+    pub codex_proxy_mode: Option<String>,
+    pub codex_http_proxy: Option<String>,
+    pub codex_https_proxy: Option<String>,
+    pub codex_all_proxy: Option<String>,
+    pub codex_no_proxy: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
