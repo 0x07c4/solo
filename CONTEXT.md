@@ -1,6 +1,6 @@
 # Solo 上下文与计划
 
-最后更新：2026-03-26
+最后更新：2026-03-29
 
 ## 1. 当前目标
 
@@ -128,6 +128,40 @@
    - 若用户仍使用普通 `http_proxy/https_proxy/...` 启动应用，则必须同时设置 `NO_PROXY=localhost,127.0.0.1,::1`。
    - 正式产品路径不是要求用户手动 `export`；而是通过设置页保存 `直连 / 跟随环境 / 手动代理`，再由后端只注入给 `codex` 子进程。
 
+26. **主区“建议 + 预览 + 确认”必须按 DDD 的决策域来设计，而不是继续围绕文本块排版**
+   - 这块的核心不是“把回复切成更漂亮的卡片”，而是先定义稳定的领域对象，再让 UI 只读这些对象的 projection。
+   - 当前目标领域语言应至少包括：`DecisionSet`、`DecisionOption`、`OptionPreview`、`Approval`。
+   - `DecisionSet` 负责一轮“多个方向 / 选一个 / 都不选 / 已选后展开下一层预览”的完整决策状态，而不是把这些状态散落在 `proposal` 与本地 UI 条件判断里。
+
+27. **方向数量不能再默认只围绕 A/B 设计**
+   - Solo 必须天然支持一个 `DecisionSet` 下有多个 `DecisionOption`。
+   - “两个方向”只是常见情况，不是前提条件。
+   - “都不选”不是补丁按钮，而应该是 `DecisionSet` 的一等动作与正式结果。
+
+28. **纯对话模式也应该支持“建议 + 预览”，但预览类型必须降级为概念预览**
+   - 纯对话模式下同样可以有 `DecisionSet` 与 `DecisionOption`，只是不应伪造 diff / 文件范围 / 命令执行这类工作区语义。
+   - 纯对话对应的是 `concept preview`，工作区协作对应的是 `workspace change preview` / `command preview`。
+   - 审批动作只应出现在真正会改文件或执行命令时。
+
+29. **默认预览必须优先服务“判断”，而不是优先服务“解释”**
+   - 用户在方向选择阶段首先需要回答的是“值不值得继续看 / 选不选”，而不是阅读整套理由。
+   - 默认态应优先暴露稳定的比较维度，如 `scope / gain / risk / cost / confidence`。
+   - 更完整的解释、依据和文件细节应退到二级展开层，而不是默认占满主区。
+
+30. **当前这轮探索已经证明：把长文本切碎成 chips / pills / 小卡片，不等于视觉化**
+   - 如果用户仍然需要主要靠读字理解内容，本质上仍然是文本 UI，只是更碎。
+   - 视觉化应该建立在领域维度清晰之后，用稳定的比较维度和层级表达来辅助判断，而不是先切文字再寻找容器。
+
+31. **推进决策流时要同步清理旧架构里的复杂设计**
+   - Solo 不能一边引入 `DecisionSet / DecisionOption / OptionPreview`，一边长期保留旧 `proposal` 直读、补丁式条件判断和双轨状态。
+   - 每次往前推进一层，都应顺手删除重复投影、收拢状态来源、合并临时分支，而不是把“架构清理”留给未来某次大重构。
+   - 当前决策流重构的成功标准，不只是新 UI 跑起来，而是旧复杂度真正退场。
+
+32. **主题系统要维护一组清晰的深浅主题家族，而不是继续堆质量参差的暗色 palette**
+   - Solo 不能只提供一串观感接近、质量不稳的暗色主题；至少要有明确的 dark / light 两个层级。
+   - 主题切换不应只改 `bg / accent`，还要覆盖 `code surface`、输入框、按钮、overlay 等关键语义 token。
+   - 默认主题应优先是最稳、最耐看的工作台主题，而不是历史遗留选项。
+
 ## 3. 当前实现快照
 
 - 前端：React + Vite（`src/App.jsx`, `src/App.css`）
@@ -135,11 +169,12 @@
 - 数据：本地持久化 sessions/workspaces/settings（`src-tauri/src/storage.rs`）
 - 登录检测：`codex login status`
 - 对话执行：`codex exec`（`codex_cli` 模式）
-- 主题：默认 `TokyoNight`，支持 Catppuccin / Gruvbox / Nord / One Dark / Dracula / Kanagawa
+- 主题：默认 `Gruvbox Dark`，当前维护 `Gruvbox Dark / Tokyo Night / Nord Night / Kanagawa Ink / Gruvbox Light / Paper Light / Nord Light`
 - 布局：按当前会话的显式模式切换 `对话 / 工作区协作`
 - 架构：继续向 Zed ACP 风格的 adapter / capability / event 分层靠拢
 - 字体：关键开发工具区域使用 `Maple Mono NF CN`
 - Chrome：顶部已收成更接近 Neovim/Zed 的单行状态栏，侧栏已改成紧凑 pane section，右栏已改成上下文与预览抽屉
+- Theme UX：主题系统已从“只有暗色且质量参差的 palette 列表”收成明确的深浅主题家族；代码面、输入面、按钮、overlay 和顶部选择器都开始走语义 token
 - Chat：消息区与输入区已开始收成居中的 conversation column，减少大面积空洞留白
 - Sidebar：已去掉大部分文件树 badge 和过亮列表装饰，继续往更安静的 editor list 收敛
 - Window：已切换为自绘深色标题栏，避免 Linux 默认白色系统栏破坏主题
@@ -165,6 +200,12 @@
 - Choice UX：工作区协作正在补显式“本轮阶段”控制；`协作分析 / 方向建议 / 具体预览` 不能再靠输入内容猜，而要由前台明确传给后端
 - Choice UX：用户开启新一轮问题时，上一轮残留的 pending/selected proposal 必须自动退场，不能继续霸占主区入口
 - Choice UX：多个方向卡不应竖向堆叠成列表；主区方向卡应优先横向展开，形成更接近“弹出卡组”的浏览感
+- Decision UX：已经确认主区决策流不应继续围绕“文本块 + 卡片样式”迭代；下一步应先建立 `DecisionSet / DecisionOption / OptionPreview` 投影层，再重做默认比较视图
+- Decision UX：当前默认预览的最大问题不是颜色或排版，而是领域维度还未稳定，导致默认视图在“解释”与“判断”之间反复摇摆
+- Decision UX：纯对话模式与工作区协作模式应共用同一决策域，只在 preview fidelity 上分层，而不是走两套独立交互模型
+- Decision UX：主区已经开始通过前端 `DecisionSet` 投影统一读取方向卡、已选方向与预览卡；后续应继续把“都不选 / 纯对话 concept preview / 多方向比较板”并入同一决策域
+- Decision UX：主区方向卡、方向预览和具体预览卡已改成读取 `DecisionOption` / `ApprovalCard` 投影；主区交互不再直接消费 raw `proposal`，只在 action adapter 层按 `id` 回连后端
+- Architecture hygiene：决策流后续迭代必须边推进边删旧结构，避免旧 `proposal` 直读和新 `DecisionSet` 投影长期双轨并存
 - Reliability：proposal / message 这类会在同一轮里批量创建的对象，ID 不能只靠毫秒时间戳；否则前端按 `id` upsert 时会吞掉后续卡片
 - Reliability：方向 fallback 解析不能在第一条非 bullet 行就结束；A/B 多行描述必须按选项分组收集，否则会把“两个方向”截成只剩一条
 - Reliability：发送锁必须持续到本轮真正 `done/error`，不能在首个 token 到达时提前解锁，否则会造成同一条用户消息重复追加
@@ -178,7 +219,7 @@
 - [ ] 在 UI 显示“当前模型提示”（从本机 codex 配置读取）
 - [x] 优化回答风格约束，减少模板化回复
 - [x] 增加对话失败的可读错误提示（网络/登录态/命令失败区分）
-- [x] 建立 `Workbench Dark` 视觉方向，默认 TokyoNight
+- [x] 建立 `Workbench Dark` 视觉方向，并把默认主题切到更稳的 `Gruvbox Dark`
 - [x] 落地 `Maple Mono NF CN` 到关键开发工具区域
 - [x] 吸收 Zed 的薄 chrome / 高密度侧栏优点
 - [x] 吸收 Neovim 的状态线与 pane 语言
@@ -187,6 +228,10 @@
 - [x] 把“快答 / 工作区协作”分流改成前端显式模式，而不是后端猜测
 - [x] 把“建议 + 预览 + 确认”明确做成前台产品语言
 - [x] 让 `.ignore` 真正参与工作区协作范围控制，减少 Codex 把时间浪费在无关目录上
+- [x] 在前端建立 `DecisionSet / DecisionOption / OptionPreview` 投影层，停止让主区直接消费原始 proposal 集合
+- [ ] 让纯对话模式也能走 `DecisionSet`，但只生成 `concept preview`
+- [ ] 把“都不选”提升为 `DecisionSet` 的正式动作，而不是临时 ghost button
+- [ ] 在继续推进 `DecisionSet` 的同时，删除旧 `proposal` 直读和补丁式 UI 状态，避免新结构叠在旧复杂设计上
 
 ### P1（随后）
 
@@ -197,6 +242,7 @@
 - [ ] 支持导出会话
 - [ ] 完善移动端/窄窗口布局
 - [ ] 把主区“方向卡 / 预览卡”继续视觉化，吸收更多杀戮尖塔式的卡片聚焦交互
+- [ ] 把主区默认视图重做成稳定的多方向比较板，而不是继续围绕单个方向解释卡来回打磨
 
 ### P2（后续扩展）
 

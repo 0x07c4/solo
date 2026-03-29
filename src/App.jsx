@@ -7,7 +7,7 @@ import "./App.css";
 
 const LOGIN_POLL_ATTEMPTS = 15;
 const LOGIN_POLL_INTERVAL_MS = 2000;
-const DEFAULT_THEME = "tokyonight";
+const DEFAULT_THEME = "gruvbox-dark";
 const MAX_STREAM_PROGRESS_ITEMS = 12;
 const STREAM_NO_TOKEN_WARN_S = 12;
 const STREAM_STALL_WARN_S = 25;
@@ -18,14 +18,15 @@ const SESSION_MODE_WORKSPACE = "workspaceCollaboration";
 const TURN_INTENT_AUTO = "auto";
 const TURN_INTENT_CHOICE = "choice";
 const TURN_INTENT_PREVIEW = "preview";
+const REJECT_ALL_DECISIONS_ACTION_ID = "reject_all_decisions";
 const THEME_OPTIONS = [
-  { value: "tokyonight", label: "TokyoNight" },
-  { value: "catppuccin-mocha", label: "Catppuccin Mocha" },
   { value: "gruvbox-dark", label: "Gruvbox Dark" },
-  { value: "nord", label: "Nord" },
-  { value: "one-dark", label: "One Dark" },
-  { value: "dracula", label: "Dracula" },
-  { value: "kanagawa", label: "Kanagawa" },
+  { value: "tokyonight", label: "Tokyo Night" },
+  { value: "nord", label: "Nord Night" },
+  { value: "kanagawa", label: "Kanagawa Ink" },
+  { value: "gruvbox-light", label: "Gruvbox Light" },
+  { value: "paper-light", label: "Paper Light" },
+  { value: "nord-light", label: "Nord Light" },
 ];
 const DEFAULT_SETTINGS = {
   provider: "codex_cli",
@@ -331,6 +332,250 @@ function truncateBlock(text, maxChars = 1800) {
     return text || "";
   }
   return `${text.slice(0, maxChars)}\n…[已截断]`;
+}
+
+function truncateInline(text, maxChars = 96) {
+  if (typeof text !== "string" || text.length <= maxChars) {
+    return text || "";
+  }
+  return `${text.slice(0, maxChars - 1).trim()}…`;
+}
+
+function splitDecisionParagraphs(text, limit = 4) {
+  if (typeof text !== "string") {
+    return [];
+  }
+  return text
+    .split(/\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function mapDecisionSectionKind(title) {
+  if (title === "改动目标") {
+    return "goal";
+  }
+  if (title === "涉及文件") {
+    return "files";
+  }
+  if (title === "收益") {
+    return "impact";
+  }
+  if (title === "风险") {
+    return "risk";
+  }
+  return "note";
+}
+
+function extractDecisionFiles(text) {
+  if (typeof text !== "string") {
+    return [];
+  }
+
+  const values = [];
+  const seen = new Set();
+  const formatFileLabel = (value) => {
+    const normalized = value.trim().replace(/\\/g, "/");
+    const segments = normalized.split("/").filter(Boolean);
+    if (!segments.length) {
+      return normalized;
+    }
+    if (segments.length === 1) {
+      return segments[0];
+    }
+    return segments.slice(-2).join("/");
+  };
+  const pushValue = (value) => {
+    const normalized = formatFileLabel(value);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    values.push(normalized);
+  };
+
+  const markdownLabelPattern = /\[([^[\]]+\.[^[\]]+)\]\([^)]+\)/g;
+  for (const match of text.matchAll(markdownLabelPattern)) {
+    pushValue(match[1]);
+  }
+
+  const pathPattern =
+    /\b(?:[\w-]+\/)*[\w.-]+\.(?:rs|jsx|tsx|ts|js|css|toml|json|md|c|h|cpp|hpp|py)\b/g;
+  for (const match of text.matchAll(pathPattern)) {
+    pushValue(match[0]);
+  }
+
+  return values.slice(0, 8);
+}
+
+function summarizeDecisionHighlights(text, limit = 2) {
+  if (typeof text !== "string") {
+    return [];
+  }
+
+  const segments = text
+    .replace(/\r\n/g, "\n")
+    .split(/\n+/)
+    .flatMap((line) => line.split(/[。；;]+/))
+    .map((part) => truncateInline(part.trim(), 84))
+    .filter(Boolean);
+
+  if (!segments.length) {
+    return [];
+  }
+
+  return segments.slice(0, limit);
+}
+
+function projectDecisionPreview(detail, summary) {
+  const normalized = truncateBlock(String(detail ?? summary ?? "").replace(/\r\n/g, "\n").trim(), 2600);
+  const fallbackSummary = summary?.trim() || "确认这个方向后，Solo 才会继续生成更具体的改动预览。";
+  if (!normalized) {
+    return {
+      intro: fallbackSummary,
+      metrics: [{ label: "下一步", value: "确认后展开具体预览" }],
+      sections: [],
+    };
+  }
+
+  const sectionPattern =
+    /(?:^|\n)\s*(改动目标|涉及文件|收益|风险|影响范围|执行方式|验证方式|回退方案)[：:]\s*/g;
+  const matches = [...normalized.matchAll(sectionPattern)];
+
+  let intro = fallbackSummary;
+  let sections = [];
+
+  if (matches.length > 0) {
+    const leading = normalized.slice(0, matches[0].index).trim();
+    if (leading) {
+      intro = leading;
+    }
+
+    sections = matches
+      .map((match, index) => {
+        const start = match.index + match[0].length;
+        const end = index + 1 < matches.length ? matches[index + 1].index : normalized.length;
+        const body = normalized.slice(start, end).trim();
+        if (!body) {
+          return null;
+        }
+        return {
+          title: match[1],
+          kind: mapDecisionSectionKind(match[1]),
+          body,
+          paragraphs: splitDecisionParagraphs(body),
+          highlights: summarizeDecisionHighlights(body, match[1] === "涉及文件" ? 1 : 2),
+          files: extractDecisionFiles(body),
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 4);
+  } else {
+    const paragraphs = splitDecisionParagraphs(normalized, 5);
+    intro = paragraphs.shift() ?? fallbackSummary;
+    sections = paragraphs.slice(0, 3).map((body, index) => ({
+      title: index === 0 ? "核心变化" : index === 1 ? "影响范围" : "注意事项",
+      kind: index === 1 ? "files" : index === 2 ? "risk" : "goal",
+      body,
+      paragraphs: [body],
+      highlights: summarizeDecisionHighlights(body, index === 1 ? 1 : 2),
+      files: extractDecisionFiles(body),
+    }));
+  }
+
+  const fileCount = new Set(sections.flatMap((section) => section.files)).size;
+  const metrics = [
+    { label: "结构化预览", value: sections.length > 0 ? `${sections.length} 个区块` : "摘要" },
+    { label: "涉及文件", value: fileCount > 0 ? `${fileCount} 个` : "待展开" },
+    { label: "下一步", value: "确认后展开具体预览" },
+  ];
+
+  return {
+    intro,
+    metrics,
+    sections,
+  };
+}
+
+function buildDecisionOption(proposal) {
+  const payload = proposal.payload ?? {};
+  const detail = payload.detail ?? proposal.summary;
+  return {
+    id: proposal.id,
+    sessionId: proposal.sessionId,
+    status: proposal.status,
+    title: proposal.title,
+    summary: proposal.summary,
+    optionKey: payload.optionKey ?? proposal.title,
+    createdAt: proposal.createdAt ?? 0,
+    preview: projectDecisionPreview(detail, proposal.summary),
+  };
+}
+
+function buildApprovalCard(proposal) {
+  const payload = proposal.payload ?? {};
+  return {
+    id: proposal.id,
+    sessionId: proposal.sessionId,
+    kind: payload.type ?? proposal.kind,
+    status: proposal.status,
+    title: proposal.title,
+    summary: proposal.summary,
+    optionKey: payload.optionKey ?? proposal.title,
+    relativePath: payload.relativePath ?? "",
+    detail: payload.detail ?? "",
+    reason: payload.reason ?? "",
+    diffText: payload.diffText ?? payload.nextContentPreview ?? "",
+    displayCommand: payload.displayCommand ?? "",
+    latestOutput: proposal.latestOutput ?? "",
+    error: proposal.error ?? "",
+  };
+}
+
+function buildDecisionSet({ sessionId, sessionMode, proposals, activePreviewId }) {
+  const options = proposals
+    .filter((proposal) => proposal.kind === "choice")
+    .map((proposal) => buildDecisionOption(proposal));
+  const pendingOptions = options.filter((option) => option.status === "pending").slice(0, 6);
+  const selectedOption =
+    options
+      .filter((option) => option.status === "selected")
+      .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+  const activeOption =
+    pendingOptions.find((option) => option.id === activePreviewId) ?? pendingOptions[0] ?? null;
+  const previewCards = proposals
+    .filter((proposal) => proposal.status === "pending" && proposal.kind !== "choice")
+    .map(buildApprovalCard);
+
+  let status = "idle";
+  if (selectedOption) {
+    status = "chosen";
+  } else if (pendingOptions.length > 0) {
+    status = "open";
+  } else if (options.length > 0) {
+    status = "dismissed";
+  }
+
+  return {
+    id: sessionId ? `decision-set-${sessionId}` : "",
+    sessionId,
+    mode: normalizeSessionMode(sessionMode) === SESSION_MODE_WORKSPACE ? "workspace" : "conversation",
+    status,
+    options,
+    pendingOptions,
+    activeOption,
+    selectedOption,
+    previewCards,
+    dismissAction:
+      pendingOptions.length > 0
+        ? {
+            id: sessionId ? `decision-dismiss-${sessionId}` : "decision-dismiss",
+            label: "都不选",
+            pendingCount: pendingOptions.length,
+          }
+        : null,
+  };
 }
 
 function messageStatusLabel(status) {
@@ -695,34 +940,33 @@ function MessageBubble({ message, progress = [] }) {
   );
 }
 
-function ProposalCard({ proposal, busy, onAccept, onReject }) {
-  const payload = proposal.payload ?? {};
-  const statusLabel = proposalStatusLabel(proposal.status);
-  const statusTone = proposalStatusTone(proposal.status);
-  const isWrite = proposal.kind === "write" || payload.type === "write";
-  const isChoice = proposal.kind === "choice" || payload.type === "choice";
-  const previewText = isWrite ? truncateBlock(payload.diffText ?? payload.nextContentPreview ?? "") : "";
-  const commandText = isWrite || isChoice ? "" : truncateBlock(payload.displayCommand ?? "");
-  const outputText = isWrite || isChoice ? "" : truncateBlock(proposal.latestOutput ?? "", 1400);
+function ProposalCard({ card, busy, onAccept, onReject }) {
+  const statusLabel = proposalStatusLabel(card.status);
+  const statusTone = proposalStatusTone(card.status);
+  const isWrite = card.kind === "write";
+  const isChoice = card.kind === "choice";
+  const previewText = isWrite ? truncateBlock(card.diffText) : "";
+  const commandText = isWrite || isChoice ? "" : truncateBlock(card.displayCommand);
+  const outputText = isWrite || isChoice ? "" : truncateBlock(card.latestOutput, 1400);
 
   return (
-    <article className={`proposal-card proposal-${proposal.status}`}>
+    <article className={`proposal-card proposal-${card.status}`}>
       <div className="proposal-card-head">
         <div className="proposal-card-title">
           <span className="section-eyebrow">
             {isWrite ? "Edit Suggestion" : isChoice ? "Decision Suggestion" : "Command Suggestion"}
           </span>
-          <strong>{proposal.title}</strong>
+          <strong>{card.title}</strong>
         </div>
         <span className={`drawer-chip drawer-chip-${statusTone}`}>{statusLabel}</span>
       </div>
       <div className="proposal-card-body">
-        <p className="proposal-summary">{proposal.summary}</p>
+        <p className="proposal-summary">{card.summary}</p>
         {isWrite ? (
           <>
             <div className="proposal-meta-row">
               <span className="proposal-meta-label">文件</span>
-              <span className="proposal-meta-value">{payload.relativePath ?? "未提供"}</span>
+              <span className="proposal-meta-value">{card.relativePath || "未提供"}</span>
             </div>
             {previewText ? (
               <div className="proposal-preview-block">
@@ -735,12 +979,12 @@ function ProposalCard({ proposal, busy, onAccept, onReject }) {
           <>
             <div className="proposal-meta-row">
               <span className="proposal-meta-label">方向</span>
-              <span className="proposal-meta-value">{payload.optionKey ?? "未提供"}</span>
+              <span className="proposal-meta-value">{card.optionKey || "未提供"}</span>
             </div>
-            {payload.detail ? (
+            {card.detail ? (
               <div className="proposal-preview-block">
                 <span className="proposal-block-label">建议内容</span>
-                <pre>{truncateBlock(payload.detail, 1200)}</pre>
+                <pre>{truncateBlock(card.detail, 1200)}</pre>
               </div>
             ) : null}
           </>
@@ -748,7 +992,7 @@ function ProposalCard({ proposal, busy, onAccept, onReject }) {
           <>
             <div className="proposal-meta-row">
               <span className="proposal-meta-label">命令</span>
-              <span className="proposal-meta-value">{payload.reason ?? "命令建议"}</span>
+              <span className="proposal-meta-value">{card.reason || "命令建议"}</span>
             </div>
             {commandText ? (
               <div className="proposal-preview-block">
@@ -764,14 +1008,14 @@ function ProposalCard({ proposal, busy, onAccept, onReject }) {
             ) : null}
           </>
         )}
-        {proposal.error ? <p className="proposal-error">{proposal.error}</p> : null}
+        {card.error ? <p className="proposal-error">{card.error}</p> : null}
       </div>
-      {proposal.status === "pending" ? (
+      {card.status === "pending" ? (
         <div className="proposal-actions">
-          <button type="button" className="primary-button" disabled={busy} onClick={() => onAccept(proposal)}>
-            {busy ? "处理中…" : proposalPrimaryActionLabel(proposal)}
+          <button type="button" className="primary-button" disabled={busy} onClick={() => onAccept(card)}>
+            {busy ? "处理中…" : proposalPrimaryActionLabel(card)}
           </button>
-          <button type="button" className="ghost-button" disabled={busy} onClick={() => onReject(proposal)}>
+          <button type="button" className="ghost-button" disabled={busy} onClick={() => onReject(card)}>
             拒绝
           </button>
         </div>
@@ -780,60 +1024,180 @@ function ProposalCard({ proposal, busy, onAccept, onReject }) {
   );
 }
 
-function DecisionOptionCard({ proposal, active, onPreview }) {
-  const optionKey = proposal.payload?.optionKey ?? proposal.title;
+function DecisionOptionCard({ option, active, onPreview }) {
+  const optionKey = option.optionKey ?? option.title;
   return (
     <article className={`decision-option-card ${active ? "is-active" : ""}`}>
       <button
         type="button"
         className="decision-option-surface"
-        onClick={() => onPreview(proposal)}
+        onClick={() => onPreview(option)}
         aria-pressed={active}
       >
         <div className="decision-option-head">
           <span className="section-eyebrow">方向 {optionKey}</span>
           {active ? <span className="drawer-chip drawer-chip-active">预览中</span> : null}
         </div>
-        <strong>{proposal.title}</strong>
-        <p>{proposal.summary}</p>
+        <strong>{option.title}</strong>
+        <p>{option.summary}</p>
         <span className="decision-option-hint">点击卡片先查看这个方向的预览</span>
       </button>
     </article>
   );
 }
 
-function DecisionPreviewPanel({ proposal, busy, onConfirm }) {
-  if (!proposal) {
+function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, onSkipAll }) {
+  if (!option) {
     return null;
   }
 
-  const optionKey = proposal.payload?.optionKey ?? proposal.title;
-  const detail = truncateBlock(proposal.payload?.detail ?? proposal.summary, 2200);
+  const optionKey = option.optionKey ?? option.title;
+  const preview = option.preview;
+  const heroSummary = truncateInline(preview.intro, 88);
+  const scopeSection =
+    preview.sections.find((section) => section.kind === "files") ??
+    preview.sections.find((section) => section.files.length > 0) ??
+    null;
+  const gainSection =
+    preview.sections.find((section) => section.kind === "impact") ??
+    preview.sections.find((section) => section.kind === "goal") ??
+    null;
+  const riskSection =
+    preview.sections.find((section) => section.kind === "risk") ??
+    preview.sections.find((section) => section.kind === "note") ??
+    null;
+  const scopeCount = scopeSection?.files.length ?? 0;
+  const scopeFiles = scopeSection?.files.slice(0, 3) ?? [];
+  const gainSignals = (gainSection?.highlights ?? []).slice(0, 2);
+  const riskSignals = (riskSection?.highlights ?? []).slice(0, 2);
+  const scopeValue = scopeCount > 0 ? `${scopeCount}` : "1";
+  const scopeUnit = scopeCount > 0 ? "文件" : "局部";
+  const costValue = scopeCount > 3 ? "中" : "低";
+  const costNote = scopeCount > 3 ? "涉及多文件联动" : "更偏局部调整";
 
   return (
     <div className="decision-preview-panel">
-      <div className="decision-preview-head">
-        <div>
-          <p className="section-eyebrow">方向预览</p>
-          <h4>正在查看方向 {optionKey}</h4>
+      <div className="decision-preview-hero">
+        <div className="decision-preview-head">
+          <div>
+            <p className="section-eyebrow">方向预览</p>
+            <h4>{option.title}</h4>
+            <p className="decision-preview-kicker">当前查看方向 {optionKey}</p>
+          </div>
+          <span className="drawer-chip drawer-chip-idle">仅预览</span>
         </div>
-        <span className="drawer-chip drawer-chip-idle">仅预览</span>
+        <p className="decision-preview-summary">{heroSummary}</p>
       </div>
-      <p className="decision-preview-summary">{proposal.summary}</p>
-      <div className="proposal-preview-block">
-        <span className="proposal-block-label">方向预览</span>
-        <pre>{detail}</pre>
+
+      <div className="decision-judgment-board">
+        <section className="decision-judgment-card decision-judgment-card-scope">
+          <span className="decision-judgment-label">范围</span>
+          <div className="decision-judgment-metric">
+            <strong>{scopeValue}</strong>
+            <span>{scopeUnit}</span>
+          </div>
+          {scopeFiles.length > 0 ? (
+            <div className="decision-judgment-files">
+              {scopeFiles.map((file) => (
+                <span key={file} className="decision-file-chip">
+                  {file}
+                </span>
+              ))}
+              {scopeCount > scopeFiles.length ? (
+                <span className="decision-file-chip decision-file-chip-muted">+{scopeCount - scopeFiles.length}</span>
+              ) : null}
+            </div>
+          ) : (
+            <p className="decision-judgment-note">聚焦一个局部入口</p>
+          )}
+        </section>
+
+        <section className="decision-judgment-card decision-judgment-card-gain">
+          <span className="decision-judgment-label">收益</span>
+          <div className="decision-judgment-copy">
+            {(gainSignals.length ? gainSignals : ["会直接改善当前主要瓶颈"]).map((signal) => (
+              <p key={signal}>{signal}</p>
+            ))}
+          </div>
+        </section>
+
+        <section className="decision-judgment-card decision-judgment-card-risk">
+          <span className="decision-judgment-label">风险</span>
+          <div className="decision-judgment-copy">
+            {(riskSignals.length ? riskSignals : ["风险可控，但仍需确认边界条件"]).map((signal) => (
+              <p key={signal}>{signal}</p>
+            ))}
+          </div>
+        </section>
+
+        <section className="decision-judgment-card decision-judgment-card-cost">
+          <span className="decision-judgment-label">代价</span>
+          <div className="decision-judgment-metric is-compact">
+            <strong>{costValue}</strong>
+            <span>复杂度</span>
+          </div>
+          <p className="decision-judgment-note">{costNote}</p>
+        </section>
       </div>
+
+      {preview.sections.length > 0 ? (
+        <details className="decision-preview-details">
+          <summary>查看详细说明</summary>
+          <div className="decision-preview-details-grid">
+            {preview.sections.map((section) => (
+              <section
+                key={`${option.id}-${section.title}-detail`}
+                className={`decision-preview-card decision-preview-card-${section.kind}`}
+              >
+                <div className="decision-preview-card-head">
+                  <span className="section-eyebrow">{section.title}</span>
+                  {section.kind === "files" && section.files.length > 0 ? (
+                    <span className="drawer-chip drawer-chip-active">{section.files.length} 个文件</span>
+                  ) : null}
+                </div>
+                {section.files.length > 0 ? (
+                  <div className="decision-preview-file-list">
+                    {section.files.map((file) => (
+                      <span key={file} className="decision-file-chip">
+                        {file}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="decision-preview-copy">
+                  {section.highlights.map((highlight, index) => (
+                    <div key={`${section.title}-${index}`} className="decision-preview-bullet">
+                      <span className="decision-preview-bullet-dot" aria-hidden="true" />
+                      <p>{highlight}</p>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
+        </details>
+      ) : null}
+
       <div className="decision-preview-footer">
-        <p>这里只展示方向说明，不会执行命令或修改文件。确认选择后，Solo 才会继续生成更具体的改动预览。</p>
-        <button
-          type="button"
-          className="primary-button"
-          disabled={busy}
-          onClick={() => onConfirm(proposal)}
-        >
-          {busy ? "处理中…" : "确认选择这个方向"}
-        </button>
+        <p>先看判断板，再决定是否进入下一层具体预览。</p>
+        <div className="decision-preview-actions">
+          <button
+            type="button"
+            className="primary-button"
+            disabled={busy || skipBusy}
+            onClick={() => onConfirm(option)}
+          >
+            {busy ? "处理中…" : "确认选择这个方向"}
+          </button>
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={busy || skipBusy}
+            onClick={() => onSkipAll(decisionSet)}
+          >
+            {skipBusy ? "处理中…" : decisionSet?.dismissAction?.label ?? "都不选"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -905,22 +1269,25 @@ export default function App() {
   const layoutMode = activeSessionMode === SESSION_MODE_WORKSPACE ? "workbench" : "chat";
   const hasCustomWindowChrome =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  const decisionProposals = activeProposals
-    .filter((proposal) => proposal.status === "pending" && proposal.kind === "choice")
-    .slice(0, 3);
-  const previewProposals = activeProposals.filter(
-    (proposal) => proposal.status === "pending" && proposal.kind !== "choice"
-  );
-  const selectedChoiceProposal =
-    [...activeProposals]
-      .filter((proposal) => proposal.kind === "choice" && proposal.status === "selected")
-      .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))[0] ?? null;
   const activeDecisionPreviewId = activeSessionId ? decisionPreviewBySession[activeSessionId] ?? "" : "";
-  const activeDecisionPreviewProposal =
-    decisionProposals.find((proposal) => proposal.id === activeDecisionPreviewId) ?? decisionProposals[0] ?? null;
-  const showDecisionDeck = decisionProposals.length > 0 && !selectedChoiceProposal;
+  const activeDecisionSet = useMemo(
+    () =>
+      buildDecisionSet({
+        sessionId: activeSessionId,
+        sessionMode: activeSessionMode,
+        proposals: activeProposals,
+        activePreviewId: activeDecisionPreviewId,
+      }),
+    [activeDecisionPreviewId, activeProposals, activeSessionId, activeSessionMode]
+  );
+  const decisionOptions = activeDecisionSet.pendingOptions;
+  const selectedDecisionOption = activeDecisionSet.selectedOption;
+  const activeDecisionPreviewOption = activeDecisionSet.activeOption;
+  const previewProposals = activeDecisionSet.previewCards;
+  const showDecisionDeck = activeDecisionSet.status === "open" && decisionOptions.length > 0;
   const showPreviewCards =
-    previewProposals.length > 0 && (!showDecisionDeck || Boolean(selectedChoiceProposal));
+    previewProposals.length > 0 && (!showDecisionDeck || Boolean(selectedDecisionOption));
+  const rejectingAllDecisions = proposalActionId === REJECT_ALL_DECISIONS_ACTION_ID;
 
   const fetchCodexStatus = async ({ showNotice = false } = {}) => {
     const status = normalizeLoginStatus(await desktop.codexLoginStatus());
@@ -1148,16 +1515,16 @@ export default function App() {
       return;
     }
 
-    const stillExists = decisionProposals.some((proposal) => proposal.id === activeDecisionPreviewId);
-    if (stillExists || decisionProposals.length === 0) {
+    const stillExists = decisionOptions.some((option) => option.id === activeDecisionPreviewId);
+    if (stillExists || decisionOptions.length === 0) {
       return;
     }
 
     setDecisionPreviewBySession((current) => ({
       ...current,
-      [activeSessionId]: decisionProposals[0].id,
+      [activeSessionId]: decisionOptions[0].id,
     }));
-  }, [activeSessionId, activeDecisionPreviewId, decisionProposals]);
+  }, [activeSessionId, activeDecisionPreviewId, decisionOptions]);
 
   useEffect(() => {
     let unlistenStatus = null;
@@ -1832,69 +2199,81 @@ export default function App() {
     }
   };
 
-  const handlePreviewDecision = (proposal) => {
+  const handlePreviewDecision = (option) => {
     if (!activeSessionId) {
       return;
     }
     setDecisionPreviewBySession((current) => ({
       ...current,
-      [activeSessionId]: proposal.id,
+      [activeSessionId]: option.id,
     }));
   };
 
-  const handleAcceptProposal = async (proposal) => {
-    setProposalActionId(proposal.id);
+  const handleChooseDecisionOption = async (option) => {
+    setProposalActionId(option.id);
     try {
-      if (proposal.kind === "choice") {
-        setChatSending(true);
-        setProposalPanelState({ loading: true, error: "" });
-        setTurnIntentBySession((current) => ({
+      setChatSending(true);
+      setProposalPanelState({ loading: true, error: "" });
+      setTurnIntentBySession((current) => ({
+        ...current,
+        [option.sessionId]: TURN_INTENT_PREVIEW,
+      }));
+      setStreamProgressBySession((current) => {
+        if (!current[option.sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[option.sessionId];
+        return next;
+      });
+      setStreamMonitorBySession((current) => {
+        if (!current[option.sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[option.sessionId];
+        return next;
+      });
+      const result = await desktop.proposalChoose(option.id);
+      setSessions((current) => upsertSession(current, result.session));
+      setProposalsBySession((current) => {
+        const previous = current[result.proposal.sessionId] ?? [];
+        const nextProposals = previous.map((entry) => {
+          if (entry.id === result.proposal.id) {
+            return { ...entry, ...result.proposal };
+          }
+          if (entry.kind === "choice" && entry.status === "pending") {
+            return {
+              ...entry,
+              status: "rejected",
+              latestOutput: "当前会话已选择其他方向。",
+            };
+          }
+          return entry;
+        });
+        return {
           ...current,
-          [proposal.sessionId]: TURN_INTENT_PREVIEW,
-        }));
-        setStreamProgressBySession((current) => {
-          if (!current[proposal.sessionId]) {
-            return current;
-          }
-          const next = { ...current };
-          delete next[proposal.sessionId];
-          return next;
-        });
-        setStreamMonitorBySession((current) => {
-          if (!current[proposal.sessionId]) {
-            return current;
-          }
-          const next = { ...current };
-          delete next[proposal.sessionId];
-          return next;
-        });
-        const result = await desktop.proposalChoose(proposal.id);
-        setSessions((current) => upsertSession(current, result.session));
-        setProposalsBySession((current) => {
-          const previous = current[result.proposal.sessionId] ?? [];
-          const nextProposals = previous.map((entry) => {
-            if (entry.id === result.proposal.id) {
-              return { ...entry, ...result.proposal };
-            }
-            if (entry.kind === "choice" && entry.status === "pending") {
-              return {
-                ...entry,
-                status: "rejected",
-                latestOutput: "当前会话已选择其他方向。",
-              };
-            }
-            return entry;
-          });
-          return {
-            ...current,
-            [result.proposal.sessionId]: sortProposals(nextProposals),
-          };
-        });
-        setNotice({ kind: "info", text: "已选择这个方向，正在展开具体预览。" });
-        return;
-      }
+          [result.proposal.sessionId]: sortProposals(nextProposals),
+        };
+      });
+      setNotice({ kind: "info", text: "已选择这个方向，正在展开具体预览。" });
+    } catch (error) {
+      setChatSending(false);
+      setProposalPanelState({ loading: false, error: "" });
+      setTurnIntentBySession((current) => ({
+        ...current,
+        [option.sessionId]: TURN_INTENT_CHOICE,
+      }));
+      setNotice({ kind: "error", text: normalizeError(error) });
+    } finally {
+      setProposalActionId("");
+    }
+  };
 
-      const updated = await desktop.approvalAccept(proposal.id);
+  const handleAcceptPreviewCard = async (card) => {
+    setProposalActionId(card.id);
+    try {
+      const updated = await desktop.approvalAccept(card.id);
       setProposalsBySession((current) => ({
         ...current,
         [updated.sessionId]: upsertProposal(current[updated.sessionId] ?? [], updated),
@@ -1915,29 +2294,59 @@ export default function App() {
         setNotice({ kind: "info", text: "已确认命令建议，正在执行。" });
       }
     } catch (error) {
-      if (proposal.kind === "choice") {
-        setChatSending(false);
-        setProposalPanelState({ loading: false, error: "" });
-        setTurnIntentBySession((current) => ({
-          ...current,
-          [proposal.sessionId]: TURN_INTENT_CHOICE,
-        }));
-      }
       setNotice({ kind: "error", text: normalizeError(error) });
     } finally {
       setProposalActionId("");
     }
   };
 
-  const handleRejectProposal = async (proposal) => {
-    setProposalActionId(proposal.id);
+  const handleRejectPreviewCard = async (card) => {
+    setProposalActionId(card.id);
     try {
-      const updated = await desktop.approvalReject(proposal.id);
+      const updated = await desktop.approvalReject(card.id);
       setProposalsBySession((current) => ({
         ...current,
         [updated.sessionId]: upsertProposal(current[updated.sessionId] ?? [], updated),
       }));
       setNotice({ kind: "info", text: "已拒绝这条建议。" });
+    } catch (error) {
+      setNotice({ kind: "error", text: normalizeError(error) });
+    } finally {
+      setProposalActionId("");
+    }
+  };
+
+  const handleDismissDecisionSet = async (decisionSet) => {
+    if (!decisionSet?.pendingOptions?.length) {
+      return;
+    }
+
+    setProposalActionId(REJECT_ALL_DECISIONS_ACTION_ID);
+    try {
+      const updatedProposals = [];
+      for (const option of decisionSet.pendingOptions) {
+        updatedProposals.push(await desktop.approvalReject(option.id));
+      }
+
+      setProposalsBySession((current) => {
+        const next = { ...current };
+        for (const updated of updatedProposals) {
+          next[updated.sessionId] = upsertProposal(next[updated.sessionId] ?? [], updated);
+        }
+        return next;
+      });
+      setDecisionPreviewBySession((current) => {
+        if (!activeSessionId) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[activeSessionId];
+        return next;
+      });
+      setNotice({
+        kind: "info",
+        text: "这组方向已跳过。你可以补充要求，再让 Solo 重新给一组方向。",
+      });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
     } finally {
@@ -2056,24 +2465,24 @@ export default function App() {
         : "空";
   const collaborationEnabled = activeSessionMode === SESSION_MODE_WORKSPACE;
   const collaborationAvailable = Boolean(activeSessionWorkspaceId);
-  const selectedChoiceLabel = selectedChoiceProposal?.payload?.optionKey ?? selectedChoiceProposal?.title ?? "";
+  const selectedChoiceLabel = selectedDecisionOption?.optionKey ?? selectedDecisionOption?.title ?? "";
   const previewDeckActive = showPreviewCards;
   const suggestionInspectorTone = proposalPanelState.error
     ? "error"
-    : decisionProposals.length > 0 || previewDeckActive || proposalPanelState.loading
+    : decisionOptions.length > 0 || previewDeckActive || proposalPanelState.loading
       ? "loading"
-      : selectedChoiceProposal
+      : selectedDecisionOption
         ? "active"
         : "idle";
   const suggestionInspectorStatus = proposalPanelState.error
     ? "加载失败"
     : showDecisionDeck
-      ? `${decisionProposals.length} 个方向`
+      ? `${decisionOptions.length} 个方向`
       : previewDeckActive
         ? `${previewProposals.length} 张预览`
         : proposalPanelState.loading
           ? "展开中"
-          : selectedChoiceProposal
+          : selectedDecisionOption
             ? "已选择"
             : "无待确认";
   const composerPlaceholder = collaborationEnabled
@@ -2560,35 +2969,52 @@ export default function App() {
                   ) : null}
                   {showDecisionDeck ? (
                     <section className="shell-card inline-proposals decision-deck">
-                      <div className="inline-proposals-head">
-                        <div>
-                          <p className="section-eyebrow">Decisions</p>
-                          <h3>先选一个方向</h3>
+                      <div className="decision-choice-rail">
+                        <div className="inline-proposals-head">
+                          <div>
+                            <p className="section-eyebrow">Decisions</p>
+                            <h3>先选一个方向</h3>
+                          </div>
+                          <div className="decision-deck-meta">
+                            <p className="inline-proposals-note">
+                              {decisionOptions.length > 1
+                                ? "方向卡会固定在上方；先切换预览，再决定要不要确认。"
+                                : "先点开这个方向的预览，再决定是否确认。"}
+                            </p>
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={rejectingAllDecisions}
+                              onClick={() => handleDismissDecisionSet(activeDecisionSet)}
+                            >
+                              {rejectingAllDecisions
+                                ? "处理中…"
+                                : activeDecisionSet.dismissAction?.label ?? "都不选"}
+                            </button>
+                          </div>
                         </div>
-                        <p className="inline-proposals-note">
-                          {decisionProposals.length > 1
-                            ? "左右浏览方向卡，先点开预览，再确认选择。"
-                            : "先点开这个方向的预览，再确认选择。"}
-                        </p>
-                      </div>
-                      <div className={`decision-deck-grid ${decisionProposals.length > 1 ? "is-multi" : ""}`}>
-                        {decisionProposals.map((proposal) => (
-                          <DecisionOptionCard
-                            key={proposal.id}
-                            proposal={proposal}
-                            active={activeDecisionPreviewProposal?.id === proposal.id}
-                            onPreview={handlePreviewDecision}
-                          />
-                        ))}
+                        <div className={`decision-deck-grid ${decisionOptions.length > 1 ? "is-multi" : ""}`}>
+                          {decisionOptions.map((option) => (
+                            <DecisionOptionCard
+                              key={option.id}
+                              option={option}
+                              active={activeDecisionPreviewOption?.id === option.id}
+                              onPreview={handlePreviewDecision}
+                            />
+                          ))}
+                        </div>
                       </div>
                       <DecisionPreviewPanel
-                        proposal={activeDecisionPreviewProposal}
-                        busy={proposalActionId === activeDecisionPreviewProposal?.id}
-                        onConfirm={handleAcceptProposal}
+                        option={activeDecisionPreviewOption}
+                        decisionSet={activeDecisionSet}
+                        busy={proposalActionId === activeDecisionPreviewOption?.id}
+                        skipBusy={rejectingAllDecisions}
+                        onConfirm={handleChooseDecisionOption}
+                        onSkipAll={handleDismissDecisionSet}
                       />
                     </section>
                   ) : null}
-                  {selectedChoiceProposal ? (
+                  {selectedDecisionOption ? (
                     <section className="shell-card selected-choice-banner">
                       <div className="selected-choice-banner-head">
                         <p className="section-eyebrow">Selected</p>
@@ -2612,13 +3038,13 @@ export default function App() {
                         <p className="inline-proposals-note">这些都只是预览，确认后才会真正应用。</p>
                       </div>
                       <div className="proposal-stack preview-card-grid">
-                        {previewProposals.map((proposal) => (
+                        {previewProposals.map((card) => (
                           <ProposalCard
-                            key={proposal.id}
-                            proposal={proposal}
-                            busy={proposalActionId === proposal.id}
-                            onAccept={handleAcceptProposal}
-                            onReject={handleRejectProposal}
+                            key={card.id}
+                            card={card}
+                            busy={proposalActionId === card.id}
+                            onAccept={handleAcceptPreviewCard}
+                            onReject={handleRejectPreviewCard}
                           />
                         ))}
                       </div>
@@ -2761,12 +3187,12 @@ export default function App() {
                   <div className="proposal-empty">
                     <p>
                       {showDecisionDeck
-                        ? `主区有 ${decisionProposals.length} 个方向卡，先选一个方向。`
+                        ? `主区有 ${decisionOptions.length} 个方向卡，先选一个方向。`
                         : previewDeckActive
                           ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
                           : proposalPanelState.loading
                             ? "正在根据你刚选的方向展开具体预览…"
-                            : selectedChoiceProposal
+                            : selectedDecisionOption
                               ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
                               : "当前会话还没有需要你确认的建议。"}
                     </p>
