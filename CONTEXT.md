@@ -128,6 +128,11 @@
    - 若用户仍使用普通 `http_proxy/https_proxy/...` 启动应用，则必须同时设置 `NO_PROXY=localhost,127.0.0.1,::1`。
    - 正式产品路径不是要求用户手动 `export`；而是通过设置页保存 `直连 / 跟随环境 / 手动代理`，再由后端只注入给 `codex` 子进程。
 
+26. **`codex_cli` 只适合作为重型工作区协作通道，不应继续承担全部对话**
+   - 当前 `codex exec` 是每轮冷启动 + 重建上下文 + 工作区前置查看的重链路，天然不适合承担所有普通聊天。
+   - `Solo` 长期应分成两条通道：`fast chat lane` 与 `heavy workspace lane`。
+   - 在这两条通道真正分离之前，`codex_cli` 可以继续保留，但只应被视为接入层，而不是 `Solo` 的长期 runtime 协议层。
+
 26. **主区“建议 + 预览 + 确认”必须按 DDD 的决策域来设计，而不是继续围绕文本块排版**
    - 这块的核心不是“把回复切成更漂亮的卡片”，而是先定义稳定的领域对象，再让 UI 只读这些对象的 projection。
    - 当前目标领域语言应至少包括：`DecisionSet`、`DecisionOption`、`OptionPreview`、`Approval`。
@@ -181,6 +186,7 @@
 - Behavior：普通聊天与工作区协作已改成显式模式切换，不再靠输入内容猜测
 - Proxy：`codex login status` / `codex login` / `codex exec` 已支持独立的 `SOLO_CODEX_*` 代理环境变量，并回退到普通代理变量
 - Settings：设置弹窗已重新接回主界面，并新增 `Codex 代理` 模式（直连 / 跟随环境 / 手动配置），保存后立即作用于后续 `codex` 子进程
+- Runtime：当前仍是 `messages + proposals` 主导的过渡形态；下一阶段应优先把内部模型收敛到 `session/thread -> turn -> item`，再决定是否更换或增加 provider
 - UX：工作区列表与聊天头部已明确区分“挂载上下文”和“进入协作”
 - Streaming：已开始解析 `codex --json` 的 `item.*` 事件，让工作区协作时的读文件/执行命令/中间说明能显示成可读进度，而不是只看到 thread/turn started
 - Streaming：工作区协作不再沿用统一 180 秒总超时；已改成按模式区分的“总超时 + 空闲超时”，并优先显示产品化阶段摘要，而不是原始 `zsh/sed/rg` 命令细节
@@ -210,6 +216,8 @@
 - Reliability：方向 fallback 解析不能在第一条非 bullet 行就结束；A/B 多行描述必须按选项分组收集，否则会把“两个方向”截成只剩一条
 - Reliability：发送锁必须持续到本轮真正 `done/error`，不能在首个 token 到达时提前解锁，否则会造成同一条用户消息重复追加
 - Reliability：`codex-cli` 的 raw stderr（如 `Reconnecting ... timeout waiting for child process to exit`）不能原样成为主交互文案；应尽量产品化，并在重连耗尽时尽早失败
+- Session UX：侧栏会话列表必须支持直接删除；删除当前会话时应自动切到剩余会话，没有剩余则立即补一条新会话，且同时清理该会话的 proposals 和本地流式状态
+- Sidebar：会话卡不再重复强调工作区挂载语义；工作区列表只负责挂载与切换；文件树默认折叠，按需展开
 
 ## 4. 近期计划（按优先级）
 
@@ -242,6 +250,8 @@
 - [ ] 支持导出会话
 - [ ] 完善移动端/窄窗口布局
 - [ ] 把主区“方向卡 / 预览卡”继续视觉化，吸收更多杀戮尖塔式的卡片聚焦交互
+- [ ] 把 `fast chat lane` 与 `heavy workspace lane` 的 runtime 边界正式拆开
+- [ ] 开始把 `messages + proposals` 降级为 projection，并补最小可用的 `turn/item` 内部结构
 - [ ] 把主区默认视图重做成稳定的多方向比较板，而不是继续围绕单个方向解释卡来回打磨
 
 ### P2（后续扩展）

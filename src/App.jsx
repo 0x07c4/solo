@@ -1024,10 +1024,14 @@ function ProposalCard({ card, busy, onAccept, onReject }) {
   );
 }
 
-function DecisionOptionCard({ option, active, onPreview }) {
+function DecisionOptionCard({ option, active, index, total, onPreview }) {
   const optionKey = option.optionKey ?? option.title;
+  const tilt = total > 1 ? `${(index - (total - 1) / 2) * 1.6}deg` : "0deg";
   return (
-    <article className={`decision-option-card ${active ? "is-active" : ""}`}>
+    <article
+      className={`decision-option-card ${active ? "is-active" : ""}`}
+      style={{ "--card-tilt": tilt }}
+    >
       <button
         type="button"
         className="decision-option-surface"
@@ -1036,11 +1040,21 @@ function DecisionOptionCard({ option, active, onPreview }) {
       >
         <div className="decision-option-head">
           <span className="section-eyebrow">方向 {optionKey}</span>
-          {active ? <span className="drawer-chip drawer-chip-active">预览中</span> : null}
+          <div className="decision-option-badges">
+            <span className="decision-option-index">{String(index + 1).padStart(2, "0")}</span>
+            {active ? <span className="drawer-chip drawer-chip-active">预览中</span> : null}
+          </div>
         </div>
-        <strong>{option.title}</strong>
-        <p>{option.summary}</p>
-        <span className="decision-option-hint">点击卡片先查看这个方向的预览</span>
+        <div className="decision-option-body">
+          <strong>{option.title}</strong>
+          <p>{option.summary}</p>
+        </div>
+        <div className="decision-option-foot">
+          <span className="decision-option-hint">点击卡片先查看这个方向的预览</span>
+          <span className="decision-option-arrow" aria-hidden="true">
+            ↗
+          </span>
+        </div>
       </button>
     </article>
   );
@@ -1245,6 +1259,7 @@ export default function App() {
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
+  const [explorerOpen, setExplorerOpen] = useState(false);
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId) ?? null,
@@ -1997,6 +2012,78 @@ export default function App() {
     setActiveWorkspaceId(session?.workspaceId ?? "");
   };
 
+  const handleDeleteSession = async (sessionId) => {
+    const targetSession = sessions.find((entry) => entry.id === sessionId);
+    if (!targetSession) {
+      return;
+    }
+
+    const deletingActive = sessionId === activeSessionId;
+
+    try {
+      let remainingSessions = sortSessions(await desktop.sessionDelete(sessionId));
+      if (!remainingSessions.length) {
+        remainingSessions = [await desktop.sessionCreate()];
+      }
+
+      const nextActiveSession = deletingActive
+        ? remainingSessions[0] ?? null
+        : remainingSessions.find((entry) => entry.id === activeSessionId) ??
+          remainingSessions[0] ??
+          null;
+
+      setSessions(remainingSessions);
+      setActiveSessionId(nextActiveSession?.id ?? "");
+      setActiveWorkspaceId(nextActiveSession?.workspaceId ?? "");
+      setDraft("");
+      resetPreview();
+      setProposalsBySession((current) => {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+      setDecisionPreviewBySession((current) => {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+      setTurnIntentBySession((current) => {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+      setStreamProgressBySession((current) => {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+      setStreamMonitorBySession((current) => {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+
+      setNotice({ kind: "info", text: `已删除会话：${targetSession.title}` });
+    } catch (error) {
+      setNotice({ kind: "error", text: normalizeError(error) });
+    }
+  };
+
   const handleSetSessionMode = async (nextMode) => {
     if (!activeSessionId) {
       return;
@@ -2136,6 +2223,9 @@ export default function App() {
       const nextWorkspaces = workspaces.filter((workspace) => workspace.id !== workspaceId);
       setWorkspaces(nextWorkspaces);
       setActiveWorkspaceId((current) => (current === workspaceId ? "" : current));
+      if (activeWorkspaceId === workspaceId) {
+        setExplorerOpen(false);
+      }
       resetPreview();
       const reloadedSessions = await desktop.sessionsList();
       setSessions(sortSessions(reloadedSessions));
@@ -2147,6 +2237,7 @@ export default function App() {
 
   const handleSelectWorkspace = async (workspaceId) => {
     setActiveWorkspaceId(workspaceId);
+    setExplorerOpen(false);
     resetPreview();
     if (!activeSessionId) {
       return;
@@ -2166,6 +2257,7 @@ export default function App() {
   const handleDetachWorkspace = async () => {
     if (!activeSessionId) {
       setActiveWorkspaceId("");
+      setExplorerOpen(false);
       resetPreview();
       return;
     }
@@ -2174,6 +2266,7 @@ export default function App() {
       const updated = await desktop.workspaceSelect(activeSessionId, null);
       setSessions((current) => upsertSession(current, updated));
       setActiveWorkspaceId("");
+      setExplorerOpen(false);
       resetPreview();
       setNotice({ kind: "info", text: "已解除工作区挂载，当前会话回到对话模式。" });
     } catch (error) {
@@ -2186,6 +2279,7 @@ export default function App() {
       return;
     }
 
+    setExplorerOpen(true);
     setPreviewState({ loading: true, error: "" });
     try {
       const preview = await desktop.workspaceReadFile(activeWorkspace.id, relativePath);
@@ -2445,7 +2539,6 @@ export default function App() {
   const modeLabel = sessionModeLabel(activeSessionMode);
   const topbarContextLabel = sessionModeTrailLabel(activeSessionMode);
   const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
-  const inspectorSessionState = activeSession ? "active" : "idle";
   const previewTitle = selectedFilePath || "暂无文件";
   const previewStateLabel = previewState.loading
     ? "loading"
@@ -2455,7 +2548,6 @@ export default function App() {
         ? "ready"
         : "empty";
   const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "已挂载" : "未挂载";
-  const inspectorSessionStateText = activeSession ? "当前会话" : "空闲";
   const previewStateText = previewState.loading
     ? "读取中"
     : previewState.error
@@ -2485,6 +2577,13 @@ export default function App() {
           : selectedDecisionOption
             ? "已选择"
             : "无待确认";
+  const showSuggestionPanel =
+    proposalPanelState.loading ||
+    Boolean(proposalPanelState.error) ||
+    showDecisionDeck ||
+    previewDeckActive ||
+    Boolean(selectedDecisionOption);
+  const showPreviewPanel = previewState.loading || Boolean(previewState.error) || Boolean(filePreview);
   const composerPlaceholder = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
       ? "描述你想让 Solo 给出的方向建议；它会先生成方向卡，再由你点开预览。"
@@ -2686,19 +2785,32 @@ export default function App() {
             </div>
             <div className="session-list">
               {sessions.map((session) => (
-                <button
+                <div
                   key={session.id}
-                  type="button"
                   className={`session-card ${session.id === activeSessionId ? "is-active" : ""}`}
-                  onClick={() => handleSelectSession(session.id)}
-                  aria-label={`打开会话 ${session.title}`}
                 >
-                  <div className="session-row">
-                    <span className="session-title">{session.title}</span>
-                    <span className="list-badge">{session.messages?.length ?? 0}</span>
-                  </div>
-                  <span className="session-meta">{sessionModeLabel(session.interactionMode)}</span>
-                </button>
+                  <button
+                    type="button"
+                    className={`session-main ${session.id === activeSessionId ? "is-active" : ""}`}
+                    onClick={() => handleSelectSession(session.id)}
+                    aria-label={`打开会话 ${session.title}`}
+                  >
+                    <div className="session-row">
+                      <span className="session-title">{session.title}</span>
+                      <span className="list-badge">{session.messages?.length ?? 0}</span>
+                    </div>
+                    <span className="session-meta">{sessionModeTrailLabel(session.interactionMode)}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button session-delete-button"
+                    onClick={() => handleDeleteSession(session.id)}
+                    aria-label={`删除会话 ${session.title}`}
+                    disabled={chatSending && session.id === activeSessionId}
+                  >
+                    删除
+                  </button>
+                </div>
               ))}
             </div>
           </section>
@@ -2711,7 +2823,7 @@ export default function App() {
                   <h2>工作区</h2>
                   <span className="section-count">{workspaces.length}</span>
                 </div>
-                <p className="section-note">点击工作区只会挂载到当前会话，不会自动进入协作。</p>
+                <p className="section-note">这里只负责挂载和切换，不替你决定是否协作。</p>
               </div>
               <button
                 type="button"
@@ -2743,9 +2855,7 @@ export default function App() {
                     <span className="workspace-path">{workspace.path}</span>
                     <span className="workspace-caption">
                       {workspace.id === activeSessionWorkspaceId
-                        ? collaborationEnabled
-                          ? "当前会话正结合这个工作区协作"
-                          : "当前会话已挂载这个工作区"
+                        ? "当前会话正在使用这个工作区"
                         : "点击挂载到当前会话"}
                     </span>
                   </button>
@@ -2761,19 +2871,34 @@ export default function App() {
             </div>
           </section>
 
-          <section className="panel-block panel-explorer is-grow">
+          <section
+            className={`panel-block panel-explorer ${explorerOpen ? "is-grow" : "is-collapsed"}`}
+          >
             <div className="section-header">
               <div>
                 <p className="section-eyebrow">Explorer</p>
                 <div className="section-title-row">
                   <h2>文件树</h2>
-                  {activeWorkspace ? (
-                    <span className="section-count section-count-workspace">{activeWorkspace.name}</span>
-                  ) : null}
                 </div>
               </div>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setExplorerOpen((current) => !current)}
+                disabled={!activeWorkspace}
+              >
+                {explorerOpen ? "收起" : "展开"}
+              </button>
             </div>
-            {activeWorkspace ? (
+            {!explorerOpen ? (
+              <div className="panel-collapsed-note">
+                <p>
+                  {activeWorkspace
+                    ? "文件树默认折叠。需要看文件时再展开。"
+                    : "挂载工作区后，可以按需展开文件树。"}
+                </p>
+              </div>
+            ) : activeWorkspace ? (
               workspaceTreeLoading ? (
                 <div className="empty-state compact">
                   <p>正在加载文件树…</p>
@@ -2969,49 +3094,53 @@ export default function App() {
                   ) : null}
                   {showDecisionDeck ? (
                     <section className="shell-card inline-proposals decision-deck">
-                      <div className="decision-choice-rail">
-                        <div className="inline-proposals-head">
-                          <div>
-                            <p className="section-eyebrow">Decisions</p>
-                            <h3>先选一个方向</h3>
-                          </div>
-                          <div className="decision-deck-meta">
-                            <p className="inline-proposals-note">
-                              {decisionOptions.length > 1
-                                ? "方向卡会固定在上方；先切换预览，再决定要不要确认。"
-                                : "先点开这个方向的预览，再决定是否确认。"}
-                            </p>
-                            <button
-                              type="button"
-                              className="ghost-button"
-                              disabled={rejectingAllDecisions}
-                              onClick={() => handleDismissDecisionSet(activeDecisionSet)}
-                            >
-                              {rejectingAllDecisions
-                                ? "处理中…"
-                                : activeDecisionSet.dismissAction?.label ?? "都不选"}
-                            </button>
-                          </div>
+                      <div className="inline-proposals-head decision-deck-head">
+                        <div>
+                          <p className="section-eyebrow">Decisions</p>
+                          <h3>先选一个方向</h3>
                         </div>
-                        <div className={`decision-deck-grid ${decisionOptions.length > 1 ? "is-multi" : ""}`}>
-                          {decisionOptions.map((option) => (
-                            <DecisionOptionCard
-                              key={option.id}
-                              option={option}
-                              active={activeDecisionPreviewOption?.id === option.id}
-                              onPreview={handlePreviewDecision}
-                            />
-                          ))}
+                        <div className="decision-deck-meta">
+                          <p className="inline-proposals-note">
+                            {decisionOptions.length > 1
+                              ? "先左右看完方向卡，再锁定一个方向继续展开预览。"
+                              : "先点开这个方向的预览，再决定是否确认。"}
+                          </p>
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            disabled={rejectingAllDecisions}
+                            onClick={() => handleDismissDecisionSet(activeDecisionSet)}
+                          >
+                            {rejectingAllDecisions
+                              ? "处理中…"
+                              : activeDecisionSet.dismissAction?.label ?? "都不选"}
+                          </button>
                         </div>
                       </div>
-                      <DecisionPreviewPanel
-                        option={activeDecisionPreviewOption}
-                        decisionSet={activeDecisionSet}
-                        busy={proposalActionId === activeDecisionPreviewOption?.id}
-                        skipBusy={rejectingAllDecisions}
-                        onConfirm={handleChooseDecisionOption}
-                        onSkipAll={handleDismissDecisionSet}
-                      />
+                      <div className="decision-deck-stage">
+                        <div className="decision-choice-rail">
+                          <div className={`decision-deck-grid ${decisionOptions.length > 1 ? "is-multi" : ""}`}>
+                            {decisionOptions.map((option, index) => (
+                              <DecisionOptionCard
+                                key={option.id}
+                                option={option}
+                                active={activeDecisionPreviewOption?.id === option.id}
+                                index={index}
+                                total={decisionOptions.length}
+                                onPreview={handlePreviewDecision}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                        <DecisionPreviewPanel
+                          option={activeDecisionPreviewOption}
+                          decisionSet={activeDecisionSet}
+                          busy={proposalActionId === activeDecisionPreviewOption?.id}
+                          skipBusy={rejectingAllDecisions}
+                          onConfirm={handleChooseDecisionOption}
+                          onSkipAll={handleDismissDecisionSet}
+                        />
+                      </div>
                     </section>
                   ) : null}
                   {selectedDecisionOption ? (
@@ -3103,23 +3232,12 @@ export default function App() {
             <span className="section-count">{modeLabel}</span>
           </div>
 
-          <div className="inspector-summary">
-            <div className="inspector-summary-item">
-              <span className="section-eyebrow">workspace</span>
-              <strong>{activeWorkspace?.name ?? "未选择"}</strong>
-            </div>
-            <div className="inspector-summary-item">
-              <span className="section-eyebrow">messages</span>
-              <strong>{sessionMessageCount}</strong>
-            </div>
-          </div>
-
           <div className="inspector-scroll">
             <section className="drawer-panel">
               <div className="drawer-panel-head">
                 <div className="drawer-panel-title">
-                  <span className="section-eyebrow">Workspace</span>
-                  <strong>{activeWorkspace?.name ?? "未选择"}</strong>
+                  <span className="section-eyebrow">Context</span>
+                  <strong>当前上下文</strong>
                 </div>
                 <span className={`drawer-chip drawer-chip-${inspectorWorkspaceState}`}>
                   {inspectorWorkspaceStateText}
@@ -3127,31 +3245,15 @@ export default function App() {
               </div>
               <div className="drawer-meta-grid">
                 <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">路径</span>
-                  <span className="drawer-meta-value drawer-meta-path">
-                    {activeWorkspace?.path ?? "添加工作区后，这里会显示当前目录。"}
-                  </span>
+                  <span className="drawer-meta-label">工作区</span>
+                  <span className="drawer-meta-value">{activeWorkspace?.name ?? "未选择"}</span>
                 </div>
                 <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">参与</span>
+                  <span className="drawer-meta-label">模式</span>
                   <span className="drawer-meta-value">
-                    {collaborationEnabled ? "当前会话会结合这个工作区" : "已挂载，当前这轮不自动参与"}
+                    {collaborationEnabled ? "工作区协作" : "对话"}
                   </span>
                 </div>
-              </div>
-            </section>
-
-            <section className="drawer-panel">
-              <div className="drawer-panel-head">
-                <div className="drawer-panel-title">
-                  <span className="section-eyebrow">Session</span>
-                  <strong>{activeSession?.title ?? "暂无会话"}</strong>
-                </div>
-                <span className={`drawer-chip drawer-chip-${inspectorSessionState}`}>
-                  {inspectorSessionStateText}
-                </span>
-              </div>
-              <div className="drawer-meta-grid">
                 <div className="drawer-meta-row">
                   <span className="drawer-meta-label">消息</span>
                   <span className="drawer-meta-value">
@@ -3159,78 +3261,76 @@ export default function App() {
                   </span>
                 </div>
                 <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">模式</span>
-                  <span className="drawer-meta-value">{modeLabel}</span>
+                  <span className="drawer-meta-label">会话</span>
+                  <span className="drawer-meta-value">{activeSession?.title ?? "暂无会话"}</span>
                 </div>
               </div>
             </section>
 
-            <section className="drawer-panel drawer-panel-proposals">
-              <div className="drawer-panel-head">
-                <div className="drawer-panel-title">
-                  <span className="section-eyebrow">Suggestions</span>
-                  <strong>建议与确认</strong>
+            {showSuggestionPanel ? (
+              <section className="drawer-panel drawer-panel-proposals">
+                <div className="drawer-panel-head">
+                  <div className="drawer-panel-title">
+                    <span className="section-eyebrow">Suggestions</span>
+                    <strong>当前阶段</strong>
+                  </div>
+                  <span className={`drawer-chip drawer-chip-${suggestionInspectorTone}`}>
+                    {suggestionInspectorStatus}
+                  </span>
                 </div>
-                <span className={`drawer-chip drawer-chip-${suggestionInspectorTone}`}>
-                  {suggestionInspectorStatus}
-                </span>
-              </div>
-              <div className="drawer-preview-body">
-                <p className="proposal-panel-note">AI 先给建议和预览，是否应用由你决定。</p>
-                {proposalPanelState.error ? (
-                  <div className="status-banner status-banner-error">
-                    <strong>加载失败</strong>
-                    <span>{proposalPanelState.error}</span>
-                  </div>
-                ) : null}
-                {!proposalPanelState.error ? (
-                  <div className="proposal-empty">
-                    <p>
-                      {showDecisionDeck
-                        ? `主区有 ${decisionOptions.length} 个方向卡，先选一个方向。`
-                        : previewDeckActive
-                          ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
-                          : proposalPanelState.loading
-                            ? "正在根据你刚选的方向展开具体预览…"
-                            : selectedDecisionOption
-                              ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
-                              : "当前会话还没有需要你确认的建议。"}
-                    </p>
-                  </div>
-                ) : null}
-              </div>
-            </section>
+                <div className="drawer-preview-body">
+                  {proposalPanelState.error ? (
+                    <div className="status-banner status-banner-error">
+                      <strong>加载失败</strong>
+                      <span>{proposalPanelState.error}</span>
+                    </div>
+                  ) : (
+                    <div className="proposal-empty">
+                      <p>
+                        {showDecisionDeck
+                          ? `主区有 ${decisionOptions.length} 个方向卡，先选一个方向。`
+                          : previewDeckActive
+                            ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
+                            : proposalPanelState.loading
+                              ? "正在根据你刚选的方向展开具体预览…"
+                              : selectedDecisionOption
+                                ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
+                                : "当前没有额外建议。"}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </section>
+            ) : null}
 
-            <section className="drawer-panel drawer-panel-preview is-grow">
-              <div className="drawer-panel-head">
-                <div className="drawer-panel-title">
-                  <span className="section-eyebrow">Preview</span>
-                  <strong>{previewTitle}</strong>
+            {showPreviewPanel ? (
+              <section className="drawer-panel drawer-panel-preview is-grow">
+                <div className="drawer-panel-head">
+                  <div className="drawer-panel-title">
+                    <span className="section-eyebrow">Preview</span>
+                    <strong>{previewTitle}</strong>
+                  </div>
+                  <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
                 </div>
-                <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
-              </div>
-              <div className="drawer-preview-body">
-              {previewState.loading ? <p>正在读取文件…</p> : null}
-              {previewState.error ? (
-                <div className="status-banner status-banner-error">
-                  <strong>预览失败</strong>
-                  <span>{previewState.error}</span>
-                </div>
-              ) : null}
-              {filePreview ? (
-                <>
-                  <pre>{filePreview.content}</pre>
-                  {filePreview.isTruncated ? (
-                    <p className="preview-note">
-                      该文件较大，当前只显示前 12000 个字符预览。
-                    </p>
+                <div className="drawer-preview-body">
+                  {previewState.loading ? <p>正在读取文件…</p> : null}
+                  {previewState.error ? (
+                    <div className="status-banner status-banner-error">
+                      <strong>预览失败</strong>
+                      <span>{previewState.error}</span>
+                    </div>
                   ) : null}
-                </>
-              ) : (
-                <pre>从左侧文件树点开文件后，这里会显示内容。</pre>
-              )}
-              </div>
-            </section>
+                  {filePreview ? (
+                    <>
+                      <pre>{filePreview.content}</pre>
+                      {filePreview.isTruncated ? (
+                        <p className="preview-note">该文件较大，当前只显示前 12000 个字符预览。</p>
+                      ) : null}
+                    </>
+                  ) : null}
+                </div>
+              </section>
+            ) : null}
           </div>
         </aside>
       </main>

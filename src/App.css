@@ -887,15 +887,11 @@ select {
 }
 
 .decision-choice-rail {
-  position: sticky;
-  top: 0;
-  z-index: 6;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding-bottom: 10px;
+  gap: 14px;
+  padding-bottom: 0;
   background: inherit;
-  box-shadow: 0 10px 20px color-mix(in srgb, black 10%, transparent);
 }
 
 .decision-deck,
@@ -949,17 +945,16 @@ select {
 }
 
 .decision-deck-grid {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(280px, 340px);
+  display: flex;
+  flex-wrap: nowrap;
   align-items: stretch;
-  gap: 14px;
+  gap: 18px;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 8px 4px 14px;
+  padding: 12px 6px 18px;
   margin: 0;
   scroll-snap-type: x proximity;
-  scroll-padding-inline: 4px;
+  scroll-padding-inline: 6px;
   overscroll-behavior-x: contain;
   scrollbar-width: thin;
 }
@@ -974,14 +969,16 @@ select {
 }
 
 .decision-deck-grid .decision-option-card {
-  min-height: 188px;
+  flex: 0 0 clamp(280px, 30vw, 356px);
+  min-height: 220px;
+  max-width: 356px;
   scroll-snap-align: start;
   position: relative;
   isolation: isolate;
 }
 
 .decision-deck-grid.is-multi .decision-option-card {
-  transform: translateY(0);
+  transform: translateY(8px) rotate(var(--card-tilt, 0deg));
 }
 
 .decision-option-card {
@@ -995,8 +992,9 @@ select {
   overflow: hidden;
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, white 8%, transparent),
-    0 14px 30px color-mix(in srgb, black 18%, transparent);
+    0 18px 34px color-mix(in srgb, black 20%, transparent);
   transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease, background 180ms ease;
+  transform-origin: center bottom;
 }
 
 .decision-option-card::before {
@@ -1023,14 +1021,14 @@ select {
   border-color: color-mix(in srgb, var(--accent) 44%, var(--border-active) 56%);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, white 8%, transparent),
-    0 20px 38px color-mix(in srgb, var(--accent) 16%, transparent);
-  transform: translateY(-8px) scale(1.018);
+    0 24px 44px color-mix(in srgb, var(--accent) 18%, transparent);
+  transform: translateY(-6px) scale(1.022) rotate(0deg);
   z-index: 3;
 }
 
 .decision-option-card:hover,
 .decision-option-card:focus-within {
-  transform: translateY(-5px) scale(1.008);
+  transform: translateY(0) scale(1.01) rotate(0deg);
   z-index: 2;
 }
 
@@ -1044,7 +1042,7 @@ select {
   padding: 14px 14px 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   justify-content: flex-start;
   cursor: pointer;
   position: relative;
@@ -1063,9 +1061,34 @@ select {
   gap: 8px;
 }
 
+.decision-option-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.decision-option-index {
+  min-width: 30px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border-default) 86%);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1;
+  text-align: center;
+  background: color-mix(in srgb, var(--surface-pane) 88%, transparent);
+}
+
+.decision-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .decision-option-card strong {
   font-family: var(--font-mono);
-  font-size: 0.9rem;
+  font-size: 0.96rem;
   line-height: 1.35;
   color: var(--text-strong);
 }
@@ -1073,21 +1096,44 @@ select {
 .decision-option-card p {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 0.8rem;
+  font-size: 0.81rem;
   line-height: 1.55;
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 4;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
-.decision-option-hint {
+.decision-option-foot {
   margin-top: auto;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.decision-option-hint {
   color: var(--text-dim);
   font-size: 0.74rem;
   line-height: 1.45;
+  max-width: 18ch;
 }
 
+.decision-option-arrow {
+  color: color-mix(in srgb, var(--accent) 74%, var(--text-secondary) 26%);
+  font-family: var(--font-mono);
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.decision-preview-panel {
+  margin-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--border-default) 78%, transparent);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 .selected-choice-banner {
   padding: 14px;
   display: flex;
@@ -1117,14 +1163,6 @@ select {
   color: var(--text-secondary);
   font-size: 0.8rem;
   line-height: 1.55;
-}
-
-.decision-preview-panel {
-  border-top: 1px solid color-mix(in srgb, var(--border-default) 78%, transparent);
-  padding-top: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
 }
 
 .decision-preview-hero {
@@ -1509,6 +1547,10 @@ select {
   padding: 0;
 }
 
+.panel-explorer.is-collapsed {
+  flex: 0 0 auto;
+}
+
 .is-grow,
 .inspector-scroll {
   flex: 1;
@@ -1527,33 +1569,6 @@ select {
   justify-content: space-between;
   gap: 10px;
   padding: 2px 2px 0;
-}
-
-.inspector-summary {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-}
-
-.inspector-summary-item {
-  border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border-default) 86%);
-  border-radius: 8px;
-  padding: 8px 9px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--surface-pane-strong) 90%, var(--surface-app-soft) 10%),
-    color-mix(in srgb, var(--surface-pane-muted) 94%, var(--surface-app-soft) 6%)
-  );
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
-}
-
-.inspector-summary-item strong {
-  display: block;
-  margin-top: 2px;
-  font-family: var(--font-mono);
-  font-size: 0.76rem;
-  line-height: 1.2;
-  color: var(--text-strong);
 }
 
 .section-header {
@@ -1588,12 +1603,28 @@ select {
 
 .session-card {
   position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.session-main {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 7px 9px 7px 12px;
+  background: transparent;
+  text-align: left;
+  transition: border-color 180ms ease, background 180ms ease, color 180ms ease, box-shadow 180ms ease;
+  cursor: pointer;
 }
 
-.session-card::before {
+.session-main::before {
   content: "";
   position: absolute;
   left: -1px;
@@ -1624,7 +1655,7 @@ select {
   border-top: none;
 }
 
-.session-card.is-active,
+.session-main.is-active,
 .workspace-card.is-active .workspace-main {
   border-color: var(--border-active);
   background: color-mix(in srgb, var(--accent) 12%, var(--surface-pane-strong) 88%);
@@ -1635,7 +1666,7 @@ select {
   background: transparent;
 }
 
-.session-card.is-active::before {
+.session-main.is-active::before {
   background: linear-gradient(
     180deg,
     color-mix(in srgb, var(--accent) 80%, white 20%),
@@ -1643,15 +1674,30 @@ select {
   );
 }
 
-.session-card:hover,
+.session-main:hover,
 .workspace-main:hover,
 .workspace-card:hover {
   border-color: color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
-.session-card:hover,
+.session-main:hover,
 .workspace-main:hover {
   background: color-mix(in srgb, var(--accent) 7%, var(--surface-pane-strong) 93%);
+}
+
+.session-delete-button {
+  min-width: 48px;
+  justify-self: end;
+  padding: 5px 9px;
+  border-radius: 7px;
+  font-size: 0.68rem;
+  line-height: 1.2;
+  opacity: 0.46;
+  transition: opacity 160ms ease, border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.session-card.is-active .session-delete-button {
+  opacity: 0.82;
 }
 
 .workspace-card .danger-button {
@@ -1664,6 +1710,8 @@ select {
   transition: opacity 160ms ease, border-color 160ms ease, background 160ms ease, transform 160ms ease;
 }
 
+.session-card:hover .session-delete-button,
+.session-delete-button:focus-visible,
 .workspace-card:hover .danger-button,
 .workspace-card .danger-button:focus-visible {
   opacity: 1;
@@ -1699,6 +1747,17 @@ select {
   color: var(--text-secondary);
   font-size: 0.72rem;
   line-height: 1.45;
+}
+
+.panel-collapsed-note {
+  padding: 12px 10px 14px;
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+.panel-collapsed-note p {
+  margin: 0;
 }
 
 .session-title,
@@ -1894,7 +1953,6 @@ select {
   gap: 10px;
 }
 
-.proposal-panel-note,
 .proposal-empty p {
   margin: 0;
   color: var(--text-secondary);
@@ -2184,10 +2242,11 @@ select {
   white-space: nowrap;
 }
 
-.session-card:focus-visible,
+.session-main:focus-visible,
 .workspace-main:focus-visible,
 .tree-node:focus-visible,
 .section-header .ghost-button:focus-visible,
+.session-delete-button:focus-visible,
 .workspace-card .danger-button:focus-visible {
   outline: none;
   border-color: rgba(120, 170, 255, 0.76);

@@ -67,6 +67,7 @@ pub fn run() {
             sessions_list,
             session_create,
             session_open,
+            session_delete,
             session_mode_set,
             workspaces_list,
             workspace_add,
@@ -413,6 +414,21 @@ fn session_open(session_id: String, state: State<'_, SharedState>) -> Result<Cha
                 .cloned()
         })
         .ok_or_else(|| "session not found".to_string())
+}
+
+#[tauri::command]
+fn session_delete(session_id: String, state: State<'_, SharedState>) -> Result<Vec<ChatSession>, String> {
+    state.update(|store| {
+        let previous_len = store.sessions.len();
+        store.sessions.retain(|session| session.id != session_id);
+        if store.sessions.len() == previous_len {
+            return Err("session not found".to_string());
+        }
+        store.proposals.retain(|proposal| proposal.session_id != session_id);
+        store.save_sessions()?;
+        store.save_proposals()?;
+        Ok(store.sorted_sessions())
+    })
 }
 
 #[tauri::command]
