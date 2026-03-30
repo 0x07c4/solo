@@ -518,7 +518,7 @@ fn workspace_remove(workspace_id: String, state: State<'_, SharedState>) -> Resu
                 ToolProposalPayload::Choice {
                     workspace_id: value,
                     ..
-                } => value == &workspace_id,
+                } => value.as_deref() == Some(workspace_id.as_str()),
             };
             if matches_workspace && proposal.status == "pending" {
                 proposal.status = "rejected".to_string();
@@ -847,7 +847,7 @@ async fn proposal_choose(
         provider.clone()
     };
 
-    let (session, proposal, latest_user_message_id, followup_input) =
+    let (session, proposal, latest_user_message_id, followup_input, followup_execution_mode) =
         state_handle.update(|store| {
             let proposal = store
                 .proposals
@@ -877,20 +877,33 @@ async fn proposal_choose(
                 .find(|session| session.id == proposal.session_id)
                 .ok_or_else(|| "session not found".to_string())?;
 
-            if session.workspace_id.as_deref() != Some(workspace_id.as_str()) {
+            let uses_workspace = workspace_id.is_some();
+            if uses_workspace && session.workspace_id.as_deref() != workspace_id.as_deref() {
                 return Err("当前方向建议绑定的工作区已变化，请重新生成建议。".to_string());
             }
 
             proposal.status = "selected".to_string();
             proposal.error = None;
-            proposal.latest_output = Some("已选择这个方向，正在展开具体预览。".to_string());
+            proposal.latest_output = Some(if uses_workspace {
+                "已选择这个方向，正在展开具体预览。".to_string()
+            } else {
+                "已选择这个方向，正在展开概念预览。".to_string()
+            });
             session
                 .pending_approvals
                 .retain(|entry| entry != &proposal_id);
-            session.interaction_mode = SessionInteractionMode::WorkspaceCollaboration;
+            session.interaction_mode = if uses_workspace {
+                SessionInteractionMode::WorkspaceCollaboration
+            } else {
+                SessionInteractionMode::Conversation
+            };
 
             let message_id = make_id("message");
-            let user_content = format!("已选择方向 {}，展开具体预览。", option_key);
+            let user_content = if uses_workspace {
+                format!("已选择方向 {}，展开具体预览。", option_key)
+            } else {
+                format!("已选择方向 {}，继续展开概念预览。", option_key)
+            };
             session.messages.push(ChatMessage {
                 id: message_id.clone(),
                 role: "user".to_string(),
@@ -901,12 +914,26 @@ async fn proposal_choose(
             });
             session.updated_at = now_millis();
 
-            let followup_input = build_choice_followup_input(option_key, detail);
+            let followup_input = if uses_workspace {
+                build_workspace_choice_followup_input(option_key, detail)
+            } else {
+                build_conversation_choice_followup_input(option_key, detail)
+            };
             let cloned_session = session.clone();
             let cloned_proposal = proposal.clone();
             store.save_proposals()?;
             store.save_sessions()?;
-            Ok((cloned_session, cloned_proposal, message_id, followup_input))
+            Ok((
+                cloned_session,
+                cloned_proposal,
+                message_id,
+                followup_input,
+                if uses_workspace {
+                    TurnExecutionMode::Agent
+                } else {
+                    TurnExecutionMode::QuickChat
+                },
+            ))
         })?;
 
     let _ = app.emit("approval-updated", &proposal);
@@ -923,7 +950,7 @@ async fn proposal_choose(
                 followup_input.clone(),
                 Vec::new(),
                 effective_provider,
-                TurnExecutionMode::Agent,
+                followup_execution_mode,
                 TurnIntent::Preview,
                 Some(followup_input),
             )
@@ -1312,7 +1339,7 @@ async fn process_chat_turn(
         let raw_reply = visible_reply.clone();
         visible_reply = strip_manual_reply_blocks(&raw_reply).trim().to_string();
 
-        if let Some(active_workspace) = workspace.as_ref() {
+        if workspace.is_some() {
             let parsed_blocks = parse_manual_reply_blocks(&raw_reply).unwrap_or_default();
             let parsed_choice_blocks = parsed_blocks
                 .iter()
@@ -1325,23 +1352,40 @@ async fn process_chat_turn(
             } else {
                 parse_reply_choice_blocks(&visible_reply)
             };
-            let proposal_blocks = if execution_mode == TurnExecutionMode::Agent
-                && turn_intent == TurnIntent::Choice
-            {
-                choice_blocks
-            } else if parsed_blocks.is_empty() {
-                choice_blocks
-            } else {
-                parsed_blocks
-            };
-            if !proposal_blocks.is_empty() {
+
+            if let Some(active_workspace) = workspace.as_ref() {
+                let proposal_blocks = if execution_mode == TurnExecutionMode::Agent
+                    && turn_intent == TurnIntent::Choice
+                {
+                    choice_blocks
+                } else if parsed_blocks.is_empty() {
+                    choice_blocks
+                } else {
+                    parsed_blocks
+                };
+                if !proposal_blocks.is_empty() {
+                    generated_proposals = state.update(|store| {
+                        let created = create_reply_proposals(
+                            store,
+                            &session_id,
+                            active_workspace,
+                            proposal_blocks,
+                        )?;
+                        if !created.is_empty() {
+                            store.save_sessions()?;
+                            store.save_proposals()?;
+                        }
+                        Ok(created)
+                    })?;
+
+                    for proposal in &generated_proposals {
+                        let _ = app.emit("tool-proposal-created", proposal);
+                    }
+                }
+            } else if execution_mode == TurnExecutionMode::QuickChat && !choice_blocks.is_empty() {
                 generated_proposals = state.update(|store| {
-                    let created = create_reply_proposals(
-                        store,
-                        &session_id,
-                        active_workspace,
-                        proposal_blocks,
-                    )?;
+                    let created =
+                        create_conversation_choice_proposals(store, &session_id, choice_blocks)?;
                     if !created.is_empty() {
                         store.save_sessions()?;
                         store.save_proposals()?;
@@ -2349,7 +2393,29 @@ fn build_codex_exec_prompt(
             .to_string(),
     };
     lines.push(base_rules);
-    if execution_mode == TurnExecutionMode::Agent {
+    if execution_mode == TurnExecutionMode::QuickChat {
+        match turn_intent {
+            TurnIntent::Choice => lines.push(
+                "这轮用户要的是多个概念方向，而不是立刻定稿。\
+                 输出规则再收紧：\
+                 1) 先用一句极短结论说明你整理了几个方向；\
+                 2) 然后附加 2 到 3 个 ```solo-choice key=\"A\" title=\"方向标题\" summary=\"一句话摘要\"``` 代码块；\
+                 3) 每个 solo-choice 代码块正文写概念预览，包括：核心思路、适用场景、收益、风险；\
+                 4) 不要假设工作区、文件、命令或真实改动，不要输出 ```solo-write``` 或 ```solo-command```。"
+                    .to_string(),
+            ),
+            TurnIntent::Preview => lines.push(
+                "这轮用户已经选定一个方向。\
+                 输出规则再收紧：\
+                 1) 只保留一句极短结论；\
+                 2) 继续展开概念预览，重点写核心思路、适用场景、收益、风险、下一步建议；\
+                 3) 不要再给多个方向，不要输出 ```solo-choice```、```solo-write``` 或 ```solo-command```；\
+                 4) 不要假设任何工作区、文件或命令上下文。"
+                    .to_string(),
+            ),
+            TurnIntent::Auto => {}
+        }
+    } else if execution_mode == TurnExecutionMode::Agent {
         if !workspace_ignore_patterns.is_empty() {
             lines.push(format!(
                 "当前工作区存在 .ignore 规则。默认不要查看这些路径，除非用户明确点名要求：{}。",
@@ -2508,13 +2574,22 @@ fn wants_direction_choices(input: &str) -> bool {
     .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
 }
 
-fn build_choice_followup_input(option_key: &str, detail: &str) -> String {
+fn build_workspace_choice_followup_input(option_key: &str, detail: &str) -> String {
     format!(
         "已选择方向 {option_key}：{detail}\n\
          请直接继续这一方向，并给出结构化预览。\
          输出重点：目标文件或范围、改动目的、影响点、风险提示、预期结果。\
          如果你已经能给出具体候选，至少附加一个 ```solo-write``` 或 ```solo-command```。\
          不要再给多个方向，也不要重复前面的长篇分析。"
+    )
+}
+
+fn build_conversation_choice_followup_input(option_key: &str, detail: &str) -> String {
+    format!(
+        "已选择方向 {option_key}：{detail}\n\
+         请沿这个方向继续展开概念预览。\
+         输出重点：核心思路、适用场景、收益、风险、下一步建议。\
+         不要再给多个方向，不要输出 ```solo-choice```、```solo-write``` 或 ```solo-command```，也不要假设工作区、文件或命令上下文。"
     )
 }
 
@@ -3196,6 +3271,63 @@ fn create_reply_proposals(
     Ok(created)
 }
 
+fn create_conversation_choice_proposals(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+    blocks: Vec<ManualReplyBlock>,
+) -> Result<Vec<ToolProposal>, String> {
+    let mut created = Vec::new();
+    for block in blocks {
+        let ManualReplyBlock::Choice {
+            option_key,
+            title,
+            summary,
+            detail,
+        } = block
+        else {
+            continue;
+        };
+        let proposal = ToolProposal {
+            id: make_id("proposal"),
+            session_id: session_id.to_string(),
+            kind: "choice".to_string(),
+            title: title
+                .filter(|entry| !entry.trim().is_empty())
+                .unwrap_or_else(|| format!("方向 {option_key}")),
+            summary: summary.unwrap_or_else(|| summarize_status_text(&detail, 84)),
+            created_at: now_millis(),
+            status: "pending".to_string(),
+            payload: ToolProposalPayload::Choice {
+                workspace_id: None,
+                option_key,
+                detail,
+            },
+            latest_output: None,
+            error: None,
+        };
+        store.proposals.push(proposal.clone());
+        created.push(proposal);
+    }
+
+    if created.is_empty() {
+        return Ok(created);
+    }
+
+    let proposal_ids = created
+        .iter()
+        .map(|proposal| proposal.id.clone())
+        .collect::<Vec<_>>();
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+    session.pending_approvals.extend(proposal_ids);
+    session.updated_at = now_millis();
+
+    Ok(created)
+}
+
 #[derive(Clone)]
 enum ManualReplyBlock {
     Write {
@@ -3647,7 +3779,7 @@ fn create_manual_proposal(
                 created_at: now_millis(),
                 status: "pending".to_string(),
                 payload: ToolProposalPayload::Choice {
-                    workspace_id: workspace.id.clone(),
+                    workspace_id: Some(workspace.id.clone()),
                     option_key,
                     detail,
                 },

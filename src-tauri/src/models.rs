@@ -189,7 +189,8 @@ pub enum ToolProposalPayload {
         reason: String,
     },
     Choice {
-        workspace_id: String,
+        #[serde(default)]
+        workspace_id: Option<String>,
         option_key: String,
         detail: String,
     },
