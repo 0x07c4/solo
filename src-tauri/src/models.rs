@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -102,6 +103,195 @@ pub struct ChatSession {
     pub pending_approvals: Vec<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskStatus {
+    #[default]
+    Active,
+    Blocked,
+    WaitingUser,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TaskRecord {
+    pub id: String,
+    pub session_id: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub status: TaskStatus,
+    pub current_turn_id: Option<String>,
+    pub latest_turn_id: Option<String>,
+}
+
+impl Default for TaskRecord {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            session_id: String::new(),
+            title: String::new(),
+            summary: None,
+            created_at: 0,
+            updated_at: 0,
+            status: TaskStatus::default(),
+            current_turn_id: None,
+            latest_turn_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TurnRecord {
+    pub id: String,
+    pub session_id: String,
+    pub task_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub status: TurnStatus,
+    pub intent: TurnIntent,
+    pub user_message_id: Option<String>,
+    pub assistant_message_id: Option<String>,
+    pub summary: Option<String>,
+    pub item_ids: Vec<String>,
+}
+
+impl Default for TurnRecord {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            session_id: String::new(),
+            task_id: None,
+            created_at: 0,
+            updated_at: 0,
+            status: TurnStatus::default(),
+            intent: TurnIntent::default(),
+            user_message_id: None,
+            assistant_message_id: None,
+            summary: None,
+            item_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemKind {
+    #[default]
+    UserMessage,
+    AgentMessage,
+    Plan,
+    StatusUpdate,
+    Choice,
+    ConceptPreview,
+    FileChangePreview,
+    CommandPreview,
+    ApprovalRequest,
+    CommandOutput,
+    CommandResult,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ItemApprovalState {
+    #[default]
+    NotRequired,
+    Pending,
+    Accepted,
+    Rejected,
+    Applied,
+    Failed,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TurnItem {
+    pub id: String,
+    pub session_id: String,
+    pub task_id: Option<String>,
+    pub turn_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub kind: TurnItemKind,
+    pub status: TurnItemStatus,
+    pub approval_state: ItemApprovalState,
+    pub title: String,
+    pub summary: Option<String>,
+    pub source_message_id: Option<String>,
+    pub source_proposal_id: Option<String>,
+    pub content: Option<String>,
+    pub metadata: Value,
+}
+
+impl Default for TurnItem {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            session_id: String::new(),
+            task_id: None,
+            turn_id: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            kind: TurnItemKind::default(),
+            status: TurnItemStatus::default(),
+            approval_state: ItemApprovalState::default(),
+            title: String::new(),
+            summary: None,
+            source_message_id: None,
+            source_proposal_id: None,
+            content: None,
+            metadata: Value::Null,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SessionRuntimeSnapshot {
+    pub session_id: String,
+    pub tasks: Vec<TaskRecord>,
+    pub turns: Vec<TurnRecord>,
+    pub turn_items: Vec<TurnItem>,
+}
+
+impl Default for SessionRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            tasks: Vec::new(),
+            turns: Vec::new(),
+            turn_items: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -147,6 +337,13 @@ pub struct CodexLoginStatus {
     pub logged_in: bool,
     pub method: String,
     pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLoginProgressEvent {
+    pub detail: String,
+    pub terminal: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

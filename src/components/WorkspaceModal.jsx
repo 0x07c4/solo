@@ -22,7 +22,7 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
       const selected = await openDialog({
         directory: true,
         multiple: false,
-        title: "选择工作区目录",
+        title: "选择项目目录",
       });
       if (typeof selected === "string" && selected.trim()) {
         setPath(selected.trim());
@@ -56,8 +56,8 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
       <div className="modal-card">
         <div className="section-header">
           <div>
-            <p className="section-eyebrow">Workspace Picker</p>
-            <h2>选择工作区目录</h2>
+            <p className="section-eyebrow">Context</p>
+            <h2>添加代码上下文</h2>
           </div>
           <button type="button" className="ghost-button" onClick={onClose}>
             关闭
@@ -65,18 +65,18 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
         </div>
 
         <div className="modal-copy">
-          <p>当前版本会直接打开系统目录选择器，由你手动挑选要绑定的工作区。</p>
-          <p>选中目录后，Solo 只把它当作协作上下文，不会默认替你改文件或执行命令。</p>
+          <p>当前版本会直接打开系统目录选择器，由你挑选一个项目目录。</p>
+          <p>这一步只是告诉 Solo 哪个目录可在工作区协作里读取；默认不会替你改文件或执行命令。</p>
         </div>
 
         <label className="field">
-          <span>已选择目录</span>
+          <span>已选目录</span>
           <input
             value={path}
             readOnly
             placeholder="点击下方按钮选择目录"
           />
-          <small>你也可以重新选择，直到确认当前工作区正确为止。</small>
+          <small>你可以反复更换，直到确认这是这轮协作真正需要的目录。</small>
         </label>
 
         {error ? (
@@ -101,7 +101,7 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
             disabled={submitting || !path.trim()}
             onClick={handleSubmit}
           >
-            添加工作区
+            添加为上下文
           </button>
         </div>
       </div>

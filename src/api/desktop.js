@@ -12,6 +12,7 @@ export const desktop = {
   sessionsList: () => invoke("sessions_list"),
   sessionCreate: () => invoke("session_create"),
   sessionOpen: (sessionId) => invoke("session_open", { sessionId }),
+  sessionRuntimeSnapshot: (sessionId) => invoke("session_runtime_snapshot", { sessionId }),
   sessionDelete: (sessionId) => invoke("session_delete", { sessionId }),
   sessionModeSet: (sessionId, interactionMode) =>
     invoke("session_mode_set", { sessionId, interactionMode }),

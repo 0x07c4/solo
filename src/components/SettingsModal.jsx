@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 
+function providerUsesCodexLogin(provider) {
+  return provider === "codex_cli" || provider === "openai-codex";
+}
+
 function validateForm(form) {
   const errors = {};
   if (!form.provider?.trim()) {
     errors.provider = "请先选择模式";
   }
-  if (form.provider === "manual" || form.provider === "codex_cli") {
+  if (form.provider === "manual" || providerUsesCodexLogin(form.provider)) {
     return errors;
   }
   if (!form.baseUrl.trim()) {
@@ -51,8 +55,10 @@ export function SettingsModal({
     if (form.provider === "manual") {
       return "当前为手动协作模式：问题在本地记录，外部回复手动导入。";
     }
-    if (form.provider === "codex_cli") {
-      return "当前为 ChatGPT 账号模式：直接复用本机 Codex 登录态。";
+    if (providerUsesCodexLogin(form.provider)) {
+      return form.provider === "codex_cli"
+        ? "当前为 ChatGPT 账号模式：直接复用本机 Codex 登录态。"
+        : "当前为 OpenAI Codex 账号模式：登录流程与 Codex 保持一致。";
     }
     if (connectionState.status === "success") {
       return connectionState.message;
@@ -171,11 +177,11 @@ export function SettingsModal({
           </>
         ) : (
           <div className="status-banner status-banner-info">
-            <strong>{form.provider === "manual" ? "Manual" : "ChatGPT"}</strong>
+            <strong>{form.provider === "manual" ? "Manual" : "Codex"}</strong>
             <span>
               {form.provider === "manual"
                 ? "发送按钮会只记录你的提问。你可以在 ChatGPT / Codex 里拿到回复后，再用“导入外部回复”贴回 Solo。"
-                : "应用会直接通过本机 Codex 登录态进行对话，无需 API Key。"}
+                : "应用会直接复用本机 Codex 的登录流程和登录态，无需手填 API Key。"}
             </span>
           </div>
         )}

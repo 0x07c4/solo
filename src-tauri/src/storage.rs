@@ -1,6 +1,6 @@
 use crate::models::{
-    ChatSession, FileReadResult, FileTreeNode, Settings, ToolProposal, ToolProposalPayload,
-    Workspace,
+    ChatSession, FileReadResult, FileTreeNode, SessionRuntimeSnapshot, Settings, TaskRecord,
+    ToolProposal, ToolProposalPayload, TurnItem, TurnRecord, Workspace,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +20,9 @@ const SETTINGS_FILE: &str = "settings.json";
 const SESSIONS_FILE: &str = "sessions.json";
 const WORKSPACES_FILE: &str = "workspaces.json";
 const PROPOSALS_FILE: &str = "approvals.json";
+const TASKS_FILE: &str = "tasks.json";
+const TURNS_FILE: &str = "turns.json";
+const TURN_ITEMS_FILE: &str = "turn-items.json";
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -35,6 +38,14 @@ pub struct Store {
     pub sessions: Vec<ChatSession>,
     pub workspaces: Vec<Workspace>,
     pub proposals: Vec<ToolProposal>,
+    // Phase 1 runtime skeleton: wired into persistence first, then integrated
+    // into turn execution and UI projection in follow-up changes.
+    #[allow(dead_code)]
+    pub tasks: Vec<TaskRecord>,
+    #[allow(dead_code)]
+    pub turns: Vec<TurnRecord>,
+    #[allow(dead_code)]
+    pub turn_items: Vec<TurnItem>,
     data_dir: PathBuf,
 }
 
@@ -52,6 +63,9 @@ impl SharedState {
             sessions: read_json_or_default(data_dir.join(SESSIONS_FILE))?,
             workspaces: read_json_or_default(data_dir.join(WORKSPACES_FILE))?,
             proposals: read_json_or_default(data_dir.join(PROPOSALS_FILE))?,
+            tasks: read_json_or_default(data_dir.join(TASKS_FILE))?,
+            turns: read_json_or_default(data_dir.join(TURNS_FILE))?,
+            turn_items: read_json_or_default(data_dir.join(TURN_ITEMS_FILE))?,
             data_dir,
         };
 
@@ -101,6 +115,21 @@ impl Store {
         write_json(self.data_dir.join(PROPOSALS_FILE), &self.proposals)
     }
 
+    #[allow(dead_code)]
+    pub fn save_tasks(&self) -> Result<(), String> {
+        write_json(self.data_dir.join(TASKS_FILE), &self.tasks)
+    }
+
+    #[allow(dead_code)]
+    pub fn save_turns(&self) -> Result<(), String> {
+        write_json(self.data_dir.join(TURNS_FILE), &self.turns)
+    }
+
+    #[allow(dead_code)]
+    pub fn save_turn_items(&self) -> Result<(), String> {
+        write_json(self.data_dir.join(TURN_ITEMS_FILE), &self.turn_items)
+    }
+
     pub fn sorted_sessions(&self) -> Vec<ChatSession> {
         let mut sessions = self.sessions.clone();
         sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -129,6 +158,83 @@ impl Store {
             other => other,
         });
         proposals
+    }
+
+    #[allow(dead_code)]
+    pub fn sorted_tasks(&self, session_id: Option<&str>) -> Vec<TaskRecord> {
+        let mut tasks = self
+            .tasks
+            .iter()
+            .filter(|task| session_id.map(|id| task.session_id == id).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| match right.updated_at.cmp(&left.updated_at) {
+            Ordering::Equal => right.id.cmp(&left.id),
+            other => other,
+        });
+        tasks
+    }
+
+    #[allow(dead_code)]
+    pub fn sorted_turns(
+        &self,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Vec<TurnRecord> {
+        let mut turns = self
+            .turns
+            .iter()
+            .filter(|turn| session_id.map(|id| turn.session_id == id).unwrap_or(true))
+            .filter(|turn| task_id.map(|id| turn.task_id.as_deref() == Some(id)).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        turns.sort_by(|left, right| match right.created_at.cmp(&left.created_at) {
+            Ordering::Equal => right.id.cmp(&left.id),
+            other => other,
+        });
+        turns
+    }
+
+    #[allow(dead_code)]
+    pub fn sorted_turn_items(
+        &self,
+        turn_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Vec<TurnItem> {
+        let mut items = self
+            .turn_items
+            .iter()
+            .filter(|item| turn_id.map(|id| item.turn_id == id).unwrap_or(true))
+            .filter(|item| task_id.map(|id| item.task_id.as_deref() == Some(id)).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| match left.created_at.cmp(&right.created_at) {
+            Ordering::Equal => left.id.cmp(&right.id),
+            other => other,
+        });
+        items
+    }
+
+    pub fn session_runtime_snapshot(&self, session_id: &str) -> SessionRuntimeSnapshot {
+        let tasks = self.sorted_tasks(Some(session_id));
+        let turns = self.sorted_turns(Some(session_id), None);
+        let mut turn_items = self
+            .turn_items
+            .iter()
+            .filter(|item| item.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        turn_items.sort_by(|left, right| match left.created_at.cmp(&right.created_at) {
+            Ordering::Equal => left.id.cmp(&right.id),
+            other => other,
+        });
+
+        SessionRuntimeSnapshot {
+            session_id: session_id.to_string(),
+            tasks,
+            turns,
+            turn_items,
+        }
     }
 }
 

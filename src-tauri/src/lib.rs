@@ -4,9 +4,11 @@ mod storage;
 
 use crate::models::{
     ChatMessage, ChatSession, ChatStreamDoneEvent, ChatStreamStatusEvent, ChatStreamTokenEvent,
-    CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent, ConnectionTestResult,
-    ManualImportResult, MessageAttachment, ProposalChooseResult, SessionInteractionMode, Settings,
-    SettingsUpdate, ToolProposal, ToolProposalPayload, TurnIntent, Workspace,
+    CodexLoginProgressEvent, CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent,
+    ConnectionTestResult, ItemApprovalState, ManualImportResult, MessageAttachment,
+    ProposalChooseResult, SessionInteractionMode, SessionRuntimeSnapshot, Settings,
+    SettingsUpdate, TaskRecord, TaskStatus, ToolProposal, ToolProposalPayload, TurnIntent,
+    TurnItem, TurnItemKind, TurnItemStatus, TurnRecord, TurnStatus, Workspace,
 };
 use crate::openai::{chat_completion, test_connection, CompletionMessage};
 use crate::storage::{
@@ -27,6 +29,23 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager, State};
+
+fn is_codex_auth_provider(provider: &str) -> bool {
+    matches!(provider.trim(), "codex_cli" | "openai-codex")
+}
+
+fn is_manual_provider(provider: &str) -> bool {
+    provider.trim() == "manual"
+}
+
+fn normalize_provider(provider: &str) -> String {
+    match provider.trim() {
+        "manual" => "manual".to_string(),
+        "openai" => "openai".to_string(),
+        "openai_codex" | "openai-codex" => "openai-codex".to_string(),
+        _ => "codex_cli".to_string(),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnExecutionMode {
@@ -68,6 +87,7 @@ pub fn run() {
             session_create,
             session_open,
             session_delete,
+            session_runtime_snapshot,
             session_mode_set,
             workspaces_list,
             workspace_add,
@@ -257,16 +277,6 @@ fn run_codex_login_status(settings: &Settings) -> Result<CodexLoginStatus, Strin
             })
         }
         Err(err) => {
-            let auth_snapshot = read_codex_auth_snapshot();
-            if let Some((logged_in, method, message)) = auth_snapshot {
-                return Ok(CodexLoginStatus {
-                    available: true,
-                    logged_in,
-                    method,
-                    message,
-                });
-            }
-
             Ok(CodexLoginStatus {
                 available: false,
                 logged_in: false,
@@ -284,16 +294,44 @@ fn codex_login_status(state: State<'_, SharedState>) -> Result<CodexLoginStatus,
 }
 
 #[tauri::command]
-fn codex_login_start(state: State<'_, SharedState>) -> Result<bool, String> {
+fn codex_login_start(app: tauri::AppHandle, state: State<'_, SharedState>) -> Result<bool, String> {
     let settings = state.read(|store| store.settings.clone());
     let mut command = Command::new("codex");
     apply_codex_proxy_env(&mut command, Some(&settings));
-    command
+    let mut child = command
         .arg("login")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("启动 Codex 登录失败：{err}"))?;
+
+    let app_handle = app.clone();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_codex_login_output_forwarder(app_handle.clone(), stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_codex_login_output_forwarder(app_handle.clone(), stderr);
+    }
+    std::thread::spawn(move || {
+        let status_message = match child.wait() {
+            Ok(status) if status.success() => CodexLoginProgressEvent {
+                detail: "Codex 登录命令已结束，正在刷新登录状态…".to_string(),
+                terminal: true,
+            },
+            Ok(status) => CodexLoginProgressEvent {
+                detail: format!(
+                    "Codex 登录命令已退出（code {}）。如果浏览器没有打开，请重试或在终端运行 `codex login` 查看细节。",
+                    status.code().unwrap_or(-1)
+                ),
+                terminal: true,
+            },
+            Err(err) => CodexLoginProgressEvent {
+                detail: format!("等待 Codex 登录流程结束时出错：{err}"),
+                terminal: true,
+            },
+        };
+        let _ = app_handle.emit("codex-login-progress", status_message);
+    });
     Ok(true)
 }
 
@@ -356,18 +394,18 @@ async fn settings_test_connection(
     state: State<'_, SharedState>,
 ) -> Result<ConnectionTestResult, String> {
     let normalized = normalize_settings(settings);
-    if normalized.provider == "codex_cli" {
+    if is_codex_auth_provider(&normalized.provider) {
         let status = run_codex_login_status(&normalized)?;
         if status.logged_in {
             return Ok(ConnectionTestResult {
                 success: true,
-                model_id: "codex_cli".to_string(),
-                message: "已检测到 ChatGPT 登录态，可直接在应用内对话。".to_string(),
+                model_id: normalized.provider.clone(),
+                message: "已检测到 Codex 登录态。".to_string(),
             });
         }
-        return Err("未检测到 ChatGPT 登录态，请先登录。".to_string());
+        return Err("未检测到 Codex 登录态，请先登录。".to_string());
     }
-    if normalized.provider == "manual" {
+    if is_manual_provider(&normalized.provider) {
         return Ok(ConnectionTestResult {
             success: true,
             model_id: "manual".to_string(),
@@ -398,7 +436,9 @@ fn session_create(state: State<'_, SharedState>) -> Result<ChatSession, String> 
             pending_approvals: Vec::new(),
         };
         store.sessions.push(session.clone());
+        ensure_active_task_for_session(store, &session.id, None);
         store.save_sessions()?;
+        store.save_tasks()?;
         Ok(session)
     })
 }
@@ -417,6 +457,19 @@ fn session_open(session_id: String, state: State<'_, SharedState>) -> Result<Cha
 }
 
 #[tauri::command]
+fn session_runtime_snapshot(
+    session_id: String,
+    state: State<'_, SharedState>,
+) -> Result<SessionRuntimeSnapshot, String> {
+    state.read(|store| {
+        if !store.sessions.iter().any(|session| session.id == session_id) {
+            return Err("session not found".to_string());
+        }
+        Ok(store.session_runtime_snapshot(&session_id))
+    })
+}
+
+#[tauri::command]
 fn session_delete(session_id: String, state: State<'_, SharedState>) -> Result<Vec<ChatSession>, String> {
     state.update(|store| {
         let previous_len = store.sessions.len();
@@ -425,8 +478,14 @@ fn session_delete(session_id: String, state: State<'_, SharedState>) -> Result<V
             return Err("session not found".to_string());
         }
         store.proposals.retain(|proposal| proposal.session_id != session_id);
+        store.tasks.retain(|task| task.session_id != session_id);
+        store.turns.retain(|turn| turn.session_id != session_id);
+        store.turn_items.retain(|item| item.session_id != session_id);
         store.save_sessions()?;
         store.save_proposals()?;
+        store.save_tasks()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(store.sorted_sessions())
     })
 }
@@ -505,6 +564,7 @@ fn workspace_remove(workspace_id: String, state: State<'_, SharedState>) -> Resu
                 session.interaction_mode = SessionInteractionMode::Conversation;
             }
         }
+        let mut rejected_proposals = Vec::new();
         for proposal in &mut store.proposals {
             let matches_workspace = match &proposal.payload {
                 ToolProposalPayload::Write {
@@ -523,11 +583,17 @@ fn workspace_remove(workspace_id: String, state: State<'_, SharedState>) -> Resu
             if matches_workspace && proposal.status == "pending" {
                 proposal.status = "rejected".to_string();
                 proposal.error = Some("workspace removed".to_string());
+                rejected_proposals.push(proposal.clone());
             }
+        }
+        for proposal in &rejected_proposals {
+            sync_turn_item_with_proposal(store, proposal)?;
         }
         store.save_workspaces()?;
         store.save_sessions()?;
         store.save_proposals()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(true)
     })
 }
@@ -615,17 +681,10 @@ async fn chat_send(
 ) -> Result<ChatSession, String> {
     let state_handle = state.inner().clone();
     let attachments = attachment_paths.unwrap_or_default();
+    let effective_turn_intent = turn_intent.clone().unwrap_or_default();
 
     let settings_snapshot = state_handle.read(|store| store.settings.clone());
-    let provider = settings_snapshot.provider.clone();
-    let effective_provider = if provider == "openai" {
-        match run_codex_login_status(&settings_snapshot) {
-            Ok(status) if status.logged_in => "codex_cli".to_string(),
-            _ => "openai".to_string(),
-        }
-    } else {
-        provider.clone()
-    };
+    let effective_provider = settings_snapshot.provider.clone();
 
     let (session, latest_user_message_id) = state_handle.update(|store| {
         if effective_provider == "openai" {
@@ -644,7 +703,7 @@ async fn chat_send(
             return Err("请先为当前会话挂载工作区，再进入工作区协作。".to_string());
         }
 
-        let archived_proposal_ids = store
+        let archived_proposals = store
             .proposals
             .iter_mut()
             .filter(|proposal| {
@@ -655,9 +714,16 @@ async fn chat_send(
                 proposal.status = "rejected".to_string();
                 proposal.error = None;
                 proposal.latest_output = Some("当前会话已开始新一轮协作。".to_string());
-                proposal.id.clone()
+                proposal.clone()
             })
             .collect::<Vec<_>>();
+        let archived_proposal_ids = archived_proposals
+            .iter()
+            .map(|proposal| proposal.id.clone())
+            .collect::<Vec<_>>();
+        for proposal in &archived_proposals {
+            sync_turn_item_with_proposal(store, proposal)?;
+        }
 
         let session = &mut store.sessions[session_index];
         if session.title == "新会话" && !input.trim().is_empty() {
@@ -700,13 +766,33 @@ async fn chat_send(
         let cloned = session.clone();
         if !archived_proposal_ids.is_empty() {
             store.save_proposals()?;
+            store.save_turns()?;
+            store.save_turn_items()?;
         }
         store.save_sessions()?;
         Ok((cloned, latest_user_message_id))
     })?;
 
-    if effective_provider == "manual" {
+    state_handle.update(|store| {
+        start_turn_for_session(
+            store,
+            &session_id,
+            &input,
+            effective_turn_intent.clone(),
+            &latest_user_message_id,
+        )?;
+        store.save_tasks()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
+        Ok(())
+    })?;
+
+    if is_manual_provider(&effective_provider) {
         return Ok(session);
+    }
+
+    if effective_provider == "openai-codex" {
+        return Err("`openai-codex` 直连 runtime 尚未接入；当前请继续使用 `ChatGPT 账号模式（Codex CLI）`。".to_string());
     }
 
     let app_handle = app.clone();
@@ -837,15 +923,7 @@ async fn proposal_choose(
 ) -> Result<ProposalChooseResult, String> {
     let state_handle = state.inner().clone();
     let settings_snapshot = state_handle.read(|store| store.settings.clone());
-    let provider = settings_snapshot.provider.clone();
-    let effective_provider = if provider == "openai" {
-        match run_codex_login_status(&settings_snapshot) {
-            Ok(status) if status.logged_in => "codex_cli".to_string(),
-            _ => "openai".to_string(),
-        }
-    } else {
-        provider.clone()
-    };
+    let effective_provider = settings_snapshot.provider.clone();
 
     let (session, proposal, latest_user_message_id, followup_input, followup_execution_mode) =
         state_handle.update(|store| {
@@ -921,8 +999,11 @@ async fn proposal_choose(
             };
             let cloned_session = session.clone();
             let cloned_proposal = proposal.clone();
+            sync_turn_item_with_proposal(store, &cloned_proposal)?;
             store.save_proposals()?;
             store.save_sessions()?;
+            store.save_turns()?;
+            store.save_turn_items()?;
             Ok((
                 cloned_session,
                 cloned_proposal,
@@ -938,7 +1019,25 @@ async fn proposal_choose(
 
     let _ = app.emit("approval-updated", &proposal);
 
-    if effective_provider != "manual" {
+    state_handle.update(|store| {
+        start_turn_for_session(
+            store,
+            &session.id,
+            &followup_input,
+            TurnIntent::Preview,
+            &latest_user_message_id,
+        )?;
+        store.save_tasks()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
+        Ok(())
+    })?;
+
+    if effective_provider == "openai-codex" {
+        return Err("`openai-codex` 直连 runtime 尚未接入；当前请继续使用 `ChatGPT 账号模式（Codex CLI）`。".to_string());
+    }
+
+    if !is_manual_provider(&effective_provider) {
         let app_handle = app.clone();
         let session_id = session.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1044,9 +1143,12 @@ fn approval_accept(
                     session.updated_at = now_millis();
                 }
                 let cloned = proposal.clone();
+                sync_turn_item_with_proposal(store, &cloned)?;
                 store.save_workspaces()?;
                 store.save_proposals()?;
                 store.save_sessions()?;
+                store.save_turns()?;
+                store.save_turn_items()?;
                 Ok(cloned)
             })?;
             let _ = app.emit("approval-updated", &applied);
@@ -1083,8 +1185,11 @@ fn approval_accept(
                     session.updated_at = now_millis();
                 }
                 let cloned = proposal.clone();
+                sync_turn_item_with_proposal(store, &cloned)?;
                 store.save_proposals()?;
                 store.save_sessions()?;
+                store.save_turns()?;
+                store.save_turn_items()?;
                 Ok(cloned)
             })?;
             let _ = app.emit("approval-updated", &approved);
@@ -1136,8 +1241,11 @@ fn approval_accept(
                     session.updated_at = now_millis();
                 }
                 let cloned = proposal.clone();
+                sync_turn_item_with_proposal(store, &cloned)?;
                 store.save_proposals()?;
                 store.save_sessions()?;
+                store.save_turns()?;
+                store.save_turn_items()?;
                 Ok(cloned)
             })?;
             let _ = app.emit("approval-updated", &accepted);
@@ -1177,8 +1285,11 @@ fn approval_reject(
             session.updated_at = now_millis();
         }
         let cloned = proposal.clone();
+        sync_turn_item_with_proposal(store, &cloned)?;
         store.save_proposals()?;
         store.save_sessions()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(cloned)
     })?;
     let _ = app.emit("approval-updated", &proposal);
@@ -2887,6 +2998,7 @@ async fn create_write_proposal(
             error: None,
         };
         store.proposals.push(proposal.clone());
+        attach_proposal_item_to_current_turn(store, &proposal)?;
         if let Some(session) = store
             .sessions
             .iter_mut()
@@ -2897,6 +3009,8 @@ async fn create_write_proposal(
         }
         store.save_proposals()?;
         store.save_sessions()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(proposal)
     })?;
     app.emit("tool-proposal-created", &proposal)
@@ -2944,6 +3058,7 @@ async fn create_command_proposal(
             error: None,
         };
         store.proposals.push(proposal.clone());
+        attach_proposal_item_to_current_turn(store, &proposal)?;
         if let Some(session) = store
             .sessions
             .iter_mut()
@@ -2954,6 +3069,8 @@ async fn create_command_proposal(
         }
         store.save_proposals()?;
         store.save_sessions()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(proposal)
     })?;
     app.emit("tool-proposal-created", &proposal)
@@ -3110,8 +3227,11 @@ async fn run_command_proposal(
             session.updated_at = now_millis();
         }
         let cloned = proposal.clone();
+        sync_turn_item_with_proposal(store, &cloned)?;
         store.save_proposals()?;
         store.save_sessions()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(cloned)
     })?;
 
@@ -3143,7 +3263,10 @@ fn mark_proposal_failed(
         proposal.error = Some(error.to_string());
         proposal.latest_output = Some(error.to_string());
         let cloned = proposal.clone();
+        sync_turn_item_with_proposal(store, &cloned)?;
         store.save_proposals()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(cloned)
     })
 }
@@ -3156,24 +3279,392 @@ fn persist_assistant_message(
     status: &str,
 ) -> Result<String, String> {
     state.update(|store| {
-        let session = store
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-            .ok_or_else(|| "session not found".to_string())?;
-        session.messages.push(ChatMessage {
-            id: message_id.to_string(),
-            role: "assistant".to_string(),
-            content: content.to_string(),
-            timestamp: now_millis(),
-            status: status.to_string(),
-            attachments: Vec::new(),
-        });
-        session.updated_at = now_millis();
-        let title = session.title.clone();
+        let title = {
+            let session = store
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| "session not found".to_string())?;
+            session.messages.push(ChatMessage {
+                id: message_id.to_string(),
+                role: "assistant".to_string(),
+                content: content.to_string(),
+                timestamp: now_millis(),
+                status: status.to_string(),
+                attachments: Vec::new(),
+            });
+            session.updated_at = now_millis();
+            session.title.clone()
+        };
+        attach_assistant_message_to_current_turn(store, session_id, message_id, content, status)?;
         store.save_sessions()?;
+        store.save_tasks()?;
+        store.save_turns()?;
+        store.save_turn_items()?;
         Ok(title)
     })
+}
+
+fn ensure_active_task_for_session(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+    seed_text: Option<&str>,
+) -> String {
+    let latest_task_index = store
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| {
+            task.session_id == session_id
+                && matches!(
+                    task.status,
+                    TaskStatus::Active | TaskStatus::Blocked | TaskStatus::WaitingUser
+                )
+        })
+        .max_by(|(_, left), (_, right)| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|(index, _)| index);
+
+    if let Some(index) = latest_task_index {
+        let task = &mut store.tasks[index];
+        task.updated_at = now_millis();
+        if task.title.trim().is_empty() {
+            task.title = derive_session_title(seed_text.unwrap_or("当前任务"));
+        }
+        return task.id.clone();
+    }
+
+    let timestamp = now_millis();
+    let title = seed_text
+        .map(derive_session_title)
+        .filter(|value| !value.trim().is_empty() && value != "新会话")
+        .unwrap_or_else(|| "当前任务".to_string());
+    let task = TaskRecord {
+        id: make_id("task"),
+        session_id: session_id.to_string(),
+        title,
+        summary: seed_text.map(|value| summarize_status_text(value, 84)),
+        created_at: timestamp,
+        updated_at: timestamp,
+        status: TaskStatus::Active,
+        current_turn_id: None,
+        latest_turn_id: None,
+    };
+    let task_id = task.id.clone();
+    store.tasks.push(task);
+    task_id
+}
+
+fn current_turn_index_for_session(
+    store: &crate::storage::Store,
+    session_id: &str,
+) -> Option<usize> {
+    store
+        .turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| {
+            turn.session_id == session_id
+                && matches!(turn.status, TurnStatus::Pending | TurnStatus::Running)
+        })
+        .max_by(|(_, left), (_, right)| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|(index, _)| index)
+}
+
+fn proposal_turn_item_state(proposal: &ToolProposal) -> (TurnItemStatus, ItemApprovalState) {
+    match proposal.status.as_str() {
+        "pending" => (TurnItemStatus::Pending, ItemApprovalState::Pending),
+        "selected" => (TurnItemStatus::Completed, ItemApprovalState::Accepted),
+        "approved" => (TurnItemStatus::Running, ItemApprovalState::Accepted),
+        "applied" | "executed" => (TurnItemStatus::Completed, ItemApprovalState::Applied),
+        "rejected" => (TurnItemStatus::Cancelled, ItemApprovalState::Rejected),
+        "failed" => (TurnItemStatus::Failed, ItemApprovalState::Failed),
+        _ => (TurnItemStatus::Pending, ItemApprovalState::Pending),
+    }
+}
+
+fn sync_turn_item_with_proposal(
+    store: &mut crate::storage::Store,
+    proposal: &ToolProposal,
+) -> Result<(), String> {
+    let timestamp = now_millis();
+    let (item_status, approval_state) = proposal_turn_item_state(proposal);
+
+    let matching_item_ids = store
+        .turn_items
+        .iter()
+        .filter(|item| item.source_proposal_id.as_deref() == Some(proposal.id.as_str()))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+
+    for item in &mut store.turn_items {
+        if item.source_proposal_id.as_deref() != Some(proposal.id.as_str()) {
+            continue;
+        }
+        item.updated_at = timestamp;
+        item.status = item_status.clone();
+        item.approval_state = approval_state.clone();
+        item.summary = proposal
+            .latest_output
+            .clone()
+            .or_else(|| proposal.error.clone())
+            .or_else(|| item.summary.clone());
+        if matches!(item.kind, TurnItemKind::CommandPreview) {
+            item.content = proposal
+                .latest_output
+                .clone()
+                .or_else(|| item.content.clone());
+        }
+    }
+
+    for turn in &mut store.turns {
+        if turn
+            .item_ids
+            .iter()
+            .any(|item_id| matching_item_ids.iter().any(|target| target == item_id))
+        {
+            turn.updated_at = timestamp;
+        }
+    }
+
+    Ok(())
+}
+
+fn append_turn_item(
+    store: &mut crate::storage::Store,
+    turn_id: &str,
+    kind: TurnItemKind,
+    status: TurnItemStatus,
+    approval_state: ItemApprovalState,
+    title: &str,
+    summary: Option<String>,
+    source_message_id: Option<String>,
+    source_proposal_id: Option<String>,
+    content: Option<String>,
+    metadata: serde_json::Value,
+) -> Result<String, String> {
+    let turn_index = store
+        .turns
+        .iter()
+        .position(|turn| turn.id == turn_id)
+        .ok_or_else(|| "turn not found".to_string())?;
+    let timestamp = now_millis();
+    let session_id = store.turns[turn_index].session_id.clone();
+    let task_id = store.turns[turn_index].task_id.clone();
+
+    let item = TurnItem {
+        id: make_id("item"),
+        session_id,
+        task_id: task_id.clone(),
+        turn_id: turn_id.to_string(),
+        created_at: timestamp,
+        updated_at: timestamp,
+        kind,
+        status,
+        approval_state,
+        title: title.to_string(),
+        summary,
+        source_message_id,
+        source_proposal_id,
+        content,
+        metadata,
+    };
+    let item_id = item.id.clone();
+    store.turn_items.push(item);
+    store.turns[turn_index].item_ids.push(item_id.clone());
+    store.turns[turn_index].updated_at = timestamp;
+
+    if let Some(task_id) = task_id {
+        if let Some(task) = store.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.updated_at = timestamp;
+        }
+    }
+
+    Ok(item_id)
+}
+
+fn start_turn_for_session(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+    input: &str,
+    intent: TurnIntent,
+    user_message_id: &str,
+) -> Result<String, String> {
+    let task_id = ensure_active_task_for_session(store, session_id, Some(input));
+    let timestamp = now_millis();
+    let turn = TurnRecord {
+        id: make_id("turn"),
+        session_id: session_id.to_string(),
+        task_id: Some(task_id.clone()),
+        created_at: timestamp,
+        updated_at: timestamp,
+        status: TurnStatus::Running,
+        intent,
+        user_message_id: Some(user_message_id.to_string()),
+        assistant_message_id: None,
+        summary: Some(summarize_status_text(input, 120)),
+        item_ids: Vec::new(),
+    };
+    let turn_id = turn.id.clone();
+    store.turns.push(turn);
+
+    if let Some(task) = store.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.status = TaskStatus::Active;
+        task.current_turn_id = Some(turn_id.clone());
+        task.latest_turn_id = Some(turn_id.clone());
+        task.updated_at = timestamp;
+    }
+
+    append_turn_item(
+        store,
+        &turn_id,
+        TurnItemKind::UserMessage,
+        TurnItemStatus::Completed,
+        ItemApprovalState::NotRequired,
+        "用户消息",
+        Some(summarize_status_text(input, 84)),
+        Some(user_message_id.to_string()),
+        None,
+        Some(input.to_string()),
+        serde_json::json!({ "role": "user" }),
+    )?;
+
+    Ok(turn_id)
+}
+
+fn attach_assistant_message_to_current_turn(
+    store: &mut crate::storage::Store,
+    session_id: &str,
+    message_id: &str,
+    content: &str,
+    status: &str,
+) -> Result<(), String> {
+    let Some(turn_index) = current_turn_index_for_session(store, session_id) else {
+        return Ok(());
+    };
+
+    let turn_id = store.turns[turn_index].id.clone();
+    let timestamp = now_millis();
+    let next_status = if status == "error" {
+        TurnStatus::Failed
+    } else {
+        TurnStatus::Completed
+    };
+    let task_id = store.turns[turn_index].task_id.clone();
+    store.turns[turn_index].assistant_message_id = Some(message_id.to_string());
+    store.turns[turn_index].updated_at = timestamp;
+    store.turns[turn_index].status = next_status;
+
+    append_turn_item(
+        store,
+        &turn_id,
+        TurnItemKind::AgentMessage,
+        if status == "error" {
+            TurnItemStatus::Failed
+        } else {
+            TurnItemStatus::Completed
+        },
+        ItemApprovalState::NotRequired,
+        "助手回复",
+        Some(summarize_status_text(content, 84)),
+        Some(message_id.to_string()),
+        None,
+        Some(content.to_string()),
+        serde_json::json!({ "role": "assistant", "messageStatus": status }),
+    )?;
+
+    if let Some(task_id) = task_id {
+        if let Some(task) = store.tasks.iter_mut().find(|task| task.id == task_id) {
+            if task.current_turn_id.as_deref() == Some(turn_id.as_str()) {
+                task.current_turn_id = None;
+            }
+            task.status = if status == "error" {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::WaitingUser
+            };
+            task.latest_turn_id = Some(turn_id);
+            task.updated_at = timestamp;
+        }
+    }
+
+    Ok(())
+}
+
+fn attach_proposal_item_to_current_turn(
+    store: &mut crate::storage::Store,
+    proposal: &ToolProposal,
+) -> Result<(), String> {
+    let Some(turn_index) = current_turn_index_for_session(store, &proposal.session_id) else {
+        return Ok(());
+    };
+    let turn_id = store.turns[turn_index].id.clone();
+
+    let (kind, title, summary, metadata) = match &proposal.payload {
+        ToolProposalPayload::Write {
+            relative_path,
+            diff_text,
+            ..
+        } => (
+            TurnItemKind::FileChangePreview,
+            proposal.title.clone(),
+            Some(proposal.summary.clone()),
+            serde_json::json!({
+                "proposalKind": proposal.kind,
+                "relativePath": relative_path,
+                "diffText": diff_text,
+            }),
+        ),
+        ToolProposalPayload::Command {
+            cwd,
+            display_command,
+            ..
+        } => (
+            TurnItemKind::CommandPreview,
+            proposal.title.clone(),
+            Some(proposal.summary.clone()),
+            serde_json::json!({
+                "proposalKind": proposal.kind,
+                "cwd": cwd,
+                "displayCommand": display_command,
+            }),
+        ),
+        ToolProposalPayload::Choice {
+            option_key, detail, ..
+        } => (
+            TurnItemKind::Choice,
+            proposal.title.clone(),
+            Some(proposal.summary.clone()),
+            serde_json::json!({
+                "proposalKind": proposal.kind,
+                "optionKey": option_key,
+                "detail": detail,
+            }),
+        ),
+    };
+
+    append_turn_item(
+        store,
+        &turn_id,
+        kind,
+        TurnItemStatus::Pending,
+        ItemApprovalState::Pending,
+        &title,
+        summary,
+        None,
+        Some(proposal.id.clone()),
+        None,
+        metadata,
+    )?;
+
+    Ok(())
 }
 
 async fn emit_streamed_reply(
@@ -3306,6 +3797,7 @@ fn create_conversation_choice_proposals(
             error: None,
         };
         store.proposals.push(proposal.clone());
+        attach_proposal_item_to_current_turn(store, &proposal)?;
         created.push(proposal);
     }
 
@@ -3720,6 +4212,7 @@ fn create_manual_proposal(
                 error: None,
             };
             store.proposals.push(proposal.clone());
+            attach_proposal_item_to_current_turn(store, &proposal)?;
             Ok(proposal)
         }
         ManualReplyBlock::Command {
@@ -3759,6 +4252,7 @@ fn create_manual_proposal(
                 error: None,
             };
             store.proposals.push(proposal.clone());
+            attach_proposal_item_to_current_turn(store, &proposal)?;
             Ok(proposal)
         }
         ManualReplyBlock::Choice {
@@ -3787,47 +4281,14 @@ fn create_manual_proposal(
                 error: None,
             };
             store.proposals.push(proposal.clone());
+            attach_proposal_item_to_current_turn(store, &proposal)?;
             Ok(proposal)
         }
     }
 }
 
-fn read_codex_auth_snapshot() -> Option<(bool, String, String)> {
-    let home = std::env::var("HOME").ok()?;
-    let auth_path = Path::new(&home).join(".codex").join("auth.json");
-    let content = fs::read_to_string(auth_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    let auth_mode = value
-        .get("auth_mode")
-        .and_then(|entry| entry.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let access_token = value
-        .get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(|token| token.as_str())
-        .unwrap_or("");
-
-    if access_token.is_empty() {
-        return Some((false, auth_mode, "Codex 未登录。".to_string()));
-    }
-
-    let method = if auth_mode.is_empty() {
-        "chatgpt".to_string()
-    } else {
-        auth_mode
-    };
-    Some((
-        true,
-        method.clone(),
-        format!("已检测到 Codex 本地会话：{method}"),
-    ))
-}
-
 fn normalize_settings(mut settings: Settings) -> Settings {
-    settings.provider = settings.provider.trim().to_string();
+    settings.provider = normalize_provider(&settings.provider);
     settings.base_url = settings.base_url.trim().trim_end_matches('/').to_string();
     settings.api_key = settings.api_key.trim().to_string();
     settings.model_id = settings.model_id.trim().to_string();
@@ -3837,6 +4298,30 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     settings.codex_all_proxy = settings.codex_all_proxy.trim().to_string();
     settings.codex_no_proxy = settings.codex_no_proxy.trim().to_string();
     settings
+}
+
+fn spawn_codex_login_output_forwarder<R>(app: tauri::AppHandle, reader: R)
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            let detail = line.trim();
+            if detail.is_empty() {
+                continue;
+            }
+            let _ = app.emit(
+                "codex-login-progress",
+                CodexLoginProgressEvent {
+                    detail: detail.to_string(),
+                    terminal: false,
+                },
+            );
+        }
+    });
 }
 
 fn validate_model_settings(settings: &Settings) -> Result<(), String> {

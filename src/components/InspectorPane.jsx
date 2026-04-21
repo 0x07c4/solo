@@ -64,6 +64,22 @@ export function InspectorPane({
   onRejectProposal,
   onOpenSettings,
 }) {
+  const modelLabel =
+    settings.provider === "manual"
+      ? "手动协作模式"
+      : settings.provider === "codex_cli"
+        ? "ChatGPT 账号模式（Codex CLI）"
+        : settings.provider === "openai-codex"
+          ? "OpenAI Codex 账号模式"
+          : settings.modelId || "未配置模型";
+  const modelDescription =
+    settings.provider === "manual"
+      ? "问题先记录在本地，会话回复由你从 ChatGPT / Codex 手动导入。"
+      : settings.provider === "codex_cli"
+        ? "直接复用本机 Codex 登录态，由 Codex CLI 执行当前对话。"
+        : settings.provider === "openai-codex"
+          ? "复用本机 Codex 登录态，但后续应走 Solo 自己的直连 runtime。"
+          : settings.baseUrl || "未配置 Base URL";
   return (
     <aside className="inspector">
       <div className="section-header">
@@ -99,20 +115,8 @@ export function InspectorPane({
 
           <div className="info-card">
             <span className="section-eyebrow">Model</span>
-            <strong>
-              {settings.provider === "manual"
-                ? "手动协作模式"
-                : settings.provider === "codex_cli"
-                  ? "ChatGPT 账号模式"
-                  : settings.modelId || "未配置模型"}
-            </strong>
-            <p>
-              {settings.provider === "manual"
-                ? "问题先记录在本地，会话回复由你从 ChatGPT / Codex 手动导入。"
-                : settings.provider === "codex_cli"
-                  ? "直接复用本机 Codex 登录态，不需要 API Key。"
-                  : settings.baseUrl || "未配置 Base URL"}
-            </p>
+            <strong>{modelLabel}</strong>
+            <p>{modelDescription}</p>
           </div>
 
           <div className="info-card">

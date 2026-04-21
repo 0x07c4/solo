@@ -113,6 +113,10 @@ function normalizeTurnIntent(intent) {
   return TURN_INTENT_AUTO;
 }
 
+function providerUsesCodexLogin(provider) {
+  return provider === "codex_cli" || provider === "openai-codex";
+}
+
 function turnIntentLabel(intent) {
   const normalized = normalizeTurnIntent(intent);
   if (normalized === TURN_INTENT_CHOICE) {
@@ -185,13 +189,13 @@ function normalizeLoginStatus(status) {
     const method = status.method?.trim();
     return {
       ...status,
-      message: method ? `已登录 ChatGPT（${method}）。` : "已登录 ChatGPT。",
+      message: method ? `已检测到 Codex 登录（${method}）。` : "已检测到 Codex 登录。",
     };
   }
 
   return {
     ...status,
-    message: "未登录 ChatGPT。点击下方按钮继续登录。",
+    message: "尚未检测到 Codex 登录。点击下方按钮继续登录。",
   };
 }
 
@@ -315,6 +319,172 @@ function proposalStatusTone(status) {
     return "loading";
   }
   return "idle";
+}
+
+function normalizeRuntimeSnapshot(snapshot, sessionId = "") {
+  if (!snapshot || typeof snapshot !== "object") {
+    return {
+      sessionId,
+      tasks: [],
+      turns: [],
+      turnItems: [],
+    };
+  }
+  return {
+    sessionId:
+      typeof snapshot.sessionId === "string" && snapshot.sessionId.trim()
+        ? snapshot.sessionId
+        : sessionId,
+    tasks: Array.isArray(snapshot.tasks) ? snapshot.tasks : [],
+    turns: Array.isArray(snapshot.turns) ? snapshot.turns : [],
+    turnItems: Array.isArray(snapshot.turnItems) ? snapshot.turnItems : [],
+  };
+}
+
+function taskStatusLabel(status) {
+  if (status === "active") {
+    return "进行中";
+  }
+  if (status === "waitingUser") {
+    return "等待你确认";
+  }
+  if (status === "blocked") {
+    return "受阻";
+  }
+  if (status === "completed") {
+    return "已完成";
+  }
+  if (status === "failed") {
+    return "失败";
+  }
+  if (status === "cancelled") {
+    return "已取消";
+  }
+  return status || "未知";
+}
+
+function turnStatusLabel(status) {
+  if (status === "running") {
+    return "执行中";
+  }
+  if (status === "pending") {
+    return "排队中";
+  }
+  if (status === "completed") {
+    return "已完成";
+  }
+  if (status === "failed") {
+    return "失败";
+  }
+  if (status === "cancelled") {
+    return "已取消";
+  }
+  return status || "未知";
+}
+
+function turnItemKindLabel(kind) {
+  if (kind === "userMessage") {
+    return "用户消息";
+  }
+  if (kind === "agentMessage") {
+    return "助手回复";
+  }
+  if (kind === "plan") {
+    return "计划";
+  }
+  if (kind === "statusUpdate") {
+    return "状态";
+  }
+  if (kind === "choice") {
+    return "方向";
+  }
+  if (kind === "conceptPreview") {
+    return "概念预览";
+  }
+  if (kind === "fileChangePreview") {
+    return "改动预览";
+  }
+  if (kind === "commandPreview") {
+    return "命令预览";
+  }
+  if (kind === "approvalRequest") {
+    return "确认请求";
+  }
+  if (kind === "commandOutput") {
+    return "命令输出";
+  }
+  if (kind === "commandResult") {
+    return "命令结果";
+  }
+  return kind || "项目";
+}
+
+function approvalStateLabel(state) {
+  if (state === "pending") {
+    return "待确认";
+  }
+  if (state === "accepted") {
+    return "已接受";
+  }
+  if (state === "rejected") {
+    return "已拒绝";
+  }
+  if (state === "applied") {
+    return "已应用";
+  }
+  if (state === "failed") {
+    return "失败";
+  }
+  return "";
+}
+
+function runtimeTone(status, approvalState = "notRequired") {
+  if (approvalState === "failed" || approvalState === "rejected") {
+    return "error";
+  }
+  if (approvalState === "applied" || approvalState === "accepted") {
+    return "ready";
+  }
+  if (approvalState === "pending") {
+    return "loading";
+  }
+  if (status === "failed" || status === "cancelled") {
+    return "error";
+  }
+  if (status === "completed") {
+    return "ready";
+  }
+  if (status === "running" || status === "pending") {
+    return "loading";
+  }
+  if (status === "active") {
+    return "active";
+  }
+  if (status === "waitingUser") {
+    return "ready";
+  }
+  return "idle";
+}
+
+function runtimeItemStateLabel(item) {
+  const approvalLabel = approvalStateLabel(item?.approvalState);
+  if (approvalLabel) {
+    return approvalLabel;
+  }
+  return turnStatusLabel(item?.status);
+}
+
+function formatRuntimeTime(timestamp) {
+  if (!timestamp) {
+    return "刚刚";
+  }
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function proposalPrimaryActionLabel(proposal) {
@@ -895,6 +1065,14 @@ function WindowControlIcon({ kind, maximized = false }) {
   );
 }
 
+function PaperclipIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M6 4.25v6.25a2.5 2.5 0 1 0 5 0V5.25a3.75 3.75 0 1 0-7.5 0v6.5a5 5 0 1 0 10 0V6.5" />
+    </svg>
+  );
+}
+
 function MessageBubble({ message, progress = [] }) {
   const status = messageStatusLabel(message.status);
   const roleLabel = message.role === "user" ? "你" : "ChatGPT";
@@ -1228,6 +1406,7 @@ export default function App() {
     message: "正在检测登录状态…",
   });
   const [codexChecking, setCodexChecking] = useState(false);
+  const [codexLoginDetail, setCodexLoginDetail] = useState("");
   const [chatSending, setChatSending] = useState(false);
   const [pendingSeconds, setPendingSeconds] = useState(0);
   const [streamProgressBySession, setStreamProgressBySession] = useState({});
@@ -1256,6 +1435,8 @@ export default function App() {
   const [proposalActionId, setProposalActionId] = useState("");
   const [decisionPreviewBySession, setDecisionPreviewBySession] = useState({});
   const [turnIntentBySession, setTurnIntentBySession] = useState({});
+  const [runtimeSnapshotBySession, setRuntimeSnapshotBySession] = useState({});
+  const [runtimePanelState, setRuntimePanelState] = useState({ loading: false, error: "" });
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -1303,11 +1484,42 @@ export default function App() {
   const showPreviewCards =
     previewProposals.length > 0 && (!showDecisionDeck || Boolean(selectedDecisionOption));
   const rejectingAllDecisions = proposalActionId === REJECT_ALL_DECISIONS_ACTION_ID;
+  const activeRuntimeSnapshot = useMemo(
+    () => normalizeRuntimeSnapshot(runtimeSnapshotBySession[activeSessionId], activeSessionId),
+    [runtimeSnapshotBySession, activeSessionId]
+  );
+  const activeRuntimeTask = useMemo(() => {
+    const tasks = activeRuntimeSnapshot.tasks ?? [];
+    return tasks[0] ?? null;
+  }, [activeRuntimeSnapshot]);
+  const activeRuntimeTurn = useMemo(() => {
+    const turns = activeRuntimeSnapshot.turns ?? [];
+    if (!turns.length) {
+      return null;
+    }
+    const preferredTurnId =
+      activeRuntimeTask?.currentTurnId ?? activeRuntimeTask?.latestTurnId ?? "";
+    if (!preferredTurnId) {
+      return turns[0] ?? null;
+    }
+    return turns.find((turn) => turn.id === preferredTurnId) ?? turns[0] ?? null;
+  }, [activeRuntimeSnapshot, activeRuntimeTask]);
+  const activeRuntimeItems = useMemo(() => {
+    if (!activeRuntimeTurn?.id) {
+      return [];
+    }
+    return (activeRuntimeSnapshot.turnItems ?? []).filter(
+      (item) => item.turnId === activeRuntimeTurn.id
+    );
+  }, [activeRuntimeSnapshot, activeRuntimeTurn]);
 
   const fetchCodexStatus = async ({ showNotice = false } = {}) => {
     const status = normalizeLoginStatus(await desktop.codexLoginStatus());
     if (mountedRef.current) {
       setCodexAuth(status);
+      if (status.loggedIn) {
+        setCodexLoginDetail("");
+      }
     }
     if (showNotice) {
       setNotice({
@@ -1345,6 +1557,41 @@ export default function App() {
     } catch (error) {
       if (mountedRef.current && !silent) {
         setProposalPanelState({ loading: false, error: normalizeError(error) });
+      }
+      throw error;
+    }
+  };
+
+  const loadSessionRuntimeSnapshot = async (sessionId, { silent = false } = {}) => {
+    if (!sessionId) {
+      if (!silent) {
+        setRuntimePanelState({ loading: false, error: "" });
+      }
+      return normalizeRuntimeSnapshot(null, "");
+    }
+
+    if (!silent) {
+      setRuntimePanelState({ loading: true, error: "" });
+    }
+
+    try {
+      const snapshot = normalizeRuntimeSnapshot(
+        await desktop.sessionRuntimeSnapshot(sessionId),
+        sessionId
+      );
+      if (mountedRef.current) {
+        setRuntimeSnapshotBySession((current) => ({
+          ...current,
+          [sessionId]: snapshot,
+        }));
+        if (!silent) {
+          setRuntimePanelState({ loading: false, error: "" });
+        }
+      }
+      return snapshot;
+    } catch (error) {
+      if (mountedRef.current && !silent) {
+        setRuntimePanelState({ loading: false, error: normalizeError(error) });
       }
       throw error;
     }
@@ -1428,18 +1675,7 @@ export default function App() {
           nextSessions = [createdSession];
         }
 
-        let normalizedSettings = normalizeSettings(loadedSettings);
-        const settingsPatch = {};
-        if (normalizedSettings.provider !== "codex_cli") {
-          settingsPatch.provider = "codex_cli";
-        }
-        if (Object.keys(settingsPatch).length > 0) {
-          try {
-            normalizedSettings = normalizeSettings(await desktop.settingsUpdate(settingsPatch));
-          } catch {
-            // Non-fatal: UI can continue with local fallback state.
-          }
-        }
+        const normalizedSettings = normalizeSettings(loadedSettings);
 
         if (cancelled) {
           return;
@@ -1526,6 +1762,27 @@ export default function App() {
   }, [activeSessionId]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    if (!activeSessionId) {
+      setRuntimePanelState({ loading: false, error: "" });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void loadSessionRuntimeSnapshot(activeSessionId).catch((error) => {
+      if (!cancelled) {
+        setNotice({ kind: "error", text: `Runtime 快照加载失败：${normalizeError(error)}` });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId]);
+
+  useEffect(() => {
     if (!activeSessionId) {
       return;
     }
@@ -1549,6 +1806,7 @@ export default function App() {
     let unlistenApprovalUpdated = null;
     let unlistenCommandOutput = null;
     let unlistenCommandFinished = null;
+    let unlistenCodexLoginProgress = null;
 
     const patchSession = (sessionId, updater) => {
       setSessions((current) =>
@@ -1711,6 +1969,7 @@ export default function App() {
           setNotice({ kind: "error", text: payload.content || "请求失败。" });
         }
         setProposalPanelState((current) => ({ ...current, loading: false, error: "" }));
+        void loadSessionRuntimeSnapshot(payload.sessionId, { silent: true }).catch(() => {});
         setStreamProgressBySession((current) => {
           if (!current[payload.sessionId]) {
             return current;
@@ -1735,6 +1994,7 @@ export default function App() {
           return;
         }
         setProposalPanelState((current) => ({ ...current, loading: false, error: "" }));
+        void loadSessionRuntimeSnapshot(payload.sessionId, { silent: true }).catch(() => {});
         setProposalsBySession((current) => ({
           ...current,
           [payload.sessionId]: upsertProposal(current[payload.sessionId] ?? [], payload),
@@ -1747,6 +2007,7 @@ export default function App() {
           return;
         }
         setProposalPanelState((current) => ({ ...current, loading: false, error: "" }));
+        void loadSessionRuntimeSnapshot(payload.sessionId, { silent: true }).catch(() => {});
         setProposalsBySession((current) => ({
           ...current,
           [payload.sessionId]: upsertProposal(current[payload.sessionId] ?? [], payload),
@@ -1780,6 +2041,18 @@ export default function App() {
           }))
         );
       });
+
+      unlistenCodexLoginProgress = await desktop.listen("codex-login-progress", (event) => {
+        const payload = event.payload;
+        const detail = typeof payload?.detail === "string" ? payload.detail.trim() : "";
+        if (!detail) {
+          return;
+        }
+        setCodexLoginDetail(detail);
+        if (payload?.terminal) {
+          setNotice({ kind: "info", text: detail });
+        }
+      });
     };
 
     void register();
@@ -1805,6 +2078,9 @@ export default function App() {
       }
       if (typeof unlistenCommandFinished === "function") {
         unlistenCommandFinished();
+      }
+      if (typeof unlistenCodexLoginProgress === "function") {
+        unlistenCodexLoginProgress();
       }
     };
   }, []);
@@ -1948,6 +2224,7 @@ export default function App() {
   const handleCodexLogin = async () => {
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     setCodexChecking(true);
+    setCodexLoginDetail("");
     try {
       await desktop.codexLoginStart();
       setNotice({
@@ -1963,7 +2240,7 @@ export default function App() {
         if (status.loggedIn) {
           setNotice({
             kind: "success",
-            text: "登录状态已更新：已登录 ChatGPT。",
+            text: "登录状态已更新：已检测到 Codex 登录。",
           });
           return;
         }
@@ -1998,6 +2275,7 @@ export default function App() {
         session = await desktop.workspaceSelect(session.id, activeWorkspaceId);
       }
       setSessions((current) => upsertSession(current, session));
+      void loadSessionRuntimeSnapshot(session.id, { silent: true }).catch(() => {});
       setActiveSessionId(session.id);
       setDraft("");
       setNotice({ kind: "success", text: "已创建新会话。" });
@@ -2077,6 +2355,14 @@ export default function App() {
         delete next[sessionId];
         return next;
       });
+      setRuntimeSnapshotBySession((current) => {
+        if (!current[sessionId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
 
       setNotice({ kind: "info", text: `已删除会话：${targetSession.title}` });
     } catch (error) {
@@ -2098,7 +2384,7 @@ export default function App() {
     ) {
       setNotice({
         kind: "info",
-        text: "先为当前会话挂载工作区，再进入工作区协作。",
+        text: "需要代码上下文时，先为当前会话选择一个目录。",
       });
       return;
     }
@@ -2129,7 +2415,7 @@ export default function App() {
       return;
     }
     const input = draft.trim();
-    if (!input || chatSending || hasStreamingAssistant || codexChecking || !codexAuth.loggedIn) {
+    if (!input || chatSending || hasStreamingAssistant || loginBlocked) {
       return;
     }
 
@@ -2188,6 +2474,7 @@ export default function App() {
         activeTurnIntent
       );
       setSessions((current) => upsertSession(current, updatedSession));
+      void loadSessionRuntimeSnapshot(activeSessionId, { silent: true }).catch(() => {});
     } catch (error) {
       setChatSending(false);
       setDraft(input);
@@ -2213,7 +2500,7 @@ export default function App() {
     setWorkspaceModalOpen(false);
     setNotice({
       kind: "success",
-      text: `已添加工作区：${workspace.name}。需要代码上下文时可切到工作区协作。`,
+      text: `已添加目录：${workspace.name}。Solo 只有在工作区协作时才会读取它。`,
     });
   };
 
@@ -2229,6 +2516,9 @@ export default function App() {
       resetPreview();
       const reloadedSessions = await desktop.sessionsList();
       setSessions(sortSessions(reloadedSessions));
+      if (activeSessionId) {
+        void loadSessionRuntimeSnapshot(activeSessionId, { silent: true }).catch(() => {});
+      }
       setNotice({ kind: "info", text: "工作区已移除。" });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
@@ -2247,7 +2537,7 @@ export default function App() {
       setSessions((current) => upsertSession(current, updated));
       setNotice({
         kind: "info",
-        text: "工作区已挂载到当前会话。是否使用它，由你切换模式决定。",
+        text: "已为当前会话选择代码上下文。是否使用它，由你切换模式决定。",
       });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
@@ -2268,7 +2558,7 @@ export default function App() {
       setActiveWorkspaceId("");
       setExplorerOpen(false);
       resetPreview();
-      setNotice({ kind: "info", text: "已解除工作区挂载，当前会话回到对话模式。" });
+      setNotice({ kind: "info", text: "已清除当前代码上下文，会话继续保持对话模式。" });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
     }
@@ -2330,6 +2620,7 @@ export default function App() {
       });
       const result = await desktop.proposalChoose(option.id);
       setSessions((current) => upsertSession(current, result.session));
+      void loadSessionRuntimeSnapshot(result.session.id, { silent: true }).catch(() => {});
       setProposalsBySession((current) => {
         const previous = current[result.proposal.sessionId] ?? [];
         const nextProposals = previous.map((entry) => {
@@ -2368,6 +2659,7 @@ export default function App() {
     setProposalActionId(card.id);
     try {
       const updated = await desktop.approvalAccept(card.id);
+      void loadSessionRuntimeSnapshot(updated.sessionId, { silent: true }).catch(() => {});
       setProposalsBySession((current) => ({
         ...current,
         [updated.sessionId]: upsertProposal(current[updated.sessionId] ?? [], updated),
@@ -2398,6 +2690,7 @@ export default function App() {
     setProposalActionId(card.id);
     try {
       const updated = await desktop.approvalReject(card.id);
+      void loadSessionRuntimeSnapshot(updated.sessionId, { silent: true }).catch(() => {});
       setProposalsBySession((current) => ({
         ...current,
         [updated.sessionId]: upsertProposal(current[updated.sessionId] ?? [], updated),
@@ -2420,6 +2713,9 @@ export default function App() {
       const updatedProposals = [];
       for (const option of decisionSet.pendingOptions) {
         updatedProposals.push(await desktop.approvalReject(option.id));
+      }
+      for (const updated of updatedProposals) {
+        void loadSessionRuntimeSnapshot(updated.sessionId, { silent: true }).catch(() => {});
       }
 
       setProposalsBySession((current) => {
@@ -2473,6 +2769,9 @@ export default function App() {
     const normalized = normalizeSettings(form);
     const saved = normalizeSettings(await desktop.settingsUpdate(normalized));
     setSettings(saved);
+    if (!providerUsesCodexLogin(saved.provider)) {
+      setCodexLoginDetail("");
+    }
     setTheme(saved.theme);
     setConnectionState({
       status: "success",
@@ -2510,17 +2809,17 @@ export default function App() {
       (message) => message.role === "assistant" && message.status === "streaming"
     )
   );
+  const activeProvider = settings.provider;
+  const providerNeedsCodexLogin = providerUsesCodexLogin(activeProvider);
+  const loginBlocked = providerNeedsCodexLogin && (!codexAuth.loggedIn || codexChecking);
   const canSend = Boolean(
     activeSessionId &&
       draft.trim() &&
-      codexAuth.loggedIn &&
-      !codexChecking &&
+      !loginBlocked &&
       !chatSending &&
       !hasStreamingAssistant
   );
-  const showPendingAssistant = Boolean(
-    chatSending && codexAuth.loggedIn && activeSessionId && !hasStreamingAssistant
-  );
+  const showPendingAssistant = Boolean(chatSending && activeSessionId && !hasStreamingAssistant);
   const activeStreamInfo = activeSessionId ? streamProgressBySession[activeSessionId] ?? null : null;
   const activeStreamMessageId = activeStreamInfo?.messageId ?? "";
   const activeStreamProgress = activeStreamInfo?.items ?? [];
@@ -2529,13 +2828,17 @@ export default function App() {
     activeSessionMode,
     activeTurnIntent
   );
-  const composerHint = !codexAuth.loggedIn
-    ? "先登录 ChatGPT 才能发送。"
-    : "Enter 发送，Shift+Enter 换行。";
+  const composerHint = providerNeedsCodexLogin && !codexAuth.loggedIn
+    ? "先完成 Codex 登录才能发送。"
+    : activeProvider === "manual"
+      ? "当前为手动协作模式，发送后只会记录问题。"
+      : activeSessionWorkspaceId
+        ? "Enter 发送，Shift+Enter 换行。"
+        : "Enter 发送，Shift+Enter 换行。需要代码时点回形针。";
   const sessionMessageCount = activeSession?.messages?.length ?? 0;
   const workspaceStatusText = activeSessionWorkspaceId
-    ? activeWorkspace?.name ?? "已挂载"
-    : "未挂载";
+    ? activeWorkspace?.name ?? "已选择"
+    : "按需添加";
   const modeLabel = sessionModeLabel(activeSessionMode);
   const topbarContextLabel = sessionModeTrailLabel(activeSessionMode);
   const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
@@ -2547,7 +2850,7 @@ export default function App() {
       : filePreview
         ? "ready"
         : "empty";
-  const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "已挂载" : "未挂载";
+  const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "已选择" : "未选择";
   const previewStateText = previewState.loading
     ? "读取中"
     : previewState.error
@@ -2583,6 +2886,25 @@ export default function App() {
     showDecisionDeck ||
     previewDeckActive ||
     Boolean(selectedDecisionOption);
+  const runtimePanelTone = runtimePanelState.error
+    ? "error"
+    : runtimePanelState.loading
+      ? "loading"
+      : activeRuntimeTurn
+        ? runtimeTone(activeRuntimeTurn.status)
+        : activeRuntimeTask
+          ? runtimeTone(activeRuntimeTask.status)
+          : "idle";
+  const runtimePanelStatus = runtimePanelState.error
+    ? "加载失败"
+    : runtimePanelState.loading
+      ? "读取中"
+      : activeRuntimeTurn
+        ? turnStatusLabel(activeRuntimeTurn.status)
+        : activeRuntimeTask
+          ? taskStatusLabel(activeRuntimeTask.status)
+          : "空";
+  const runtimeItemList = activeRuntimeItems.slice(-6);
   const showPreviewPanel = previewState.loading || Boolean(previewState.error) || Boolean(filePreview);
   const composerPlaceholder = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
@@ -2591,8 +2913,8 @@ export default function App() {
         ? "描述你想直接展开的具体预览；Solo 会先给改动范围和影响点，不会直接应用。"
         : "描述你想让 Solo 结合当前工作区分析的事；它会先查看相关文件再回答。"
     : collaborationAvailable
-      ? "直接提问；如果这轮需要当前工作区，请先切到工作区协作。"
-      : "直接提问；需要代码上下文时先挂载工作区，再切到工作区协作。";
+      ? "直接提问；如果这轮需要代码上下文，再切到工作区协作。"
+      : "直接提问；需要代码上下文时再补充一个目录，并切到工作区协作。";
   const chatSubtitle = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
       ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先给方向建议，再由你点开预览并确认。`
@@ -2600,11 +2922,11 @@ export default function App() {
         ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，直接沿当前方向展开具体预览。`
         : `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先看相关文件，再给结论和依据。`
     : collaborationAvailable
-      ? `当前为对话模式。工作区 ${activeWorkspace?.name ?? "当前项目"} 已挂载，只有切到工作区协作时才会参与。`
-      : "当前为对话模式。需要代码上下文时再挂载工作区并切到工作区协作。";
+      ? `当前为对话模式。目录 ${activeWorkspace?.name ?? "当前项目"} 已作为可选上下文接入，只有切到工作区协作时才会参与。`
+      : "当前为对话模式。先直接提问；需要代码上下文时再补充目录并进入工作区协作。";
   const workspaceContextText = collaborationAvailable
-    ? `${activeWorkspace?.name ?? "当前项目"} 已挂载到当前会话`
-    : "当前会话还没有挂载工作区";
+    ? `${activeWorkspace?.name ?? "当前项目"} · 仅在工作区协作里使用`
+    : "当前没有代码上下文，先对话也可以";
   const modeIntentText = collaborationEnabled
     ? `这一轮会结合工作区，当前阶段：${turnIntentLabel(activeTurnIntent)}`
     : collaborationAvailable
@@ -2617,8 +2939,11 @@ export default function App() {
         ? "Solo 会直接展开更具体的改动预览，但仍然不会自动应用。"
         : "Solo 会先查看相关文件，再给结论、依据和下一步建议。"
     : collaborationAvailable
-      ? "工作区只是可用上下文。只有你切到“工作区协作”后，它才会真正参与回答。"
-      : "先挂载工作区，再进入工作区协作。";
+      ? "代码目录只是可选上下文。只有你切到“工作区协作”后，它才会真正参与回答。"
+      : "先直接提问；只有需要代码依据时再补充目录。";
+  const composerContextButtonLabel = activeSessionWorkspaceId
+    ? `更换代码上下文，当前为 ${activeWorkspace?.name ?? "已选目录"}`
+    : "添加代码上下文";
 
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
@@ -2677,13 +3002,21 @@ export default function App() {
         </div>
         <div className="topbar-status">
           <div className="status-pill">
-            <span className="status-pill-label">ChatGPT</span>
+            <span className="status-pill-label">
+              {providerNeedsCodexLogin ? "Codex 登录" : "连接"}
+            </span>
             <strong className="status-pill-value">
-              {!codexAuth.available
-                ? "不可用"
-                : codexAuth.loggedIn
-                  ? "已登录"
-                  : "未登录"}
+              {providerNeedsCodexLogin
+                ? (!codexAuth.available
+                    ? "不可用"
+                    : codexAuth.loggedIn
+                      ? "已登录"
+                      : "未登录")
+                : activeProvider === "manual"
+                  ? "手动"
+                  : settings.modelId
+                    ? "已配置"
+                    : "未配置"}
             </strong>
           </div>
           <div className="status-pill">
@@ -2701,7 +3034,7 @@ export default function App() {
             </select>
           </label>
           <div className="status-pill">
-            <span className="status-pill-label">工作区</span>
+            <span className="status-pill-label">上下文</span>
             <strong className="status-pill-value status-pill-code">{workspaceStatusText}</strong>
           </div>
           <button
@@ -2818,57 +3151,56 @@ export default function App() {
           <section className="panel-block panel-workspaces">
             <div className="section-header">
               <div>
-                <p className="section-eyebrow">Workspaces</p>
+                <p className="section-eyebrow">Context</p>
                 <div className="section-title-row">
-                  <h2>工作区</h2>
+                  <h2>代码上下文</h2>
                   <span className="section-count">{workspaces.length}</span>
                 </div>
-                <p className="section-note">这里只负责挂载和切换，不替你决定是否协作。</p>
+                <p className="section-note">默认先对话。需要代码时，用输入框旁的回形针补充目录。</p>
               </div>
-              <button
-                type="button"
-                className="ghost-button"
-                onClick={() => setWorkspaceModalOpen(true)}
-              >
-                添加
-              </button>
             </div>
-            <div className="workspace-list">
-              {workspaces.map((workspace) => (
-                <div
-                  key={workspace.id}
-                  className={`workspace-card ${
-                    workspace.id === activeWorkspaceId ? "is-active" : ""
-                  }`}
-                >
-                  <button
-                    type="button"
-                    className="workspace-main"
-                    onClick={() => void handleSelectWorkspace(workspace.id)}
+            {workspaces.length ? (
+              <div className="workspace-list">
+                {workspaces.map((workspace) => (
+                  <div
+                    key={workspace.id}
+                    className={`workspace-card ${
+                      workspace.id === activeWorkspaceId ? "is-active" : ""
+                    }`}
                   >
-                    <div className="workspace-row">
-                      <span className="workspace-title">{workspace.name}</span>
-                      {workspace.id === activeSessionWorkspaceId ? (
-                        <span className="list-badge list-badge-accent">已挂载</span>
-                      ) : null}
-                    </div>
-                    <span className="workspace-path">{workspace.path}</span>
-                    <span className="workspace-caption">
-                      {workspace.id === activeSessionWorkspaceId
-                        ? "当前会话正在使用这个工作区"
-                        : "点击挂载到当前会话"}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-button"
-                    onClick={() => handleRemoveWorkspace(workspace.id)}
-                  >
-                    移除
-                  </button>
-                </div>
-              ))}
-            </div>
+                    <button
+                      type="button"
+                      className="workspace-main"
+                      onClick={() => void handleSelectWorkspace(workspace.id)}
+                    >
+                      <div className="workspace-row">
+                        <span className="workspace-title">{workspace.name}</span>
+                        {workspace.id === activeSessionWorkspaceId ? (
+                          <span className="list-badge list-badge-accent">当前上下文</span>
+                        ) : null}
+                      </div>
+                      <span className="workspace-path">{workspace.path}</span>
+                      <span className="workspace-caption">
+                        {workspace.id === activeSessionWorkspaceId
+                          ? "当前会话会在工作区协作里读取这个目录"
+                          : "设为当前上下文"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="danger-button"
+                      onClick={() => handleRemoveWorkspace(workspace.id)}
+                    >
+                      移除
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="panel-collapsed-note">
+                <p>还没有保存的目录。需要代码上下文时，用输入框旁的回形针添加。</p>
+              </div>
+            )}
           </section>
 
           <section
@@ -2895,7 +3227,7 @@ export default function App() {
                 <p>
                   {activeWorkspace
                     ? "文件树默认折叠。需要看文件时再展开。"
-                    : "挂载工作区后，可以按需展开文件树。"}
+                    : "还没有可用代码目录。需要时再添加。"}
                 </p>
               </div>
             ) : activeWorkspace ? (
@@ -2914,12 +3246,12 @@ export default function App() {
                 </div>
               ) : (
                 <div className="empty-state compact">
-                  <p>当前工作区暂无可显示的文件树。</p>
+                  <p>当前目录暂无可显示的文件树。</p>
                 </div>
               )
             ) : (
               <div className="empty-state compact">
-                <p>先添加一个工作区。</p>
+                <p>需要代码时，再添加一个目录。</p>
               </div>
             )}
           </section>
@@ -2934,7 +3266,7 @@ export default function App() {
                 <p className="chat-subtitle">{chatSubtitle}</p>
                 <div className="chat-context-strip">
                   <div className="chat-context-item">
-                    <span className="chat-context-label">工作区</span>
+                    <span className="chat-context-label">代码上下文</span>
                     <strong className="chat-context-value">{workspaceContextText}</strong>
                   </div>
                   <div className="chat-context-item">
@@ -2965,7 +3297,7 @@ export default function App() {
                     onClick={() => void handleSetSessionMode(SESSION_MODE_WORKSPACE)}
                     aria-pressed={activeSessionMode === SESSION_MODE_WORKSPACE}
                     title={
-                      collaborationAvailable ? "结合当前工作区协作" : "先挂载工作区，再进入工作区协作"
+                      collaborationAvailable ? "结合当前工作区协作" : "先选择一个代码目录，再进入工作区协作"
                     }
                   >
                     工作区协作
@@ -3022,20 +3354,20 @@ export default function App() {
                 ) : null}
                 {activeSessionWorkspaceId ? (
                   <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                    解除工作区
+                    清除上下文
                   </button>
                 ) : null}
                 <button type="button" className="ghost-button" onClick={handleCreateSession}>
                   新会话
                 </button>
-                {!codexAuth.loggedIn ? (
+                {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
                   <button
                     type="button"
                     className="primary-button"
                     disabled={codexChecking}
                     onClick={handleCodexLogin}
                   >
-                    {codexChecking ? "登录中…" : "登录"}
+                    {codexChecking ? "登录中…" : "登录 Codex"}
                   </button>
                 ) : null}
               </div>
@@ -3043,11 +3375,12 @@ export default function App() {
           </div>
           <div className="chat-scroll">
             <div className="conversation-stack">
-              {!codexAuth.loggedIn ? (
+              {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
                 <div className="shell-card hero-card">
-                  <p className="section-eyebrow">ChatGPT</p>
-                  <h2>登录 ChatGPT</h2>
+                  <p className="section-eyebrow">Codex</p>
+                  <h2>登录 Codex</h2>
                   <p>{codexAuth.message}</p>
+                  {codexLoginDetail ? <p className="field-hint">{codexLoginDetail}</p> : null}
                   <div className="compact-row">
                     <button
                       type="button"
@@ -3055,7 +3388,7 @@ export default function App() {
                       disabled={codexChecking}
                       onClick={handleCodexLogin}
                     >
-                      {codexChecking ? "登录中…" : "登录 ChatGPT"}
+                      {codexChecking ? "登录中…" : "登录 Codex"}
                     </button>
                     <button
                       type="button"
@@ -3183,13 +3516,17 @@ export default function App() {
               ) : (
                 <div className="empty-state hero">
                   <p className="section-eyebrow">Conversation</p>
-                  <h2>直接开始对话，需要时再进入工作区协作。</h2>
+                  <h2>先开始对话，代码上下文按需再加。</h2>
                   <p>
                     {collaborationEnabled
                       ? "你已经进入工作区协作。Solo 会先查看相关文件，再给出建议、权衡和改动预览。"
                       : collaborationAvailable
-                        ? "你已经登录 ChatGPT。现在可以继续直接提问；如果需要代码上下文，再显式切到工作区协作。"
-                        : "你已经登录 ChatGPT。现在可以直接提问；需要代码上下文时先挂载工作区，再切到工作区协作。"}
+                        ? providerNeedsCodexLogin
+                          ? "你已经完成 Codex 登录。现在可以继续直接提问；如果需要代码上下文，再显式切到工作区协作。"
+                          : "当前连接已就绪。现在可以继续直接提问；如果需要代码上下文，再显式切到工作区协作。"
+                        : providerNeedsCodexLogin
+                          ? "你已经完成 Codex 登录。现在可以直接提问；需要代码依据时再补充目录并切到工作区协作。"
+                          : "当前连接已就绪。现在可以直接提问；需要代码依据时再补充目录并切到工作区协作。"}
                   </p>
                 </div>
               )}
@@ -3201,7 +3538,7 @@ export default function App() {
               <textarea
                 className="composer-input"
                 value={draft}
-                disabled={!codexAuth.loggedIn || codexChecking || chatSending || hasStreamingAssistant}
+                disabled={loginBlocked || chatSending || hasStreamingAssistant}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
                 placeholder={composerPlaceholder}
@@ -3209,6 +3546,17 @@ export default function App() {
               <div className="composer-actions">
                 <p className="composer-hint">{composerHint}</p>
                 <div className="composer-button-row">
+                  <button
+                    type="button"
+                    className={`ghost-button composer-attach-button ${
+                      activeSessionWorkspaceId ? "has-context" : ""
+                    }`}
+                    aria-label={composerContextButtonLabel}
+                    title={composerContextButtonLabel}
+                    onClick={() => setWorkspaceModalOpen(true)}
+                  >
+                    <PaperclipIcon />
+                  </button>
                   <button
                     type="button"
                     className="primary-button"
@@ -3245,7 +3593,7 @@ export default function App() {
               </div>
               <div className="drawer-meta-grid">
                 <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">工作区</span>
+                  <span className="drawer-meta-label">代码上下文</span>
                   <span className="drawer-meta-value">{activeWorkspace?.name ?? "未选择"}</span>
                 </div>
                 <div className="drawer-meta-row">
@@ -3264,6 +3612,80 @@ export default function App() {
                   <span className="drawer-meta-label">会话</span>
                   <span className="drawer-meta-value">{activeSession?.title ?? "暂无会话"}</span>
                 </div>
+              </div>
+            </section>
+
+            <section className="drawer-panel">
+              <div className="drawer-panel-head">
+                <div className="drawer-panel-title">
+                  <span className="section-eyebrow">Runtime</span>
+                  <strong>当前任务流</strong>
+                </div>
+                <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>
+                  {runtimePanelStatus}
+                </span>
+              </div>
+              <div className="drawer-meta-grid">
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">任务</span>
+                  <span className="drawer-meta-value">
+                    {activeRuntimeTask?.title || "当前还没有任务骨架。"}
+                  </span>
+                </div>
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">任务态</span>
+                  <span className="drawer-meta-value">
+                    {activeRuntimeTask ? taskStatusLabel(activeRuntimeTask.status) : "空"}
+                  </span>
+                </div>
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">回合</span>
+                  <span className="drawer-meta-value">
+                    {activeRuntimeTurn
+                      ? `${turnIntentLabel(activeRuntimeTurn.intent)} · ${formatRuntimeTime(
+                          activeRuntimeTurn.updatedAt ?? activeRuntimeTurn.createdAt
+                        )}`
+                      : "当前还没有回合记录。"}
+                  </span>
+                </div>
+                <div className="drawer-meta-row">
+                  <span className="drawer-meta-label">计数</span>
+                  <span className="drawer-meta-value">
+                    {`${activeRuntimeSnapshot.tasks.length} task / ${activeRuntimeSnapshot.turns.length} turn / ${activeRuntimeSnapshot.turnItems.length} item`}
+                  </span>
+                </div>
+              </div>
+              <div className="drawer-preview-body">
+                {runtimePanelState.error ? (
+                  <div className="status-banner status-banner-error">
+                    <strong>Runtime 读取失败</strong>
+                    <span>{runtimePanelState.error}</span>
+                  </div>
+                ) : runtimeItemList.length > 0 ? (
+                  <div className="runtime-item-list">
+                    {runtimeItemList.map((item) => (
+                      <div key={item.id} className="runtime-item-card">
+                        <div className="runtime-item-head">
+                          <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
+                          <span
+                            className={`drawer-chip drawer-chip-${runtimeTone(
+                              item.status,
+                              item.approvalState
+                            )}`}
+                          >
+                            {runtimeItemStateLabel(item)}
+                          </span>
+                        </div>
+                        <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
+                        <p>{item.summary || truncateInline(item.content || "暂无摘要。", 96)}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="proposal-empty">
+                    <p>当前会话还没有可展示的结构化 item。</p>
+                  </div>
+                )}
               </div>
             </section>
 
