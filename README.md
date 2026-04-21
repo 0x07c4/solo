@@ -1,57 +1,96 @@
 # Solo
 
-Solo is a human-in-the-loop AI workbench for Linux, built with `React + Tauri`.
+Solo is an observability system for the agent era, built with `React + Tauri`
+for Linux.
 
-The name `Solo` means:
+It is no longer best understood as a human-in-the-loop chat workbench.
+The more accurate framing now is:
+
+- the agent is strong enough to execute substantial work with limited supervision
+- the human increasingly behaves like a product manager or project manager
+- Solo should make agent work visible, manageable, traceable, and intervenable
+
+In one line:
+
+- `Solo = desktop observability and control plane for agent work`
+
+The name `Solo` still means:
 
 - it is built first for solo developers
-- the goal is that one person can use Solo to independently complete the development loop
-- AI, workspace context, suggestions, previews, and confirmation should eventually live in one desktop tool
+- one person should be able to supervise multiple agent workstreams from one tool
+- planning, execution state, artifacts, blockers, and interventions should live in one desktop product
 
-In Chinese, the product direction can be summarized as:
+In Chinese, the product direction can now be summarized as:
 
-> `Solo`：帮助你进入开发心流的人机协作 AI 工作台
+> `Solo`：agent 时代的任务观测与控制工作台
 
-Solo is not meant to be an autonomous agent that takes over the build process.  
-Its goal is to help a human work better:
+## What Solo Should Solve
 
-- understand problems faster
-- compare options more clearly
-- preview changes before acting
-- keep the final decision in human hands
+As agent capability improves, the bottleneck shifts away from "can it answer?"
+and toward:
 
-It is designed around two core modes:
+- what is each agent working on
+- which tasks are blocked, delayed, or off track
+- what resources are being consumed or competed for
+- what changed, why it changed, and who or what caused it
+- when the human should intervene, rather than being asked every few steps
 
-- `Conversation`: fast direct conversation using the local `codex` CLI login state
-- `Workspace Collaboration`: optional local workspace context for analysis, suggestions, tradeoffs, and previews
+So Solo is not primarily trying to be:
 
-These modes are explicit product states, not hidden heuristics:
+- another chat shell
+- another terminal wrapper
+- another pseudo IDE
+- a UI that asks the user to approve every tiny action
 
-- attaching a workspace only makes local context available
-- Solo should not silently decide that a normal chat turn is now workspace-aware
-- the user explicitly switches a session into `Workspace Collaboration` when they want repository context to participate
+It should instead become the place to:
 
-Current direction:
+- manage tasks
+- manage schedule and progress
+- coordinate resources
+- inspect runs and artifacts
+- trace execution state and history
+- intervene at milestones, exceptions, or failures
 
-- ChatGPT-style conversation flow inside the app
-- workspace-aware collaboration only when the user explicitly switches into it
-- suggestion + preview + confirmation instead of agent-first autonomous execution
-- Zed ACP-inspired architecture, so model/runtime and editor capabilities stay decoupled
-- dark, editor-inspired desktop UI with theme switching
+## Current Product Direction
 
-## Current V1 shape
+The current strategic direction is:
 
-- `codex_cli` as the primary conversation path
+- observability-first, not chat-first
+- the user acts more like a PM than a step-by-step operator
+- chat is only one control surface, not the product identity
+- workspace context is a resource dimension, not the main product mode
+- approvals should move toward checkpoints and exception handling, not default micro-confirmation
+- runtime ownership matters more than polishing prompt-shaped UI
+
+## Current V1 Reality
+
+The repository is still in a transitional state.
+
+Today it already has:
+
 - local sessions, workspaces, and settings persisted on disk
-- adaptive `conversation / workspace collaboration` desktop layout
-- workspace browsing and file attachment
-- streamed feedback during long replies
-- write-file and run-command proposals shown as previews that require user confirmation
-- custom in-app window chrome for Linux
+- `codex_cli` as the main execution path
+- a `conversation / workspace collaboration` shell
+- streamed progress and runtime snapshots
+- proposal and approval flows
+- early `task / turn / item` persistence skeleton in Rust
+
+But this V1 shape should now be treated as a bridge, not the destination.
+The long-term product should move toward:
+
+- `workstream / task / run / event / resource / artifact / checkpoint`
+- task board and timeline views
+- agent run inspection and replay
+- resource coordination and blocker tracking
+- structured intervention points instead of constant natural-language back-and-forth
 
 ## Project Context
 
-See [CONTEXT.md](./CONTEXT.md) for current decisions and next-step plan.
+See [CONTEXT.md](./CONTEXT.md) for the current repo-level direction and near-term
+plan.
+
+See [docs/solo-control-plane.md](./docs/solo-control-plane.md) for the main
+product reframe toward an agent observability system.
 
 ## Development
 
@@ -71,4 +110,6 @@ cd src-tauri && cargo check
 
 Solo is released under the `Apache-2.0` license.
 
-This keeps the desktop client open source while preserving room for future commercial offerings built around hosted services, cloud features, or paid extensions.
+This keeps the desktop client open source while preserving room for future
+commercial offerings built around hosted services, cloud features, or paid
+extensions.

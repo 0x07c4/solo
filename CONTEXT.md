@@ -1,283 +1,170 @@
 # Solo 上下文与计划
 
-最后更新：2026-03-29
+最后更新：2026-04-22
 
-## 1. 当前目标
+## 1. 当前方向
 
-做一个 Linux 桌面客户端：
+`Solo` 现在的主方向已经重构为：
 
-- 可直接在应用内对话（优先使用本地 ChatGPT / Codex 登录态）
-- 可按需挂载本地工作区做上下文协作
-- 以“建议 + 预览 + 用户确认”为核心协作方式，而不是自治执行
+- `agent 时代的观测系统`
+- 用户更像产品经理 / 项目经理，而不是逐步操作 agent 的执行员
+- 产品的核心价值不再是“多聊一点”或“多确认一点”，而是：
+  - 管理任务
+  - 管理工期与进展
+  - 协调资源
+  - 追溯状态
+  - 在关键节点介入
 
-## 2. 已落地决策
+更直接地说：
 
-1. **`Solo` 的命名含义固定为“个人开发者可独立完成开发闭环”**
-   - 首先服务个人开发使用场景，而不是团队协作平台。
-   - 产品目标是让一个人用 Solo 完成对话、理解、选择、预览和确认闭环。
+- `Solo` 不该继续围绕“对话 + 工作区协作”组织整个产品身份
+- 那只是当前 V1 的过渡壳
+- 今后的产品主语义应该是：
+  - workstream
+  - task
+  - run
+  - event
+  - resource
+  - artifact
+  - checkpoint / exception
 
-2. **中文定位语引入“心流”**
-   - 主品牌仍然是 `Solo`。
-   - `心流` 作为中文定位语 / 副标题使用。
-   - 当前表述方向：`Solo：帮助你进入开发心流的人机协作 AI 工作台`。
+## 2. 覆盖性判断
 
-3. **产品定位改为 human-in-the-loop，而不是自治 agent**
-   - Solo 不是替用户接管工作流程的自治代理。
-   - AI 的职责是提供知识、分析、建议、权衡、风险提醒和预览。
-   - 最终决策权与执行确认始终交给用户。
+以下判断从现在起优先生效；如果与旧文档、旧 UI 或旧注释冲突，以这里为准。
 
-4. **对外主路线固定为“对话 + 工作区协作”**
-   - `对话`：快速、直接、低负担，优先接近 ChatGPT 的使用体验。
-   - `工作区协作`：在需要代码或项目上下文时再进入。
-   - 不再把 `Agent` 作为前台一级概念。
+1. **用户角色改为 PM / 项目经理**
+   - 用户主要负责设定目标、管理优先级、观察进度、处理风险和做关键决策。
+   - 用户不应默认被放在每个微小步骤的确认链路里。
 
-5. **工作区协作的默认方式固定为“建议 + 预览 + 确认”**
-   - 任何写文件、运行命令、修改项目的能力都不能默认自主执行。
-   - AI 可以提出动作建议、给出改动预览和风险信息。
-   - 真正应用改动前必须经过用户确认。
+2. **默认假设 agent 可以连续执行**
+   - agent 能力已经足够强，不应再把频繁的人机来回当成默认产品前提。
+   - 更合理的交互模式是：
+     - agent 持续推进
+     - Solo 持续投影状态
+     - 人在里程碑、异常、资源冲突、风险上升时介入
 
-6. **对话通道优先 `codex_cli`**
-   - 不再依赖用户单独充值 API key 才能聊天。
-   - 启动时会把 provider 调整到 `codex_cli`。
+3. **`Solo` 应该是观测与控制层，而不是聊天壳**
+   - 对话仍然可以存在，但只能作为输入或追问入口之一。
+   - 主界面不应再长期以消息流为唯一主轴。
 
-7. **支持纯对话模式（无工作区）**
-   - 不挂载文件夹也可直接聊天。
-   - 只有需要代码上下文时才绑定工作区。
+4. **工作区只是资源维度，不再是产品主模式**
+   - 工作区、模型、工具、权限、token 预算、运行环境，本质都应被视为资源。
+   - “是否使用工作区”不该继续定义整个产品交互模型。
 
-8. **普通聊天优先“快答”，而不是自动进入协作式分析**
-   - 用户只是聊天、问知识、问建议时，应尽量快答。
-   - 是否进入工作区协作由用户显式切换，不再依赖输入内容猜测模式。
+5. **审批从“默认每步确认”改为“检查点 / 异常处理”**
+   - 审批仍然重要，但不应继续做成所有工作默认都要过的人肉阀门。
+   - 更合理的是：
+     - checkpoint
+     - escalation
+     - exception
+     - rollback / retry / reassign
 
-9. **界面方向参考 ChatGPT + Copilot**
-   - 左侧：会话 + 工作区
-   - 中间：主对话
-   - 右侧：上下文 / 预览抽屉
+6. **产品第一性问题改为任务治理，而不是回复体验**
+   - 优先级更高的问题是：
+     - 当前有哪些任务
+     - 哪些任务正在推进
+     - 哪些任务阻塞
+     - 哪些资源冲突
+     - 哪些 run 失败或偏航
+     - 哪些 artifact 已产出
+   - 不再把“让回复更像 ChatGPT”视作主方向。
 
-10. **UI 设计语言改为 ChatGPT + AstroNvim/LazyVim**
-   - 交互形态继续以对话为主，不做成伪编辑器。
-   - 视觉系统借 editor chrome、紧凑信息密度和 pane 语言。
-
-11. **架构上吸收 Zed ACP 思路**
-   - 不把模型能力、工作区能力和 UI 直接耦死在一起。
-   - 目标是走 adapter / capability / event 的 agent 内核分层，方便后续继续扩展。
-   - 这层能力保留为内部实现，不作为前台产品语言。
-
-12. **字体策略固定为“UI 无衬线 + Maple Mono NF CN”**
-   - 正文、按钮、标题仍以无衬线为主。
-   - 路径、文件树、状态栏、badge、过程日志、预览区使用 `Maple Mono NF CN`。
-
-13. **布局模式改为显式会话模式**
-   - `对话` / `工作区协作` 是会话级状态，由用户主动切换。
-   - 挂载工作区只代表上下文可用，不代表系统会自动读取它。
-   - 只有进入 `工作区协作` 后，三栏工作台和仓库上下文才参与当前会话。
-
-14. **继续吸收 Zed 的 UI 优点，但不做成编辑器**
-   - 顶部 chrome 更薄、更像开发工具状态条。
-   - 左侧栏更高密度，减少大卡片感，增强 pane/list 语言。
-   - 目标是“开发工具感”，不是“网页控制台感”。
-
-15. **继续吸收 Neovim 的状态线与 pane 语言**
-   - 顶栏优先做成单行 statusline，而不是网页式信息卡。
-   - Section 标题、计数、路径和状态统一偏 monospace 工具感。
-   - 侧栏与右栏都按 editor pane 处理，减少漂浮卡片和夸张圆角。
-
-16. **主页面固定一屏，不使用浏览器级滚动**
-   - 整个应用视口固定在 100vh。
-   - 只允许聊天区、文件树、右侧面板等内部区域各自滚动。
-
-17. **移除系统白色标题栏，改为应用内自绘窗口 chrome**
-   - Tauri 窗口禁用原生 decorations。
-   - 顶部使用深色标题栏、拖拽区、自绘最小化/最大化/关闭按钮。
-
-18. **Git 历史只保留公开身份**
-   - 仓库历史重写为单个 `Solo` 初始化提交。
-   - 提交身份统一使用 GitHub `noreply`：`0x07c4 <0x07c4@users.noreply.github.com>`。
-   - 不保留任何带个人邮箱、本地绝对路径或旧品牌历史的公开提交链。
-
-19. **客户端开源许可证固定为 `Apache-2.0`**
-   - 目标是保持桌面客户端开源，同时保留后续商业化空间。
-   - 未来如需扩展云服务、托管能力或付费增强功能，可在开源客户端之外单独设计商业层。
-
-20. **工作区通过系统目录选择器添加**
-   - 不再要求用户手动输入绝对路径。
-   - “添加工作区”入口应直接打开系统目录选择器，再由用户确认目录。
-
-21. **“挂载工作区”与“进入工作区协作”必须是两个动作**
-   - 点击工作区只表示把它挂载到当前会话。
-   - 是否真正结合这个工作区回答，由用户显式切到 `工作区协作` 决定。
-   - UI 需要持续把这两个动作区分清楚，避免再次退回“系统替用户猜模式”。
-
-22. **工作区 `.ignore` 必须参与 Solo 与 Codex 的协作范围控制**
-   - `.ignore` 不只是前端文件树过滤规则，也要进入工作区协作提示词。
-   - Solo 读取文件、预览文件、应用写入建议时，都要尊重 `.ignore`。
-   - Codex 在工作区协作时默认跳过这些路径，除非用户明确点名要求查看。
-
-23. **主区应成为“方向选择 + 预览确认”的主决策面**
-   - 多方向建议优先在主区显示为方向卡片，而不是塞进长文本或右侧抽屉。
-   - 用户选定方向后，再在主区展开预览卡。
-   - 右侧抽屉只保留上下文与状态摘要，不再承担主要决策流。
-
-24. **方向卡只能负责“预览与确认选择”，不能直接应用改动**
-   - 方向卡点击后先展开该方向的预览说明。
-   - 只有用户明确点击“确认选择这个方向”后，Solo 才沿该方向继续生成更具体的改动预览。
-   - `应用改动 / 执行命令` 只能出现在真正的预览卡阶段，不能在方向选择阶段提前出现。
-
-25. **代理优先只注入给 `codex` 子进程，不污染整个桌面应用**
-   - 开发环境里全局设置 `http_proxy/https_proxy/all_proxy` 会把 `localhost` 和 Vite dev server 一起代理走，导致 Tauri 白屏。
-   - Solo 应优先读取 `SOLO_CODEX_HTTP_PROXY / SOLO_CODEX_HTTPS_PROXY / SOLO_CODEX_ALL_PROXY / SOLO_CODEX_NO_PROXY`，并只把这些变量注入给 `codex` 子进程。
-   - 若用户仍使用普通 `http_proxy/https_proxy/...` 启动应用，则必须同时设置 `NO_PROXY=localhost,127.0.0.1,::1`。
-   - 正式产品路径不是要求用户手动 `export`；而是通过设置页保存 `直连 / 跟随环境 / 手动代理`，再由后端只注入给 `codex` 子进程。
-
-26. **`codex_cli` 只适合作为重型工作区协作通道，不应继续承担全部对话**
-   - 当前 `codex exec` 是每轮冷启动 + 重建上下文 + 工作区前置查看的重链路，天然不适合承担所有普通聊天。
-   - `Solo` 长期应分成两条通道：`fast chat lane` 与 `heavy workspace lane`。
-   - 在这两条通道真正分离之前，`codex_cli` 可以继续保留，但只应被视为接入层，而不是 `Solo` 的长期 runtime 协议层。
-
-26. **主区“建议 + 预览 + 确认”必须按 DDD 的决策域来设计，而不是继续围绕文本块排版**
-   - 这块的核心不是“把回复切成更漂亮的卡片”，而是先定义稳定的领域对象，再让 UI 只读这些对象的 projection。
-   - 当前目标领域语言应至少包括：`DecisionSet`、`DecisionOption`、`OptionPreview`、`Approval`。
-   - `DecisionSet` 负责一轮“多个方向 / 选一个 / 都不选 / 已选后展开下一层预览”的完整决策状态，而不是把这些状态散落在 `proposal` 与本地 UI 条件判断里。
-
-27. **方向数量不能再默认只围绕 A/B 设计**
-   - Solo 必须天然支持一个 `DecisionSet` 下有多个 `DecisionOption`。
-   - “两个方向”只是常见情况，不是前提条件。
-   - “都不选”不是补丁按钮，而应该是 `DecisionSet` 的一等动作与正式结果。
-
-28. **纯对话模式也应该支持“建议 + 预览”，但预览类型必须降级为概念预览**
-   - 纯对话模式下同样可以有 `DecisionSet` 与 `DecisionOption`，只是不应伪造 diff / 文件范围 / 命令执行这类工作区语义。
-   - 纯对话对应的是 `concept preview`，工作区协作对应的是 `workspace change preview` / `command preview`。
-   - 审批动作只应出现在真正会改文件或执行命令时。
-
-29. **默认预览必须优先服务“判断”，而不是优先服务“解释”**
-   - 用户在方向选择阶段首先需要回答的是“值不值得继续看 / 选不选”，而不是阅读整套理由。
-   - 默认态应优先暴露稳定的比较维度，如 `scope / gain / risk / cost / confidence`。
-   - 更完整的解释、依据和文件细节应退到二级展开层，而不是默认占满主区。
-
-30. **当前这轮探索已经证明：把长文本切碎成 chips / pills / 小卡片，不等于视觉化**
-   - 如果用户仍然需要主要靠读字理解内容，本质上仍然是文本 UI，只是更碎。
-   - 视觉化应该建立在领域维度清晰之后，用稳定的比较维度和层级表达来辅助判断，而不是先切文字再寻找容器。
-
-31. **推进决策流时要同步清理旧架构里的复杂设计**
-   - Solo 不能一边引入 `DecisionSet / DecisionOption / OptionPreview`，一边长期保留旧 `proposal` 直读、补丁式条件判断和双轨状态。
-   - 每次往前推进一层，都应顺手删除重复投影、收拢状态来源、合并临时分支，而不是把“架构清理”留给未来某次大重构。
-   - 当前决策流重构的成功标准，不只是新 UI 跑起来，而是旧复杂度真正退场。
-
-32. **主题系统要维护一组清晰的深浅主题家族，而不是继续堆质量参差的暗色 palette**
-   - Solo 不能只提供一串观感接近、质量不稳的暗色主题；至少要有明确的 dark / light 两个层级。
-   - 主题切换不应只改 `bg / accent`，还要覆盖 `code surface`、输入框、按钮、overlay 等关键语义 token。
-   - 默认主题应优先是最稳、最耐看的工作台主题，而不是历史遗留选项。
+7. **运行时模型要为观测系统服务**
+   - 当前 `thread / task / turn / item` 的工作仍然有价值，但应继续外扩到更适合观测系统的对象：
+     - `workstream`
+     - `task`
+     - `run`
+     - `event`
+     - `resource`
+     - `artifact`
+     - `checkpoint`
+   - UI 以后应优先读这些对象的 projection，而不是继续围绕 `message/proposal` 做产品设计。
 
 ## 3. 当前实现快照
 
-- 前端：React + Vite（`src/App.jsx`, `src/App.css`）
-- 后端：Tauri Rust（`src-tauri/src/lib.rs`）
-- 数据：本地持久化 sessions/workspaces/settings（`src-tauri/src/storage.rs`）
-- 登录检测：`codex login status`
-- 对话执行：`codex exec`（`codex_cli` 模式）
-- 主题：默认 `Gruvbox Dark`，当前维护 `Gruvbox Dark / Tokyo Night / Nord Night / Kanagawa Ink / Gruvbox Light / Paper Light / Nord Light`
-- 布局：按当前会话的显式模式切换 `对话 / 工作区协作`
-- 架构：继续向 Zed ACP 风格的 adapter / capability / event 分层靠拢
-- 字体：关键开发工具区域使用 `Maple Mono NF CN`
-- Chrome：顶部已收成更接近 Neovim/Zed 的单行状态栏，侧栏已改成紧凑 pane section，右栏已改成上下文与预览抽屉
-- Theme UX：主题系统已从“只有暗色且质量参差的 palette 列表”收成明确的深浅主题家族；代码面、输入面、按钮、overlay 和顶部选择器都开始走语义 token
-- Chat：消息区与输入区已开始收成居中的 conversation column，减少大面积空洞留白
-- Sidebar：已去掉大部分文件树 badge 和过亮列表装饰，继续往更安静的 editor list 收敛
-- Window：已切换为自绘深色标题栏，避免 Linux 默认白色系统栏破坏主题
-- Behavior：普通聊天与工作区协作已改成显式模式切换，不再靠输入内容猜测
-- Proxy：`codex login status` / `codex login` / `codex exec` 已支持独立的 `SOLO_CODEX_*` 代理环境变量，并回退到普通代理变量
-- Settings：设置弹窗已重新接回主界面，并新增 `Codex 代理` 模式（直连 / 跟随环境 / 手动配置），保存后立即作用于后续 `codex` 子进程
-- Runtime：当前仍是 `messages + proposals` 主导的过渡形态；下一阶段应优先把内部模型收敛到 `session/thread -> turn -> item`，再决定是否更换或增加 provider
-- UX：工作区列表与聊天头部已明确区分“挂载上下文”和“进入协作”
-- Streaming：已开始解析 `codex --json` 的 `item.*` 事件，让工作区协作时的读文件/执行命令/中间说明能显示成可读进度，而不是只看到 thread/turn started
-- Streaming：工作区协作不再沿用统一 180 秒总超时；已改成按模式区分的“总超时 + 空闲超时”，并优先显示产品化阶段摘要，而不是原始 `zsh/sed/rg` 命令细节
-- Streaming：前端等待文案与监控阈值也按模式区分；工作区协作不得再笼统提示“网络较慢”，而应明确说明正在查看工作区、整理建议与预览
-- Streaming：`Reconnecting... (timeout waiting for child process to exit)` 这类 Codex CLI 重连噪声不应被当成“有进展”；它不再刷新活动时间，并且会更早触发失败，避免工作区协作假活着卡几百秒
-- Suggestions：当建议卡片通过事件流到达时，右侧抽屉会立即结束 loading 状态，不再出现“卡片已出现但仍在加载列表”
-- Suggestions：当回复里已经明确给出 A/B 方向选择但没有 `solo-write` / `solo-command` 结构块时，右侧也应生成“方向建议”卡，避免主消息有选项而抽屉为空
-- Suggestions：即使当前回合没有产出 proposal，流式结束后右侧“建议与确认”也必须停止 loading，避免出现“回复结束了但抽屉还在转”的假状态
-- Prompt：工作区协作模式下，只要用户在讨论具体文件的建议/优化/预览，就优先要求模型产出 `solo-write` / `solo-command` 候选块，而不是只给文字点评
-- Reply shape：一旦当前回合已经产出 proposal，主聊天区回复应退到“短结论 + 去右侧看预览”，不要再用长篇正文稀释建议与预览的主体验
-- Approval UX：当前会话的文件建议 / 命令建议已进入右侧抽屉，可直接查看预览、确认或拒绝
-- Workspace filtering：工作区文件树、文件读取和写入提案已经接入 `.ignore` 过滤，避免把 `node_modules` / `dist` 等目录带进主界面和写入链路
-- Codex scope：工作区协作时会把 `.ignore` 规则注入 Codex 提示词，并在开始阶段明确提示“已应用 .ignore”
-- Main decision flow：主区已开始拆分为“方向卡 -> 已选方向 -> 预览卡”，右侧抽屉退回到上下文与状态摘要
-- Choice UX：方向卡现在采用“点卡片预览、点按钮确认选择”的两步交互，避免让用户在未见到具体改动时直接确认应用
-- Choice UX：当用户明确要“两个方向 / 先让我选”时，工作区协作应优先产出结构化 `solo-choice` 方向卡，不得直接塌成 `solo-write` 改动卡
-- Choice UX：工作区协作正在补显式“本轮阶段”控制；`协作分析 / 方向建议 / 具体预览` 不能再靠输入内容猜，而要由前台明确传给后端
-- Choice UX：用户开启新一轮问题时，上一轮残留的 pending/selected proposal 必须自动退场，不能继续霸占主区入口
-- Choice UX：多个方向卡不应竖向堆叠成列表；主区方向卡应优先横向展开，形成更接近“弹出卡组”的浏览感
-- Decision UX：已经确认主区决策流不应继续围绕“文本块 + 卡片样式”迭代；下一步应先建立 `DecisionSet / DecisionOption / OptionPreview` 投影层，再重做默认比较视图
-- Decision UX：当前默认预览的最大问题不是颜色或排版，而是领域维度还未稳定，导致默认视图在“解释”与“判断”之间反复摇摆
-- Decision UX：纯对话模式与工作区协作模式应共用同一决策域，只在 preview fidelity 上分层，而不是走两套独立交互模型
-- Decision UX：主区已经开始通过前端 `DecisionSet` 投影统一读取方向卡、已选方向与预览卡；后续应继续把“都不选 / 纯对话 concept preview / 多方向比较板”并入同一决策域
-- Decision UX：主区方向卡、方向预览和具体预览卡已改成读取 `DecisionOption` / `ApprovalCard` 投影；主区交互不再直接消费 raw `proposal`，只在 action adapter 层按 `id` 回连后端
-- Architecture hygiene：决策流后续迭代必须边推进边删旧结构，避免旧 `proposal` 直读和新 `DecisionSet` 投影长期双轨并存
-- Reliability：proposal / message 这类会在同一轮里批量创建的对象，ID 不能只靠毫秒时间戳；否则前端按 `id` upsert 时会吞掉后续卡片
-- Reliability：方向 fallback 解析不能在第一条非 bullet 行就结束；A/B 多行描述必须按选项分组收集，否则会把“两个方向”截成只剩一条
-- Reliability：发送锁必须持续到本轮真正 `done/error`，不能在首个 token 到达时提前解锁，否则会造成同一条用户消息重复追加
-- Reliability：`codex-cli` 的 raw stderr（如 `Reconnecting ... timeout waiting for child process to exit`）不能原样成为主交互文案；应尽量产品化，并在重连耗尽时尽早失败
-- Session UX：侧栏会话列表必须支持直接删除；删除当前会话时应自动切到剩余会话，没有剩余则立即补一条新会话，且同时清理该会话的 proposals 和本地流式状态
-- Sidebar：会话卡不再重复强调工作区挂载语义；工作区列表只负责挂载与切换；文件树默认折叠，按需展开
+当前仓库仍然明显处在旧壳向新方向迁移的过渡阶段。
 
-## 4. 近期计划（按优先级）
+现在已经有的可复用基础：
 
-### P0（先做）
+- React + Tauri 的桌面形态
+- 本地持久化的 sessions / workspaces / settings
+- `codex_cli` 驱动的执行链路
+- 流式状态、阶段摘要和右侧 runtime snapshot
+- Rust 端最小 `TaskRecord / TurnRecord / TurnItem` 持久化骨架
+- proposal / approval 流程和基础事件总线
 
-- [x] 增加明确的“纯对话模式”开关（隐藏/折叠工作区面板）
-- [ ] 在 UI 显示“当前模型提示”（从本机 codex 配置读取）
-- [x] 优化回答风格约束，减少模板化回复
-- [x] 增加对话失败的可读错误提示（网络/登录态/命令失败区分）
-- [x] 建立 `Workbench Dark` 视觉方向，并把默认主题切到更稳的 `Gruvbox Dark`
-- [x] 落地 `Maple Mono NF CN` 到关键开发工具区域
-- [x] 吸收 Zed 的薄 chrome / 高密度侧栏优点
-- [x] 吸收 Neovim 的状态线与 pane 语言
-- [x] 移除系统白标题栏，接管窗口顶部 chrome
-- [x] 清理公开 Git 历史中的个人身份与旧品牌残留
-- [x] 把“快答 / 工作区协作”分流改成前端显式模式，而不是后端猜测
-- [x] 把“建议 + 预览 + 确认”明确做成前台产品语言
-- [x] 让 `.ignore` 真正参与工作区协作范围控制，减少 Codex 把时间浪费在无关目录上
-- [x] 在前端建立 `DecisionSet / DecisionOption / OptionPreview` 投影层，停止让主区直接消费原始 proposal 集合
-- [ ] 让纯对话模式也能走 `DecisionSet`，但只生成 `concept preview`
-- [ ] 把“都不选”提升为 `DecisionSet` 的正式动作，而不是临时 ghost button
-- [ ] 在继续推进 `DecisionSet` 的同时，删除旧 `proposal` 直读和补丁式 UI 状态，避免新结构叠在旧复杂设计上
+这些资产依然有用，但应被重新解释为：
 
-### P1（随后）
+- 它们不是“聊天工作台”的完成度
+- 而是“观测系统底座”的早期实现
 
-- [ ] 把主题变量继续整理成更稳定的 semantic/component token 结构
-- [ ] 继续压缩顶栏与侧栏 chrome，减少 web 卡片感
-- [ ] 对话消息支持 Markdown 渲染
-- [ ] 会话搜索与固定
-- [ ] 支持导出会话
-- [ ] 完善移动端/窄窗口布局
-- [ ] 把主区“方向卡 / 预览卡”继续视觉化，吸收更多杀戮尖塔式的卡片聚焦交互
-- [ ] 把 `fast chat lane` 与 `heavy workspace lane` 的 runtime 边界正式拆开
-- [ ] 开始把 `messages + proposals` 降级为 projection，并补最小可用的 `turn/item` 内部结构
-- [ ] 把主区默认视图重做成稳定的多方向比较板，而不是继续围绕单个方向解释卡来回打磨
+当前最大的偏差：
 
-### P2（后续扩展）
+- 主 UI 仍以消息流为主
+- 工作区协作仍然是强产品主语义
+- 批准 / 拒绝仍更像逐步确认流
+- `task` 还没有成为真正的一等治理对象
+- 资源、工期、阻塞、异常追溯都还没有正式进入产品域
 
-- [ ] 重构“提案审批（写文件/跑命令）”工作流入口，使其更像建议预览而不是代理执行
-- [ ] 增加更细粒度的权限策略与审计日志
+## 4. 近期计划
 
-## 5. 本地开发与验证
+后续计划从现在起按这个方向执行。
 
-```bash
-npm install
-npm run tauri dev
-```
+### P0
 
-提交前至少执行：
+- 定义新的产品领域模型：
+  - `Workstream`
+  - `Task`
+  - `Run`
+  - `Event`
+  - `Resource`
+  - `Artifact`
+  - `Checkpoint`
+- 明确这些对象和当前 `session / task / turn / item / proposal` 的映射关系。
+- 把“审批”从通用微确认，重构为 checkpoint / exception 体系。
 
-```bash
-npm run lint
-npm run build
-cd src-tauri && cargo check
-```
+### P1
 
-## 6. 更新规则
+- 把主界面从 chat-first 改成 observability-first：
+  - 任务面板
+  - 活跃 run 列表
+  - 时间线 / 事件流
+  - 阻塞与异常面板
+  - artifact / diff / output 检视面板
+- 让聊天区降级为次级输入面，而不是产品中心。
 
-后续每次较大改动后，更新本文件：
+### P2
 
-1. “已落地决策”
-2. “当前实现快照”
-3. “近期计划”的勾选状态
+- 引入资源视角：
+  - workspace
+  - provider / model
+  - tools
+  - permission scope
+  - token / cost / runtime budget
+- 支持从“任务推进”而不是“消息轮次”来观察资源消耗与争用。
+
+### P3
+
+- 引入工期与节奏视角：
+  - 预计开始 / 完成
+  - 当前延迟
+  - blocked duration
+  - escalation age
+  - intervention history
+- 让 `Solo` 能真正承担项目管理视角下的 agent 监督工作。
+
+### P4
+
+- 统一 headless runtime 与 provider adapter：
+  - `codex_cli`
+  - `openai-codex`
+  - 后续其他 agent runtime
+- 要求所有 adapter 产出同一套 run/event/resource/checkpoint 语义。
+
+## 5. 当前执行基线
+
+从现在开始：
+
+- 文档、设计和实现优先围绕“观测系统”推进
+- 如果出现“继续围绕聊天 UI 打磨体验”和“推进任务治理 / 状态追溯 / 资源协调”之间的冲突，后者优先
+- 如果旧文档里仍然保留 `human-in-the-loop chat workbench` 的表达，应视为历史阶段判断，而不是当前方向
