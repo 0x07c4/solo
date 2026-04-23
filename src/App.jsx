@@ -1395,6 +1395,127 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
   );
 }
 
+function RuntimeSummaryCard({ label, value, tone = "idle", detail = "" }) {
+  return (
+    <article className={`runtime-summary-card runtime-summary-card-${tone}`}>
+      <span className="runtime-summary-label">{label}</span>
+      <strong className="runtime-summary-value">{value}</strong>
+      {detail ? <p className="runtime-summary-detail">{detail}</p> : null}
+    </article>
+  );
+}
+
+function TaskBoardCard({ entry, active, onSelect }) {
+  return (
+    <button
+      type="button"
+      className={`task-board-card task-board-card-${entry.tone} ${active ? "is-active" : ""}`}
+      onClick={() => onSelect(entry.id)}
+      aria-label={`查看任务流 ${entry.title}`}
+    >
+      <div className="task-board-card-head">
+        <div className="task-board-card-heading">
+          <strong>{entry.title}</strong>
+          <span className="task-board-card-meta">{entry.meta}</span>
+        </div>
+        <span className={`list-badge list-badge-${entry.tone}`}>{entry.statusLabel}</span>
+      </div>
+      <p className="task-board-card-summary">{entry.summary}</p>
+      <div className="task-board-card-foot">
+        <span className={`task-board-pill ${entry.hasException ? "is-alert" : ""}`}>
+          {entry.hasException ? entry.exceptionSummary : "点击切换到详情区"}
+        </span>
+        {active ? <span className="task-board-pill is-active">当前选中</span> : null}
+      </div>
+    </button>
+  );
+}
+
+function TaskBoardLane({
+  title,
+  eyebrow,
+  tone = "idle",
+  entries,
+  activeSessionId,
+  onSelect,
+  emptyLabel,
+}) {
+  return (
+    <section className={`task-board-lane task-board-lane-${tone}`}>
+      <div className="task-board-lane-head">
+        <div>
+          <p className="section-eyebrow">{eyebrow}</p>
+          <h3>{title}</h3>
+        </div>
+        <span className={`drawer-chip drawer-chip-${tone}`}>{entries.length}</span>
+      </div>
+      {entries.length ? (
+        <div className="task-board-lane-list">
+          {entries.map((entry) => (
+            <TaskBoardCard
+              key={entry.id}
+              entry={entry}
+              active={entry.id === activeSessionId}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="task-board-empty">
+          <span>{emptyLabel}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function WorkstreamCard({ entry, active, onSelect, onDelete, deletingDisabled = false }) {
+  return (
+    <div className={`session-card ${active ? "is-active" : ""}`}>
+      <button
+        type="button"
+        className={`session-main ${active ? "is-active" : ""}`}
+        onClick={() => onSelect(entry.id)}
+        aria-label={`打开任务流 ${entry.title}`}
+      >
+        <div className="session-row">
+          <span className="session-title">{entry.title}</span>
+          <span className={`list-badge list-badge-${entry.tone}`}>{entry.statusLabel}</span>
+        </div>
+        <span className="session-meta">{entry.meta}</span>
+        <span className="session-caption">{entry.summary}</span>
+      </button>
+      <button
+        type="button"
+        className="danger-button session-delete-button"
+        onClick={() => onDelete(entry.id)}
+        aria-label={`删除任务流 ${entry.title}`}
+        disabled={deletingDisabled}
+      >
+        删除
+      </button>
+    </div>
+  );
+}
+
+function ExceptionCard({ entry, active, onSelect }) {
+  return (
+    <button
+      type="button"
+      className={`exception-card ${active ? "is-active" : ""}`}
+      onClick={() => onSelect(entry.id)}
+      aria-label={`查看异常任务流 ${entry.title}`}
+    >
+      <div className="exception-card-head">
+        <strong>{entry.title}</strong>
+        <span className={`drawer-chip drawer-chip-${entry.tone}`}>{entry.exceptionLabel}</span>
+      </div>
+      <span className="exception-card-meta">{entry.meta}</span>
+      <p>{entry.exceptionSummary}</p>
+    </button>
+  );
+}
+
 export default function App() {
   const mountedRef = useRef(true);
   const activeSessionIdRef = useRef("");
@@ -1441,6 +1562,7 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState("trace");
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId) ?? null,
@@ -1512,6 +1634,104 @@ export default function App() {
       (item) => item.turnId === activeRuntimeTurn.id
     );
   }, [activeRuntimeSnapshot, activeRuntimeTurn]);
+  const sessionRuntimeSummaries = useMemo(
+    () =>
+      sessions.map((session) => {
+        const snapshot = normalizeRuntimeSnapshot(runtimeSnapshotBySession[session.id], session.id);
+        const tasks = snapshot.tasks ?? [];
+        const turns = snapshot.turns ?? [];
+        const task = tasks[0] ?? null;
+        const preferredTurnId = task?.currentTurnId ?? task?.latestTurnId ?? "";
+        const turn =
+          turns.find((item) => item.id === preferredTurnId) ??
+          turns[0] ??
+          null;
+        const pendingApprovals = (snapshot.turnItems ?? []).filter(
+          (item) => item.approvalState === "pending"
+        ).length;
+        const failedItems = (snapshot.turnItems ?? []).filter(
+          (item) =>
+            item.status === "failed" ||
+            item.status === "cancelled" ||
+            item.approvalState === "failed" ||
+            item.approvalState === "rejected"
+        ).length;
+        const tone = failedItems > 0
+          ? "error"
+          : pendingApprovals > 0 || task?.status === "waitingUser"
+            ? "loading"
+            : task?.status === "completed" || turn?.status === "completed"
+              ? "ready"
+              : task?.status === "active" || turn?.status === "running"
+                ? "active"
+                : "idle";
+        const statusLabel = task
+          ? taskStatusLabel(task.status)
+          : turn
+            ? turnStatusLabel(turn.status)
+            : sessionModeTrailLabel(session.interactionMode);
+        const summary =
+          task?.summary?.trim() ||
+          turn?.summary?.trim() ||
+          snapshot.turnItems.at(-1)?.summary?.trim() ||
+          "当前还没有结构化任务摘要。";
+        const meta = turn
+          ? `${turnIntentLabel(turn.intent)} · ${formatRuntimeTime(turn.updatedAt ?? turn.createdAt)}`
+          : `${sessionModeTrailLabel(session.interactionMode)} · ${formatRuntimeTime(session.updatedAt)}`;
+        const bucket = failedItems > 0
+          ? "blocked"
+          : pendingApprovals > 0 || task?.status === "waitingUser"
+            ? "waiting"
+            : task?.status === "completed" || task?.status === "cancelled" || turn?.status === "completed"
+              ? "done"
+              : "active";
+        let exceptionLabel = "";
+        let exceptionSummary = "";
+        if (failedItems > 0) {
+          exceptionLabel = "异常";
+          exceptionSummary = `${failedItems} 个失败或拒绝事件需要处理`;
+        } else if (pendingApprovals > 0) {
+          exceptionLabel = "待确认";
+          exceptionSummary = `${pendingApprovals} 个检查点等待你介入`;
+        } else if (task?.status === "waitingUser") {
+          exceptionLabel = "待决策";
+          exceptionSummary = "当前任务停在等待用户决策状态。";
+        }
+        return {
+          id: session.id,
+          title: task?.title || session.title,
+          statusLabel,
+          tone,
+          summary,
+          meta,
+          bucket,
+          hasException: Boolean(exceptionLabel),
+          exceptionLabel,
+          exceptionSummary,
+        };
+      }),
+    [sessions, runtimeSnapshotBySession]
+  );
+  const activeWorkstreamEntries = useMemo(
+    () => sessionRuntimeSummaries.filter((entry) => entry.bucket === "active"),
+    [sessionRuntimeSummaries]
+  );
+  const waitingWorkstreamEntries = useMemo(
+    () => sessionRuntimeSummaries.filter((entry) => entry.bucket === "waiting"),
+    [sessionRuntimeSummaries]
+  );
+  const doneWorkstreamEntries = useMemo(
+    () => sessionRuntimeSummaries.filter((entry) => entry.bucket === "done"),
+    [sessionRuntimeSummaries]
+  );
+  const exceptionEntries = useMemo(
+    () => sessionRuntimeSummaries.filter((entry) => entry.hasException),
+    [sessionRuntimeSummaries]
+  );
+  const activeSessionSummary = useMemo(
+    () => sessionRuntimeSummaries.find((entry) => entry.id === activeSessionId) ?? null,
+    [sessionRuntimeSummaries, activeSessionId]
+  );
 
   const fetchCodexStatus = async ({ showNotice = false } = {}) => {
     const status = normalizeLoginStatus(await desktop.codexLoginStatus());
@@ -2833,9 +3053,8 @@ export default function App() {
     : activeProvider === "manual"
       ? "当前为手动协作模式，发送后只会记录问题。"
       : activeSessionWorkspaceId
-        ? "Enter 发送，Shift+Enter 换行。"
+        ? "Enter 发送，Shift+Enter 换行。需要代码依据时，Solo 会按当前资源设置读取目录。"
         : "Enter 发送，Shift+Enter 换行。需要代码时点回形针。";
-  const sessionMessageCount = activeSession?.messages?.length ?? 0;
   const workspaceStatusText = activeSessionWorkspaceId
     ? activeWorkspace?.name ?? "已选择"
     : "按需添加";
@@ -2905,7 +3124,116 @@ export default function App() {
           ? taskStatusLabel(activeRuntimeTask.status)
           : "空";
   const runtimeItemList = activeRuntimeItems.slice(-6);
+  const runtimeTimelineItems = activeRuntimeItems.slice(-8).reverse();
+  const runtimePendingApprovalCount = activeRuntimeItems.filter(
+    (item) => item.approvalState === "pending"
+  ).length;
+  const runtimeFailedCount = activeRuntimeItems.filter(
+    (item) =>
+      item.status === "failed" ||
+      item.status === "cancelled" ||
+      item.approvalState === "failed" ||
+      item.approvalState === "rejected"
+  ).length;
+  const runtimeResourceCount =
+    (activeSessionWorkspaceId ? 1 : 0) +
+    (activeSessionMode === SESSION_MODE_WORKSPACE ? 1 : 0);
+  const runtimeWorkstreamLabel =
+    activeRuntimeTask?.title || activeSession?.title || "当前 workstream 尚未命名";
+  const runtimeTaskCount = activeRuntimeSnapshot.tasks.length;
+  const runtimeTurnCount = activeRuntimeSnapshot.turns.length;
+  const runtimeArtifactCount = previewProposals.length + (filePreview ? 1 : 0);
+  const runtimeExceptionCount = runtimePendingApprovalCount + runtimeFailedCount;
+  const activeRunLabel = activeRuntimeTurn
+    ? `${turnIntentLabel(activeRuntimeTurn.intent)} · ${turnStatusLabel(activeRuntimeTurn.status)}`
+    : "当前没有活跃 run";
+  const activeRunTimeLabel = activeRuntimeTurn
+    ? formatRuntimeTime(activeRuntimeTurn.updatedAt ?? activeRuntimeTurn.createdAt)
+    : "等待开始";
+  const activeRunSummary = activeRuntimeItems.length
+    ? truncateInline(
+        activeRuntimeItems.at(-1)?.summary || activeRuntimeItems.at(-1)?.content || "等待新的运行事件。",
+        96
+      )
+    : "当前还没有结构化运行事件。";
+  const runtimeFocusTitle = runtimeExceptionCount > 0
+    ? "需要介入"
+    : showPreviewCards || showDecisionDeck || runtimePendingApprovalCount > 0
+      ? "等待决策"
+      : activeRuntimeTurn
+        ? "执行健康"
+        : "等待任务";
+  const runtimeFocusDetail = runtimeExceptionCount > 0
+    ? `${runtimeExceptionCount} 个异常或待确认节点需要处理`
+    : showDecisionDeck
+      ? `${decisionOptions.length} 个方向等待选择`
+      : showPreviewCards
+        ? `${previewProposals.length} 个预览等待确认`
+        : activeRuntimeTurn
+          ? "当前运行正常推进，可继续观察时间线"
+          : "先创建任务或发送目标，让 Solo 启动第一条 run";
   const showPreviewPanel = previewState.loading || Boolean(previewState.error) || Boolean(filePreview);
+  const inspectorTabs = [
+    {
+      id: "trace",
+      label: "Trace",
+      description: `${runtimeTaskCount} task / ${runtimeTurnCount} turn`,
+      badgeTone: runtimePanelTone,
+      badgeText: runtimePanelStatus,
+    },
+    {
+      id: "artifacts",
+      label: "Artifacts",
+      description: runtimeArtifactCount > 0 ? `${runtimeArtifactCount} 个产物` : "暂无产物",
+      badgeTone: previewStateLabel === "empty" ? "idle" : previewStateLabel,
+      badgeText: runtimeArtifactCount > 0 ? String(runtimeArtifactCount) : "0",
+    },
+    {
+      id: "resources",
+      label: "Resources",
+      description: activeWorkspace?.name ?? "未附加资源",
+      badgeTone: inspectorWorkspaceState,
+      badgeText: String(runtimeResourceCount),
+    },
+    {
+      id: "controls",
+      label: "Controls",
+      description: runtimeFocusTitle,
+      badgeTone: runtimeExceptionCount > 0 ? "error" : showSuggestionPanel ? suggestionInspectorTone : "idle",
+      badgeText: runtimeExceptionCount > 0 ? String(runtimeExceptionCount) : showSuggestionPanel ? suggestionInspectorStatus : "空",
+    },
+  ];
+  const inspectorSummaryCards = [
+    {
+      label: "Focus",
+      value: runtimeFocusTitle,
+      detail: runtimeFocusDetail,
+      tone: runtimeExceptionCount > 0 ? "error" : runtimePanelTone,
+    },
+    {
+      label: "Run",
+      value: activeRunLabel,
+      detail: `${activeRunTimeLabel} · ${runtimeWorkstreamLabel}`,
+      tone: runtimePanelTone,
+    },
+    {
+      label: "Items",
+      value: `${activeRuntimeSnapshot.turnItems.length} 个事件`,
+      detail: `${runtimeTaskCount} task / ${runtimeTurnCount} turn / ${runtimeArtifactCount} artifact`,
+      tone: activeRuntimeSnapshot.turnItems.length > 0 ? "active" : "idle",
+    },
+    {
+      label: "Exceptions",
+      value: runtimeExceptionCount > 0 ? `${runtimeExceptionCount} 个待处理` : "运行正常",
+      detail:
+        runtimePendingApprovalCount > 0
+          ? `${runtimePendingApprovalCount} 个节点等待确认`
+          : runtimeFailedCount > 0
+            ? `${runtimeFailedCount} 个节点失败或被拒绝`
+            : "当前没有异常节点",
+      tone: runtimeExceptionCount > 0 ? "error" : "ready",
+    },
+  ];
   const composerPlaceholder = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
       ? "描述你想让 Solo 给出的方向建议；它会先生成方向卡，再由你点开预览。"
@@ -2924,9 +3252,6 @@ export default function App() {
     : collaborationAvailable
       ? `当前为对话模式。目录 ${activeWorkspace?.name ?? "当前项目"} 已作为可选上下文接入，只有切到工作区协作时才会参与。`
       : "当前为对话模式。先直接提问；需要代码上下文时再补充目录并进入工作区协作。";
-  const workspaceContextText = collaborationAvailable
-    ? `${activeWorkspace?.name ?? "当前项目"} · 仅在工作区协作里使用`
-    : "当前没有代码上下文，先对话也可以";
   const modeIntentText = collaborationEnabled
     ? `这一轮会结合工作区，当前阶段：${turnIntentLabel(activeTurnIntent)}`
     : collaborationAvailable
@@ -2942,8 +3267,8 @@ export default function App() {
       ? "代码目录只是可选上下文。只有你切到“工作区协作”后，它才会真正参与回答。"
       : "先直接提问；只有需要代码依据时再补充目录。";
   const composerContextButtonLabel = activeSessionWorkspaceId
-    ? `更换代码上下文，当前为 ${activeWorkspace?.name ?? "已选目录"}`
-    : "添加代码上下文";
+    ? `更换附加资源，当前为 ${activeWorkspace?.name ?? "已选目录"}`
+    : "附加资源";
 
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
@@ -3106,57 +3431,132 @@ export default function App() {
           <section className="panel-block panel-sessions">
             <div className="section-header">
               <div>
-                <p className="section-eyebrow">Sessions</p>
-                <div className="section-title-row">
-                  <h2>会话</h2>
-                  <span className="section-count">{sessions.length}</span>
-                </div>
+                  <p className="section-eyebrow">Workstreams</p>
+                  <div className="section-title-row">
+                    <h2>任务流</h2>
+                    <span className="section-count">{sessions.length}</span>
+                  </div>
               </div>
               <button type="button" className="ghost-button" onClick={handleCreateSession}>
                 新建
               </button>
             </div>
-            <div className="session-list">
-              {sessions.map((session) => (
-                <div
-                  key={session.id}
-                  className={`session-card ${session.id === activeSessionId ? "is-active" : ""}`}
-                >
-                  <button
-                    type="button"
-                    className={`session-main ${session.id === activeSessionId ? "is-active" : ""}`}
-                    onClick={() => handleSelectSession(session.id)}
-                    aria-label={`打开会话 ${session.title}`}
-                  >
-                    <div className="session-row">
-                      <span className="session-title">{session.title}</span>
-                      <span className="list-badge">{session.messages?.length ?? 0}</span>
-                    </div>
-                    <span className="session-meta">{sessionModeTrailLabel(session.interactionMode)}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-button session-delete-button"
-                    onClick={() => handleDeleteSession(session.id)}
-                    aria-label={`删除会话 ${session.title}`}
-                    disabled={chatSending && session.id === activeSessionId}
-                  >
-                    删除
-                  </button>
+            <div className="workstream-groups">
+              <section className="workstream-group">
+                <div className="workstream-group-head">
+                  <span className="section-eyebrow">Active</span>
+                  <span className="section-count">{activeWorkstreamEntries.length}</span>
                 </div>
-              ))}
+                {activeWorkstreamEntries.length ? (
+                  <div className="session-list">
+                    {activeWorkstreamEntries.map((entry) => (
+                      <WorkstreamCard
+                        key={entry.id}
+                        entry={entry}
+                        active={entry.id === activeSessionId}
+                        onSelect={handleSelectSession}
+                        onDelete={handleDeleteSession}
+                        deletingDisabled={chatSending && entry.id === activeSessionId}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="panel-collapsed-note">
+                    <p>当前没有进行中的任务流。</p>
+                  </div>
+                )}
+              </section>
+
+              <section className="workstream-group">
+                <div className="workstream-group-head">
+                  <span className="section-eyebrow">Waiting</span>
+                  <span className="section-count">{waitingWorkstreamEntries.length}</span>
+                </div>
+                {waitingWorkstreamEntries.length ? (
+                  <div className="session-list">
+                    {waitingWorkstreamEntries.map((entry) => (
+                      <WorkstreamCard
+                        key={entry.id}
+                        entry={entry}
+                        active={entry.id === activeSessionId}
+                        onSelect={handleSelectSession}
+                        onDelete={handleDeleteSession}
+                        deletingDisabled={chatSending && entry.id === activeSessionId}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="panel-collapsed-note">
+                    <p>当前没有等待你确认的任务流。</p>
+                  </div>
+                )}
+              </section>
+
+              <section className="workstream-group">
+                <div className="workstream-group-head">
+                  <span className="section-eyebrow">Done</span>
+                  <span className="section-count">{doneWorkstreamEntries.length}</span>
+                </div>
+                {doneWorkstreamEntries.length ? (
+                  <div className="session-list">
+                    {doneWorkstreamEntries.map((entry) => (
+                      <WorkstreamCard
+                        key={entry.id}
+                        entry={entry}
+                        active={entry.id === activeSessionId}
+                        onSelect={handleSelectSession}
+                        onDelete={handleDeleteSession}
+                        deletingDisabled={chatSending && entry.id === activeSessionId}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="panel-collapsed-note">
+                    <p>当前还没有完成的任务流。</p>
+                  </div>
+                )}
+              </section>
             </div>
+          </section>
+
+          <section className="panel-block panel-exceptions">
+            <div className="section-header">
+              <div>
+                <p className="section-eyebrow">Exceptions</p>
+                <div className="section-title-row">
+                  <h2>异常收件箱</h2>
+                  <span className="section-count">{exceptionEntries.length}</span>
+                </div>
+                <p className="section-note">集中查看失败、阻塞和待确认节点。</p>
+              </div>
+            </div>
+            {exceptionEntries.length ? (
+              <div className="exception-list">
+                {exceptionEntries.map((entry) => (
+                  <ExceptionCard
+                    key={entry.id}
+                    entry={entry}
+                    active={entry.id === activeSessionId}
+                    onSelect={handleSelectSession}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="panel-collapsed-note">
+                <p>当前没有需要立即处理的异常。</p>
+              </div>
+            )}
           </section>
 
           <section className="panel-block panel-workspaces">
             <div className="section-header">
               <div>
-                <p className="section-eyebrow">Context</p>
-                <div className="section-title-row">
-                  <h2>代码上下文</h2>
-                  <span className="section-count">{workspaces.length}</span>
-                </div>
-                <p className="section-note">默认先对话。需要代码时，用输入框旁的回形针补充目录。</p>
+                  <p className="section-eyebrow">Resources</p>
+                  <div className="section-title-row">
+                    <h2>附加资源</h2>
+                    <span className="section-count">{workspaces.length}</span>
+                  </div>
+                  <p className="section-note">目录只是资源。需要时再通过回形针附加到当前任务流。</p>
               </div>
             </div>
             {workspaces.length ? (
@@ -3208,10 +3608,10 @@ export default function App() {
           >
             <div className="section-header">
               <div>
-                <p className="section-eyebrow">Explorer</p>
-                <div className="section-title-row">
-                  <h2>文件树</h2>
-                </div>
+                  <p className="section-eyebrow">Resource Lens</p>
+                  <div className="section-title-row">
+                    <h2>资源浏览</h2>
+                  </div>
               </div>
               <button
                 type="button"
@@ -3261,104 +3661,40 @@ export default function App() {
           <div className="chat-head">
             <div className="chat-head-shell">
               <div className="chat-head-main">
-                <p className="section-eyebrow">Conversation</p>
-                <h2>{activeSession?.title ?? "新会话"}</h2>
+                <p className="section-eyebrow">Workstream</p>
+                <h2>{runtimeWorkstreamLabel}</h2>
                 <p className="chat-subtitle">{chatSubtitle}</p>
-                <div className="chat-context-strip">
+                <div className="chat-context-strip task-context-strip">
                   <div className="chat-context-item">
-                    <span className="chat-context-label">代码上下文</span>
-                    <strong className="chat-context-value">{workspaceContextText}</strong>
+                    <span className="chat-context-label">当前任务</span>
+                    <strong className="chat-context-value">
+                      {activeRuntimeTask
+                        ? `${taskStatusLabel(activeRuntimeTask.status)} · ${activeRuntimeTask.title}`
+                        : "尚未建立任务骨架"}
+                    </strong>
                   </div>
                   <div className="chat-context-item">
-                    <span className="chat-context-label">当前方式</span>
-                    <strong className="chat-context-value">{modeIntentText}</strong>
+                    <span className="chat-context-label">活跃 Run</span>
+                    <strong className="chat-context-value">{activeRunLabel}</strong>
+                  </div>
+                  <div className="chat-context-item">
+                    <span className="chat-context-label">异常 / 检查点</span>
+                    <strong className="chat-context-value">
+                      {runtimeExceptionCount > 0 ? `${runtimeExceptionCount} 个待处理` : "当前没有异常"}
+                    </strong>
+                  </div>
+                  <div className="chat-context-item">
+                    <span className="chat-context-label">附加资源</span>
+                    <strong className="chat-context-value">
+                      {activeWorkspace?.name ?? "当前没有目录资源"}
+                    </strong>
                   </div>
                   <p className="chat-context-note">{modeGuidanceText}</p>
                 </div>
               </div>
-              <div className="compact-row">
-                <div className="mode-switch" role="tablist" aria-label="会话模式">
-                  <button
-                    type="button"
-                    className={`ghost-button mode-switch-button ${
-                      activeSessionMode === SESSION_MODE_CONVERSATION ? "is-active" : ""
-                    }`}
-                    onClick={() => void handleSetSessionMode(SESSION_MODE_CONVERSATION)}
-                    aria-pressed={activeSessionMode === SESSION_MODE_CONVERSATION}
-                  >
-                    对话
-                  </button>
-                  <button
-                    type="button"
-                    className={`ghost-button mode-switch-button ${
-                      activeSessionMode === SESSION_MODE_WORKSPACE ? "is-active" : ""
-                    }`}
-                    disabled={!collaborationAvailable}
-                    onClick={() => void handleSetSessionMode(SESSION_MODE_WORKSPACE)}
-                    aria-pressed={activeSessionMode === SESSION_MODE_WORKSPACE}
-                    title={
-                      collaborationAvailable ? "结合当前工作区协作" : "先选择一个代码目录，再进入工作区协作"
-                    }
-                  >
-                    工作区协作
-                  </button>
-                </div>
-                {collaborationEnabled ? (
-                  <div className="mode-switch turn-intent-switch" role="tablist" aria-label="当前回合阶段">
-                    <button
-                      type="button"
-                      className={`ghost-button mode-switch-button ${
-                        activeTurnIntent === TURN_INTENT_AUTO ? "is-active" : ""
-                      }`}
-                      onClick={() =>
-                        setTurnIntentBySession((current) => ({
-                          ...current,
-                          [activeSessionId]: TURN_INTENT_AUTO,
-                        }))
-                      }
-                      aria-pressed={activeTurnIntent === TURN_INTENT_AUTO}
-                    >
-                      协作分析
-                    </button>
-                    <button
-                      type="button"
-                      className={`ghost-button mode-switch-button ${
-                        activeTurnIntent === TURN_INTENT_CHOICE ? "is-active" : ""
-                      }`}
-                      onClick={() =>
-                        setTurnIntentBySession((current) => ({
-                          ...current,
-                          [activeSessionId]: TURN_INTENT_CHOICE,
-                        }))
-                      }
-                      aria-pressed={activeTurnIntent === TURN_INTENT_CHOICE}
-                    >
-                      方向建议
-                    </button>
-                    <button
-                      type="button"
-                      className={`ghost-button mode-switch-button ${
-                        activeTurnIntent === TURN_INTENT_PREVIEW ? "is-active" : ""
-                      }`}
-                      onClick={() =>
-                        setTurnIntentBySession((current) => ({
-                          ...current,
-                          [activeSessionId]: TURN_INTENT_PREVIEW,
-                        }))
-                      }
-                      aria-pressed={activeTurnIntent === TURN_INTENT_PREVIEW}
-                    >
-                      具体预览
-                    </button>
-                  </div>
-                ) : null}
-                {activeSessionWorkspaceId ? (
-                  <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                    清除上下文
-                  </button>
-                ) : null}
+              <div className="chat-head-actions">
                 <button type="button" className="ghost-button" onClick={handleCreateSession}>
-                  新会话
+                  新任务流
                 </button>
                 {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
                   <button
@@ -3375,6 +3711,182 @@ export default function App() {
           </div>
           <div className="chat-scroll">
             <div className="conversation-stack">
+              {!(providerNeedsCodexLogin && !codexAuth.loggedIn) ? (
+                <>
+                  <section className="shell-card task-cockpit">
+                    <div className="task-panel-head">
+                      <div>
+                        <p className="section-eyebrow">Task Board</p>
+                        <h3>工作流总览</h3>
+                      </div>
+                      <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{runtimePanelStatus}</span>
+                    </div>
+                    <div className="runtime-summary-grid">
+                      <RuntimeSummaryCard
+                        label="任务"
+                        value={`${runtimeTaskCount}`}
+                        tone={activeRuntimeTask ? runtimeTone(activeRuntimeTask.status) : "idle"}
+                        detail={
+                          activeRuntimeTask
+                            ? truncateInline(activeRuntimeTask.title || "当前任务进行中", 44)
+                            : "当前还没有任务骨架"
+                        }
+                      />
+                      <RuntimeSummaryCard
+                        label="活跃 Run"
+                        value={`${runtimeTurnCount}`}
+                        tone={activeRuntimeTurn ? runtimeTone(activeRuntimeTurn.status) : "idle"}
+                        detail={activeRunTimeLabel}
+                      />
+                      <RuntimeSummaryCard
+                        label="异常 / 待确认"
+                        value={`${runtimeExceptionCount}`}
+                        tone={runtimeExceptionCount > 0 ? "error" : "ready"}
+                        detail={runtimeFocusDetail}
+                      />
+                      <RuntimeSummaryCard
+                        label="资源 / 产物"
+                        value={`${runtimeResourceCount} / ${runtimeArtifactCount}`}
+                        tone={runtimeArtifactCount > 0 || runtimeResourceCount > 0 ? "active" : "idle"}
+                        detail={activeWorkspace?.name ?? "当前没有附加目录资源"}
+                      />
+                    </div>
+                  </section>
+
+                  <section className="shell-card task-board-shell">
+                    <div className="task-panel-head">
+                      <div>
+                        <p className="section-eyebrow">Workstream Board</p>
+                        <h3>多任务编排看板</h3>
+                      </div>
+                      <span className="drawer-chip drawer-chip-active">
+                        {`${sessionRuntimeSummaries.length} 个任务流`}
+                      </span>
+                    </div>
+                    <p className="task-board-note">
+                      主面板先看队列状态，再下钻到当前选中任务的详情和运行时间线。
+                    </p>
+                    <div className="task-board-grid">
+                      <TaskBoardLane
+                        title="执行中"
+                        eyebrow="In Progress"
+                        tone="active"
+                        entries={activeWorkstreamEntries}
+                        activeSessionId={activeSessionId}
+                        onSelect={handleSelectSession}
+                        emptyLabel="当前没有正在推进的任务流。"
+                      />
+                      <TaskBoardLane
+                        title="等待中"
+                        eyebrow="Waiting"
+                        tone="loading"
+                        entries={waitingWorkstreamEntries}
+                        activeSessionId={activeSessionId}
+                        onSelect={handleSelectSession}
+                        emptyLabel="当前没有等待决策或确认的任务流。"
+                      />
+                      <TaskBoardLane
+                        title="已完成"
+                        eyebrow="Done"
+                        tone="ready"
+                        entries={doneWorkstreamEntries}
+                        activeSessionId={activeSessionId}
+                        onSelect={handleSelectSession}
+                        emptyLabel="当前还没有完成态任务流。"
+                      />
+                    </div>
+                  </section>
+
+                  <div className="task-flow-grid">
+                    <section className="shell-card task-stage-card">
+                      <div className="task-panel-head">
+                        <div>
+                          <p className="section-eyebrow">Selected Workstream</p>
+                          <h3>选中任务详情</h3>
+                        </div>
+                        <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{runtimePanelStatus}</span>
+                      </div>
+                      <div className="drawer-meta-grid">
+                        <div className="drawer-meta-row">
+                          <span className="drawer-meta-label">任务流</span>
+                          <span className="drawer-meta-value">
+                            {activeSessionSummary?.title || "先创建任务流"}
+                          </span>
+                        </div>
+                        <div className="drawer-meta-row">
+                          <span className="drawer-meta-label">编排态</span>
+                          <span className="drawer-meta-value">
+                            {activeSessionSummary?.statusLabel || "空"}
+                          </span>
+                        </div>
+                        <div className="drawer-meta-row">
+                          <span className="drawer-meta-label">当前任务</span>
+                          <span className="drawer-meta-value">
+                            {activeRuntimeTask?.title || "先通过下方 command bar 创建任务"}
+                          </span>
+                        </div>
+                        <div className="drawer-meta-row">
+                          <span className="drawer-meta-label">Run</span>
+                          <span className="drawer-meta-value">{activeRunLabel}</span>
+                        </div>
+                        <div className="drawer-meta-row">
+                          <span className="drawer-meta-label">摘要</span>
+                          <span className="drawer-meta-value">{activeRunSummary}</span>
+                        </div>
+                      </div>
+                      <div className={`task-focus-banner tone-${runtimeExceptionCount > 0 ? "error" : "active"}`}>
+                        <span className="task-focus-label">{runtimeFocusTitle}</span>
+                        <p>{runtimeFocusDetail}</p>
+                      </div>
+                    </section>
+
+                    <section className="shell-card task-stage-card">
+                      <div className="task-panel-head">
+                        <div>
+                          <p className="section-eyebrow">Run Timeline</p>
+                          <h3>最近事件</h3>
+                        </div>
+                        <span className="drawer-chip drawer-chip-idle">
+                          {`${activeRuntimeSnapshot.turnItems.length} item`}
+                        </span>
+                      </div>
+                      <div className="task-timeline-list">
+                        {runtimePanelState.error ? (
+                          <div className="status-banner status-banner-error">
+                            <strong>Runtime 读取失败</strong>
+                            <span>{runtimePanelState.error}</span>
+                          </div>
+                        ) : runtimeTimelineItems.length > 0 ? (
+                          runtimeTimelineItems.map((item) => (
+                            <div key={item.id} className="task-timeline-item">
+                              <div className="task-timeline-marker" aria-hidden="true" />
+                              <div className="task-timeline-body">
+                                <div className="task-timeline-head">
+                                  <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
+                                  <span
+                                    className={`drawer-chip drawer-chip-${runtimeTone(
+                                      item.status,
+                                      item.approvalState
+                                    )}`}
+                                  >
+                                    {runtimeItemStateLabel(item)}
+                                  </span>
+                                </div>
+                                <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
+                                <p>{item.summary || truncateInline(item.content || "暂无摘要。", 120)}</p>
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="proposal-empty">
+                            <p>当前还没有运行事件。先创建任务或发送目标，让 Solo 启动第一条 run。</p>
+                          </div>
+                        )}
+                      </div>
+                    </section>
+                  </div>
+                </>
+              ) : null}
               {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
                 <div className="shell-card hero-card">
                   <p className="section-eyebrow">Codex</p>
@@ -3515,8 +4027,8 @@ export default function App() {
                 </>
               ) : (
                 <div className="empty-state hero">
-                  <p className="section-eyebrow">Conversation</p>
-                  <h2>先开始对话，代码上下文按需再加。</h2>
+                  <p className="section-eyebrow">Operator Log</p>
+                  <h2>先创建任务，再决定是否补充资源。</h2>
                   <p>
                     {collaborationEnabled
                       ? "你已经进入工作区协作。Solo 会先查看相关文件，再给出建议、权衡和改动预览。"
@@ -3535,6 +4047,43 @@ export default function App() {
 
           <div className="composer">
             <div className="composer-shell">
+              <div className="composer-bar-head">
+                <div>
+                  <p className="section-eyebrow">Command Bar</p>
+                  <strong>创建任务或追加干预</strong>
+                </div>
+                <span className={`drawer-chip drawer-chip-${activeSessionWorkspaceId ? "active" : "idle"}`}>
+                  {activeSessionWorkspaceId ? "已附加资源" : "未附加资源"}
+                </span>
+              </div>
+              {activeSessionWorkspaceId ? (
+                <div className="composer-resource-strip">
+                  <div className="composer-resource-main">
+                    <span className="composer-resource-label">当前资源</span>
+                    <strong>{activeWorkspace?.name ?? "已选目录"}</strong>
+                    <span className="composer-resource-path">
+                      {activeWorkspace?.path ?? "目录路径暂不可用"}
+                    </span>
+                  </div>
+                  <div className="composer-resource-actions">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => setWorkspaceModalOpen(true)}
+                    >
+                      更换
+                    </button>
+                    <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
+                      移除
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="composer-resource-empty">
+                  <PaperclipIcon />
+                  <span>目录只是附加资源。需要代码上下文时，再用回形针添加。</span>
+                </div>
+              )}
               <textarea
                 className="composer-input"
                 value={draft}
@@ -3574,184 +4123,429 @@ export default function App() {
         <aside className="inspector">
           <div className="inspector-head">
             <div>
-              <p className="section-eyebrow">Inspector</p>
-              <h2>上下文与预览</h2>
+              <p className="section-eyebrow">Run Detail</p>
+              <h2>运行详情</h2>
             </div>
-            <span className="section-count">{modeLabel}</span>
+            <span className="section-count">{runtimePanelStatus}</span>
+          </div>
+
+          <div className="inspector-summary-strip" aria-label="运行摘要">
+            {inspectorSummaryCards.map((card) => (
+              <article key={card.label} className={`inspector-summary-card tone-${card.tone}`}>
+                <span className="section-eyebrow">{card.label}</span>
+                <strong>{card.value}</strong>
+                <p>{card.detail}</p>
+              </article>
+            ))}
+          </div>
+
+          <div className="inspector-tablist" role="tablist" aria-label="运行详情分区">
+            {inspectorTabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                id={`inspector-tab-${tab.id}`}
+                role="tab"
+                aria-selected={inspectorTab === tab.id}
+                aria-controls={`inspector-panel-${tab.id}`}
+                className={`inspector-tab ${inspectorTab === tab.id ? "is-active" : ""}`}
+                onClick={() => setInspectorTab(tab.id)}
+              >
+                <span className="inspector-tab-topline">
+                  <span className="inspector-tab-label">{tab.label}</span>
+                  <span className={`drawer-chip drawer-chip-${tab.badgeTone}`}>{tab.badgeText}</span>
+                </span>
+                <span className="inspector-tab-description">{tab.description}</span>
+              </button>
+            ))}
           </div>
 
           <div className="inspector-scroll">
-            <section className="drawer-panel">
-              <div className="drawer-panel-head">
-                <div className="drawer-panel-title">
-                  <span className="section-eyebrow">Context</span>
-                  <strong>当前上下文</strong>
-                </div>
-                <span className={`drawer-chip drawer-chip-${inspectorWorkspaceState}`}>
-                  {inspectorWorkspaceStateText}
-                </span>
-              </div>
-              <div className="drawer-meta-grid">
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">代码上下文</span>
-                  <span className="drawer-meta-value">{activeWorkspace?.name ?? "未选择"}</span>
-                </div>
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">模式</span>
-                  <span className="drawer-meta-value">
-                    {collaborationEnabled ? "工作区协作" : "对话"}
-                  </span>
-                </div>
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">消息</span>
-                  <span className="drawer-meta-value">
-                    {activeSession ? `${sessionMessageCount} 条消息` : "请先创建会话。"}
-                  </span>
-                </div>
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">会话</span>
-                  <span className="drawer-meta-value">{activeSession?.title ?? "暂无会话"}</span>
-                </div>
-              </div>
-            </section>
-
-            <section className="drawer-panel">
-              <div className="drawer-panel-head">
-                <div className="drawer-panel-title">
-                  <span className="section-eyebrow">Runtime</span>
-                  <strong>当前任务流</strong>
-                </div>
-                <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>
-                  {runtimePanelStatus}
-                </span>
-              </div>
-              <div className="drawer-meta-grid">
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">任务</span>
-                  <span className="drawer-meta-value">
-                    {activeRuntimeTask?.title || "当前还没有任务骨架。"}
-                  </span>
-                </div>
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">任务态</span>
-                  <span className="drawer-meta-value">
-                    {activeRuntimeTask ? taskStatusLabel(activeRuntimeTask.status) : "空"}
-                  </span>
-                </div>
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">回合</span>
-                  <span className="drawer-meta-value">
-                    {activeRuntimeTurn
-                      ? `${turnIntentLabel(activeRuntimeTurn.intent)} · ${formatRuntimeTime(
-                          activeRuntimeTurn.updatedAt ?? activeRuntimeTurn.createdAt
-                        )}`
-                      : "当前还没有回合记录。"}
-                  </span>
-                </div>
-                <div className="drawer-meta-row">
-                  <span className="drawer-meta-label">计数</span>
-                  <span className="drawer-meta-value">
-                    {`${activeRuntimeSnapshot.tasks.length} task / ${activeRuntimeSnapshot.turns.length} turn / ${activeRuntimeSnapshot.turnItems.length} item`}
-                  </span>
-                </div>
-              </div>
-              <div className="drawer-preview-body">
-                {runtimePanelState.error ? (
-                  <div className="status-banner status-banner-error">
-                    <strong>Runtime 读取失败</strong>
-                    <span>{runtimePanelState.error}</span>
+            {inspectorTab === "trace" ? (
+              <div
+                id="inspector-panel-trace"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-trace"
+                className="inspector-panel-stack"
+              >
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Trace</span>
+                      <strong>运行轨迹</strong>
+                    </div>
+                    <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{runtimePanelStatus}</span>
                   </div>
-                ) : runtimeItemList.length > 0 ? (
-                  <div className="runtime-item-list">
-                    {runtimeItemList.map((item) => (
-                      <div key={item.id} className="runtime-item-card">
-                        <div className="runtime-item-head">
-                          <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
-                          <span
-                            className={`drawer-chip drawer-chip-${runtimeTone(
-                              item.status,
-                              item.approvalState
-                            )}`}
-                          >
-                            {runtimeItemStateLabel(item)}
-                          </span>
-                        </div>
-                        <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
-                        <p>{item.summary || truncateInline(item.content || "暂无摘要。", 96)}</p>
+                  <div className="drawer-meta-grid">
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">焦点</span>
+                      <span className="drawer-meta-value">{runtimeFocusDetail}</span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">任务</span>
+                      <span className="drawer-meta-value">
+                        {activeRuntimeTask?.title || "当前还没有任务骨架。"}
+                      </span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">回合</span>
+                      <span className="drawer-meta-value">{activeRunLabel}</span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">最近</span>
+                      <span className="drawer-meta-value">{activeRunSummary}</span>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Events</span>
+                      <strong>事件时间线</strong>
+                    </div>
+                    <span className="drawer-chip drawer-chip-idle">{`${activeRuntimeSnapshot.turnItems.length} item`}</span>
+                  </div>
+                  <div className="drawer-preview-body">
+                    {runtimePanelState.error ? (
+                      <div className="status-banner status-banner-error">
+                        <strong>Runtime 读取失败</strong>
+                        <span>{runtimePanelState.error}</span>
                       </div>
-                    ))}
+                    ) : runtimeItemList.length > 0 ? (
+                      <div className="runtime-item-list">
+                        {runtimeItemList.map((item) => (
+                          <div key={item.id} className="runtime-item-card">
+                            <div className="runtime-item-head">
+                              <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
+                              <span
+                                className={`drawer-chip drawer-chip-${runtimeTone(
+                                  item.status,
+                                  item.approvalState
+                                )}`}
+                              >
+                                {runtimeItemStateLabel(item)}
+                              </span>
+                            </div>
+                            <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
+                            <p>{item.summary || truncateInline(item.content || "暂无摘要。", 96)}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="proposal-empty">
+                        <p>当前会话还没有可展示的结构化 item。</p>
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <div className="proposal-empty">
-                    <p>当前会话还没有可展示的结构化 item。</p>
-                  </div>
-                )}
+                </section>
               </div>
-            </section>
-
-            {showSuggestionPanel ? (
-              <section className="drawer-panel drawer-panel-proposals">
-                <div className="drawer-panel-head">
-                  <div className="drawer-panel-title">
-                    <span className="section-eyebrow">Suggestions</span>
-                    <strong>当前阶段</strong>
-                  </div>
-                  <span className={`drawer-chip drawer-chip-${suggestionInspectorTone}`}>
-                    {suggestionInspectorStatus}
-                  </span>
-                </div>
-                <div className="drawer-preview-body">
-                  {proposalPanelState.error ? (
-                    <div className="status-banner status-banner-error">
-                      <strong>加载失败</strong>
-                      <span>{proposalPanelState.error}</span>
-                    </div>
-                  ) : (
-                    <div className="proposal-empty">
-                      <p>
-                        {showDecisionDeck
-                          ? `主区有 ${decisionOptions.length} 个方向卡，先选一个方向。`
-                          : previewDeckActive
-                            ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
-                            : proposalPanelState.loading
-                              ? "正在根据你刚选的方向展开具体预览…"
-                              : selectedDecisionOption
-                                ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
-                                : "当前没有额外建议。"}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </section>
             ) : null}
 
-            {showPreviewPanel ? (
-              <section className="drawer-panel drawer-panel-preview is-grow">
-                <div className="drawer-panel-head">
-                  <div className="drawer-panel-title">
-                    <span className="section-eyebrow">Preview</span>
-                    <strong>{previewTitle}</strong>
-                  </div>
-                  <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
-                </div>
-                <div className="drawer-preview-body">
-                  {previewState.loading ? <p>正在读取文件…</p> : null}
-                  {previewState.error ? (
-                    <div className="status-banner status-banner-error">
-                      <strong>预览失败</strong>
-                      <span>{previewState.error}</span>
+            {inspectorTab === "artifacts" ? (
+              <div
+                id="inspector-panel-artifacts"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-artifacts"
+                className="inspector-panel-stack"
+              >
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Artifacts</span>
+                      <strong>产物面板</strong>
                     </div>
-                  ) : null}
-                  {filePreview ? (
-                    <>
-                      <pre>{filePreview.content}</pre>
-                      {filePreview.isTruncated ? (
-                        <p className="preview-note">该文件较大，当前只显示前 12000 个字符预览。</p>
+                    <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
+                  </div>
+                  <div className="drawer-meta-grid">
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">文件</span>
+                      <span className="drawer-meta-value">{previewTitle}</span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">状态</span>
+                      <span className="drawer-meta-value">
+                        {showPreviewPanel
+                          ? "右侧已载入文件预览"
+                          : previewDeckActive
+                            ? `主区有 ${previewProposals.length} 张预览卡`
+                            : showDecisionDeck
+                              ? `主区有 ${decisionOptions.length} 个方向卡`
+                              : "当前没有可展开的文件产物"}
+                      </span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">产物数</span>
+                      <span className="drawer-meta-value">{`${runtimeArtifactCount} 个产物或预览节点`}</span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">说明</span>
+                      <span className="drawer-meta-value">
+                        这里专门查看文件预览与可交付结果，不再和运行事件混在一起。
+                      </span>
+                    </div>
+                  </div>
+                </section>
+
+                {showPreviewPanel ? (
+                  <section className="drawer-panel drawer-panel-preview is-grow">
+                    <div className="drawer-panel-head">
+                      <div className="drawer-panel-title">
+                        <span className="section-eyebrow">Preview</span>
+                        <strong>{previewTitle}</strong>
+                      </div>
+                      <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
+                    </div>
+                    <div className="drawer-preview-body">
+                      {previewState.loading ? <p>正在读取文件…</p> : null}
+                      {previewState.error ? (
+                        <div className="status-banner status-banner-error">
+                          <strong>预览失败</strong>
+                          <span>{previewState.error}</span>
+                        </div>
                       ) : null}
-                    </>
-                  ) : null}
-                </div>
-              </section>
+                      {filePreview ? (
+                        <>
+                          <pre>{filePreview.content}</pre>
+                          {filePreview.isTruncated ? (
+                            <p className="preview-note">该文件较大，当前只显示前 12000 个字符预览。</p>
+                          ) : null}
+                        </>
+                      ) : null}
+                    </div>
+                  </section>
+                ) : (
+                  <section className="drawer-panel">
+                    <div className="drawer-panel-head">
+                      <div className="drawer-panel-title">
+                        <span className="section-eyebrow">Preview</span>
+                        <strong>等待产物</strong>
+                      </div>
+                      <span className="drawer-chip drawer-chip-idle">空</span>
+                    </div>
+                    <div className="drawer-preview-body">
+                      <div className="proposal-empty">
+                        <p>
+                          {previewDeckActive
+                            ? "主区已经生成预览卡，确认后这里会显示更具体的文件内容。"
+                            : "当前还没有文件级产物。先选择方向、展开预览，或者让 Solo 读取一个具体文件。"}
+                        </p>
+                      </div>
+                    </div>
+                  </section>
+                )}
+              </div>
+            ) : null}
+
+            {inspectorTab === "resources" ? (
+              <div
+                id="inspector-panel-resources"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-resources"
+                className="inspector-panel-stack"
+              >
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Resources</span>
+                      <strong>当前资源</strong>
+                    </div>
+                    <span className={`drawer-chip drawer-chip-${inspectorWorkspaceState}`}>
+                      {inspectorWorkspaceStateText}
+                    </span>
+                  </div>
+                  <div className="drawer-meta-grid">
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">目录</span>
+                      <span className="drawer-meta-value">{activeWorkspace?.name ?? "未附加目录资源"}</span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">路径</span>
+                      <span className="drawer-meta-value drawer-meta-path">
+                        {activeWorkspace?.path ?? "需要代码上下文时，再通过回形针添加目录。"}
+                      </span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">方式</span>
+                      <span className="drawer-meta-value">{modeIntentText}</span>
+                    </div>
+                    <div className="drawer-meta-row">
+                      <span className="drawer-meta-label">会话</span>
+                      <span className="drawer-meta-value">
+                        {activeSession?.title ?? "请先创建会话。"}
+                      </span>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Boundary</span>
+                      <strong>资源边界</strong>
+                    </div>
+                    <span className="drawer-chip drawer-chip-idle">{`${runtimeResourceCount} 个资源`}</span>
+                  </div>
+                  <div className="drawer-preview-body">
+                    <div className="proposal-empty">
+                      <p>{modeGuidanceText}</p>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {inspectorTab === "controls" ? (
+              <div
+                id="inspector-panel-controls"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-controls"
+                className="inspector-panel-stack"
+              >
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Checkpoint</span>
+                      <strong>待决策节点</strong>
+                    </div>
+                    <span className={`drawer-chip drawer-chip-${suggestionInspectorTone}`}>
+                      {suggestionInspectorStatus}
+                    </span>
+                  </div>
+                  <div className="drawer-preview-body">
+                    {proposalPanelState.error ? (
+                      <div className="status-banner status-banner-error">
+                        <strong>加载失败</strong>
+                        <span>{proposalPanelState.error}</span>
+                      </div>
+                    ) : (
+                      <div className="proposal-empty">
+                        <p>
+                          {showDecisionDeck
+                            ? `主区有 ${decisionOptions.length} 个方向卡，先选一个方向。`
+                            : previewDeckActive
+                              ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
+                              : proposalPanelState.loading
+                                ? "正在根据你刚选的方向展开具体预览…"
+                                : selectedDecisionOption
+                                  ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
+                                  : "当前没有额外建议。"}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </section>
+
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
+                      <span className="section-eyebrow">Controls</span>
+                      <strong>控制面板</strong>
+                    </div>
+                    <span className="drawer-chip drawer-chip-idle">{modeLabel}</span>
+                  </div>
+                  <div className="drawer-preview-body control-stack">
+                    <div className="mode-switch" role="tablist" aria-label="会话模式">
+                      <button
+                        type="button"
+                        className={`ghost-button mode-switch-button ${
+                          activeSessionMode === SESSION_MODE_CONVERSATION ? "is-active" : ""
+                        }`}
+                        onClick={() => void handleSetSessionMode(SESSION_MODE_CONVERSATION)}
+                        aria-pressed={activeSessionMode === SESSION_MODE_CONVERSATION}
+                      >
+                        对话
+                      </button>
+                      <button
+                        type="button"
+                        className={`ghost-button mode-switch-button ${
+                          activeSessionMode === SESSION_MODE_WORKSPACE ? "is-active" : ""
+                        }`}
+                        disabled={!collaborationAvailable}
+                        onClick={() => void handleSetSessionMode(SESSION_MODE_WORKSPACE)}
+                        aria-pressed={activeSessionMode === SESSION_MODE_WORKSPACE}
+                        title={
+                          collaborationAvailable ? "结合当前工作区协作" : "先选择一个代码目录，再进入工作区协作"
+                        }
+                      >
+                        工作区协作
+                      </button>
+                    </div>
+                    {collaborationEnabled ? (
+                      <div className="mode-switch turn-intent-switch" role="tablist" aria-label="当前回合阶段">
+                        <button
+                          type="button"
+                          className={`ghost-button mode-switch-button ${
+                            activeTurnIntent === TURN_INTENT_AUTO ? "is-active" : ""
+                          }`}
+                          onClick={() =>
+                            setTurnIntentBySession((current) => ({
+                              ...current,
+                              [activeSessionId]: TURN_INTENT_AUTO,
+                            }))
+                          }
+                          aria-pressed={activeTurnIntent === TURN_INTENT_AUTO}
+                        >
+                          协作分析
+                        </button>
+                        <button
+                          type="button"
+                          className={`ghost-button mode-switch-button ${
+                            activeTurnIntent === TURN_INTENT_CHOICE ? "is-active" : ""
+                          }`}
+                          onClick={() =>
+                            setTurnIntentBySession((current) => ({
+                              ...current,
+                              [activeSessionId]: TURN_INTENT_CHOICE,
+                            }))
+                          }
+                          aria-pressed={activeTurnIntent === TURN_INTENT_CHOICE}
+                        >
+                          方向建议
+                        </button>
+                        <button
+                          type="button"
+                          className={`ghost-button mode-switch-button ${
+                            activeTurnIntent === TURN_INTENT_PREVIEW ? "is-active" : ""
+                          }`}
+                          onClick={() =>
+                            setTurnIntentBySession((current) => ({
+                              ...current,
+                              [activeSessionId]: TURN_INTENT_PREVIEW,
+                            }))
+                          }
+                          aria-pressed={activeTurnIntent === TURN_INTENT_PREVIEW}
+                        >
+                          具体预览
+                        </button>
+                      </div>
+                    ) : null}
+                    <div className="control-button-grid">
+                      {activeSessionWorkspaceId ? (
+                        <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
+                          清除上下文
+                        </button>
+                      ) : null}
+                      <button type="button" className="ghost-button" onClick={handleCreateSession}>
+                        新任务流
+                      </button>
+                      <button type="button" className="ghost-button" onClick={() => setWorkspaceModalOpen(true)}>
+                        附加资源
+                      </button>
+                      {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
+                        <button
+                          type="button"
+                          className="primary-button"
+                          disabled={codexChecking}
+                          onClick={handleCodexLogin}
+                        >
+                          {codexChecking ? "登录中…" : "登录 Codex"}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                </section>
+              </div>
             ) : null}
           </div>
         </aside>

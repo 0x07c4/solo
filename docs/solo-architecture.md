@@ -13,6 +13,7 @@
 相关文件：
 
 - 产品与 runtime 重心：[solo-control-plane.md](./solo-control-plane.md)
+- 主界面设计：[solo-surface-design.md](./solo-surface-design.md)
 - 前端：[App.jsx](/home/chikee/workspace/solo/src/App.jsx)
 - IPC 入口：[desktop.js](/home/chikee/workspace/solo/src/api/desktop.js)
 - Tauri runtime：[lib.rs](/home/chikee/workspace/solo/src-tauri/src/lib.rs)

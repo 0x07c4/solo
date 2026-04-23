@@ -252,6 +252,8 @@
 
 如果 `Solo` 是观测系统，主界面就不该长期停留在 chat-first。
 
+更细的页面设计、surface 职责和迁移顺序，见：[solo-surface-design.md](./solo-surface-design.md)
+
 更合理的投影是：
 
 ### 左侧

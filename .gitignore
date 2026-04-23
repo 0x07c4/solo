@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 .codex/
+.agents
+.claude/
+skills-lock.json
 docs/.obsidian/
 
 # Editor directories and files
