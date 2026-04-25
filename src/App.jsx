@@ -85,11 +85,11 @@ function normalizeSessionMode(mode) {
 }
 
 function sessionModeLabel(mode) {
-  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "资源参与" : "资源未参与";
+  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "resource-attached" : "managed";
 }
 
 function sessionModeTrailLabel(mode) {
-  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "资源参与" : "纯对话";
+  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "resource-attached" : "managed";
 }
 
 function normalizeTurnIntent(intent) {
@@ -106,12 +106,12 @@ function providerUsesCodexLogin(provider) {
 function turnIntentLabel(intent) {
   const normalized = normalizeTurnIntent(intent);
   if (normalized === TURN_INTENT_CHOICE) {
-    return "方向建议";
+    return "direction";
   }
   if (normalized === TURN_INTENT_PREVIEW) {
-    return "具体预览";
+    return "preview";
   }
-  return "协作分析";
+  return "analysis";
 }
 
 function pendingAssistantLabel(seconds, sessionMode, turnIntent = TURN_INTENT_AUTO) {
@@ -265,27 +265,27 @@ function patchProposalById(proposalsBySession, proposalId, updater) {
 
 function proposalStatusLabel(status) {
   if (status === "pending") {
-    return "待确认";
+    return "Pending";
   }
   if (status === "selected") {
-    return "已选择";
+    return "Selected";
   }
   if (status === "approved") {
-    return "执行中";
+    return "Approved";
   }
   if (status === "applied") {
-    return "已应用";
+    return "Applied";
   }
   if (status === "executed") {
-    return "已执行";
+    return "Executed";
   }
   if (status === "rejected") {
-    return "已拒绝";
+    return "Rejected";
   }
   if (status === "failed") {
-    return "失败";
+    return "Failed";
   }
-  return status || "未知";
+  return status || "Unknown";
 }
 
 function proposalStatusTone(status) {
@@ -359,12 +359,12 @@ function normalizeObservedCodexAgents(value) {
 
 function codexAgentStateLabel(state) {
   if (state === "running") {
-    return "运行中";
+    return "running";
   }
   if (state === "sleeping") {
-    return "空闲/等待";
+    return "waiting";
   }
-  return "未知";
+  return "unknown";
 }
 
 function codexAgentTone(agent) {
@@ -389,12 +389,9 @@ function ExternalAgentResourceCard({ agent, workspace, session, current, onFocus
           {codexAgentStateLabel(agent.state)}
         </span>
       </div>
-      <p>{agent.cwd}</p>
       <div className="external-agent-meta">
-        <span>pid {agent.pid || "unknown"}</span>
         <span>observe-only</span>
-        <span>{workspace ? "workspace linked" : "workspace unknown"}</span>
-        <span>{formatRuntimeTime(agent.lastSeenAt)}</span>
+        <span>{workspace ? "linked" : "untracked"}</span>
       </div>
       {session ? (
         <button
@@ -402,7 +399,7 @@ function ExternalAgentResourceCard({ agent, workspace, session, current, onFocus
           className="ghost-button external-agent-action"
           onClick={() => onFocusSession(session.id)}
         >
-          聚焦会话
+          Focus
         </button>
       ) : null}
     </div>
@@ -411,97 +408,97 @@ function ExternalAgentResourceCard({ agent, workspace, session, current, onFocus
 
 function taskStatusLabel(status) {
   if (status === "active") {
-    return "进行中";
+    return "active";
   }
   if (status === "waitingUser") {
-    return "等待你确认";
+    return "waiting approval";
   }
   if (status === "blocked") {
-    return "受阻";
+    return "blocked";
   }
   if (status === "completed") {
-    return "已完成";
+    return "done";
   }
   if (status === "failed") {
-    return "失败";
+    return "failed";
   }
   if (status === "cancelled") {
-    return "已取消";
+    return "cancelled";
   }
-  return status || "未知";
+  return status || "unknown";
 }
 
 function turnStatusLabel(status) {
   if (status === "running") {
-    return "执行中";
+    return "running";
   }
   if (status === "pending") {
-    return "排队中";
+    return "queued";
   }
   if (status === "completed") {
-    return "已完成";
+    return "done";
   }
   if (status === "failed") {
-    return "失败";
+    return "failed";
   }
   if (status === "cancelled") {
-    return "已取消";
+    return "cancelled";
   }
-  return status || "未知";
+  return status || "unknown";
 }
 
 function turnItemKindLabel(kind) {
   if (kind === "userMessage") {
-    return "用户消息";
+    return "user";
   }
   if (kind === "agentMessage") {
-    return "助手回复";
+    return "agent";
   }
   if (kind === "plan") {
-    return "计划";
+    return "plan";
   }
   if (kind === "statusUpdate") {
-    return "状态";
+    return "status";
   }
   if (kind === "choice") {
-    return "方向";
+    return "decision";
   }
   if (kind === "conceptPreview") {
-    return "概念预览";
+    return "preview";
   }
   if (kind === "fileChangePreview") {
-    return "改动预览";
+    return "file preview";
   }
   if (kind === "commandPreview") {
-    return "命令预览";
+    return "command preview";
   }
   if (kind === "approvalRequest") {
-    return "确认请求";
+    return "approval";
   }
   if (kind === "commandOutput") {
-    return "命令输出";
+    return "command output";
   }
   if (kind === "commandResult") {
-    return "命令结果";
+    return "command result";
   }
-  return kind || "项目";
+  return kind || "event";
 }
 
 function approvalStateLabel(state) {
   if (state === "pending") {
-    return "待确认";
+    return "waiting";
   }
   if (state === "accepted") {
-    return "已接受";
+    return "accepted";
   }
   if (state === "rejected") {
-    return "已拒绝";
+    return "rejected";
   }
   if (state === "applied") {
-    return "已应用";
+    return "applied";
   }
   if (state === "failed") {
-    return "失败";
+    return "failed";
   }
   return "";
 }
@@ -544,9 +541,9 @@ function runtimeItemStateLabel(item) {
 
 function formatRuntimeTime(timestamp) {
   if (!timestamp) {
-    return "刚刚";
+    return "now";
   }
-  return new Date(timestamp).toLocaleString("zh-CN", {
+  return new Date(timestamp).toLocaleString("en-US", {
     hour12: false,
     month: "2-digit",
     day: "2-digit",
@@ -557,12 +554,12 @@ function formatRuntimeTime(timestamp) {
 
 function proposalPrimaryActionLabel(proposal) {
   if (proposal.kind === "choice") {
-    return "选择这个方向";
+    return "Choose";
   }
   if (proposal.kind === "command") {
-    return "确认执行命令";
+    return "Run";
   }
-  return "确认应用改动";
+  return "Approve";
 }
 
 function truncateBlock(text, maxChars = 1800) {
@@ -1141,7 +1138,7 @@ function PaperclipIcon() {
   );
 }
 
-function EmptyVisual({ label = "空状态", tone = "idle" }) {
+function EmptyVisual({ label = "Empty", tone = "idle" }) {
   return (
     <div className={`empty-visual empty-visual-${tone}`} aria-label={label} role="img">
       <span />
@@ -1153,10 +1150,10 @@ function EmptyVisual({ label = "空状态", tone = "idle" }) {
 
 function MessageBubble({ message, progress = [] }) {
   const status = messageStatusLabel(message.status);
-  const roleLabel = message.role === "user" ? "你" : "ChatGPT";
+  const roleLabel = message.role === "user" ? "You" : "ChatGPT";
   const messageText =
     message.role === "assistant" && message.status === "streaming" && !message.content?.trim()
-      ? "正在生成回复…"
+      ? "Generating..."
       : message.content;
   const showProgress =
     message.role === "assistant" &&
@@ -1221,12 +1218,12 @@ function ProposalCard({ card, busy, onAccept, onReject }) {
         {isWrite ? (
           <>
             <div className="proposal-meta-row">
-              <span className="proposal-meta-label">文件</span>
-              <span className="proposal-meta-value">{card.relativePath || "未提供"}</span>
+              <span className="proposal-meta-label">File</span>
+              <span className="proposal-meta-value">{card.relativePath || "not provided"}</span>
             </div>
             {previewText ? (
               <div className="proposal-preview-block">
-                <span className="proposal-block-label">改动预览</span>
+                <span className="proposal-block-label">Preview</span>
                 <pre>{previewText}</pre>
               </div>
             ) : null}
@@ -1234,12 +1231,12 @@ function ProposalCard({ card, busy, onAccept, onReject }) {
         ) : isChoice ? (
           <>
             <div className="proposal-meta-row">
-              <span className="proposal-meta-label">方向</span>
-              <span className="proposal-meta-value">{card.optionKey || "未提供"}</span>
+              <span className="proposal-meta-label">Option</span>
+              <span className="proposal-meta-value">{card.optionKey || "not provided"}</span>
             </div>
             {card.detail ? (
               <div className="proposal-preview-block">
-                <span className="proposal-block-label">建议内容</span>
+                <span className="proposal-block-label">Detail</span>
                 <pre>{truncateBlock(card.detail, 1200)}</pre>
               </div>
             ) : null}
@@ -1247,18 +1244,18 @@ function ProposalCard({ card, busy, onAccept, onReject }) {
         ) : (
           <>
             <div className="proposal-meta-row">
-              <span className="proposal-meta-label">命令</span>
-              <span className="proposal-meta-value">{card.reason || "命令建议"}</span>
+              <span className="proposal-meta-label">Command</span>
+              <span className="proposal-meta-value">{card.reason || "suggested command"}</span>
             </div>
             {commandText ? (
               <div className="proposal-preview-block">
-                <span className="proposal-block-label">执行预览</span>
+                <span className="proposal-block-label">Preview</span>
                 <pre>{commandText}</pre>
               </div>
             ) : null}
             {outputText ? (
               <div className="proposal-preview-block">
-                <span className="proposal-block-label">最近输出</span>
+                <span className="proposal-block-label">Latest output</span>
                 <pre>{outputText}</pre>
               </div>
             ) : null}
@@ -1269,10 +1266,10 @@ function ProposalCard({ card, busy, onAccept, onReject }) {
       {card.status === "pending" ? (
         <div className="proposal-actions">
           <button type="button" className="primary-button" disabled={busy} onClick={() => onAccept(card)}>
-            {busy ? "处理中…" : proposalPrimaryActionLabel(card)}
+            {busy ? "Working..." : proposalPrimaryActionLabel(card)}
           </button>
           <button type="button" className="ghost-button" disabled={busy} onClick={() => onReject(card)}>
-            拒绝
+            Reject
           </button>
         </div>
       ) : null}
@@ -1295,10 +1292,10 @@ function DecisionOptionCard({ option, active, index, total, onPreview }) {
         aria-pressed={active}
       >
         <div className="decision-option-head">
-          <span className="section-eyebrow">方向 {optionKey}</span>
+          <span className="section-eyebrow">Option {optionKey}</span>
           <div className="decision-option-badges">
             <span className="decision-option-index">{String(index + 1).padStart(2, "0")}</span>
-            {active ? <span className="drawer-chip drawer-chip-active">预览中</span> : null}
+            {active ? <span className="drawer-chip drawer-chip-active">Preview</span> : null}
           </div>
         </div>
         <div className="decision-option-body">
@@ -1340,27 +1337,27 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
   const gainSignals = (gainSection?.highlights ?? []).slice(0, 2);
   const riskSignals = (riskSection?.highlights ?? []).slice(0, 2);
   const scopeValue = scopeCount > 0 ? `${scopeCount}` : "1";
-  const scopeUnit = scopeCount > 0 ? "文件" : "局部";
-  const costValue = scopeCount > 3 ? "中" : "低";
-  const costNote = scopeCount > 3 ? "涉及多文件联动" : "更偏局部调整";
+  const scopeUnit = scopeCount > 0 ? "files" : "local";
+  const costValue = scopeCount > 3 ? "medium" : "low";
+  const costNote = scopeCount > 3 ? "touches multiple files" : "localized change";
 
   return (
     <div className="decision-preview-panel">
       <div className="decision-preview-hero">
         <div className="decision-preview-head">
           <div>
-            <p className="section-eyebrow">方向预览</p>
+            <p className="section-eyebrow">Direction preview</p>
             <h4>{option.title}</h4>
-            <p className="decision-preview-kicker">当前查看方向 {optionKey}</p>
+            <p className="decision-preview-kicker">Inspecting option {optionKey}</p>
           </div>
-          <span className="drawer-chip drawer-chip-idle">仅预览</span>
+          <span className="drawer-chip drawer-chip-idle">preview</span>
         </div>
         <p className="decision-preview-summary">{heroSummary}</p>
       </div>
 
       <div className="decision-judgment-board">
         <section className="decision-judgment-card decision-judgment-card-scope">
-          <span className="decision-judgment-label">范围</span>
+          <span className="decision-judgment-label">Scope</span>
           <div className="decision-judgment-metric">
             <strong>{scopeValue}</strong>
             <span>{scopeUnit}</span>
@@ -1377,33 +1374,33 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
               ) : null}
             </div>
           ) : (
-            <p className="decision-judgment-note">聚焦一个局部入口</p>
+            <p className="decision-judgment-note">one local entry</p>
           )}
         </section>
 
         <section className="decision-judgment-card decision-judgment-card-gain">
-          <span className="decision-judgment-label">收益</span>
+          <span className="decision-judgment-label">Gain</span>
           <div className="decision-judgment-copy">
-            {(gainSignals.length ? gainSignals : ["会直接改善当前主要瓶颈"]).map((signal) => (
+            {(gainSignals.length ? gainSignals : ["improves the current bottleneck"]).map((signal) => (
               <p key={signal}>{signal}</p>
             ))}
           </div>
         </section>
 
         <section className="decision-judgment-card decision-judgment-card-risk">
-          <span className="decision-judgment-label">风险</span>
+          <span className="decision-judgment-label">Risk</span>
           <div className="decision-judgment-copy">
-            {(riskSignals.length ? riskSignals : ["风险可控，但仍需确认边界条件"]).map((signal) => (
+            {(riskSignals.length ? riskSignals : ["controlled risk; confirm boundaries"]).map((signal) => (
               <p key={signal}>{signal}</p>
             ))}
           </div>
         </section>
 
         <section className="decision-judgment-card decision-judgment-card-cost">
-          <span className="decision-judgment-label">代价</span>
+          <span className="decision-judgment-label">Cost</span>
           <div className="decision-judgment-metric is-compact">
             <strong>{costValue}</strong>
-            <span>复杂度</span>
+            <span>complexity</span>
           </div>
           <p className="decision-judgment-note">{costNote}</p>
         </section>
@@ -1411,7 +1408,7 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
 
       {preview.sections.length > 0 ? (
         <details className="decision-preview-details">
-          <summary>查看详细说明</summary>
+          <summary>View details</summary>
           <div className="decision-preview-details-grid">
             {preview.sections.map((section) => (
               <section
@@ -1421,7 +1418,7 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
                 <div className="decision-preview-card-head">
                   <span className="section-eyebrow">{section.title}</span>
                   {section.kind === "files" && section.files.length > 0 ? (
-                    <span className="drawer-chip drawer-chip-active">{section.files.length} 个文件</span>
+                    <span className="drawer-chip drawer-chip-active">{section.files.length} files</span>
                   ) : null}
                 </div>
                 {section.files.length > 0 ? (
@@ -1455,7 +1452,7 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
             disabled={busy || skipBusy}
             onClick={() => onConfirm(option)}
           >
-            {busy ? "处理中…" : "确认选择这个方向"}
+            {busy ? "Working..." : "Choose"}
           </button>
           <button
             type="button"
@@ -1463,7 +1460,7 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
             disabled={busy || skipBusy}
             onClick={() => onSkipAll(decisionSet)}
           >
-            {skipBusy ? "处理中…" : decisionSet?.dismissAction?.label ?? "都不选"}
+            {skipBusy ? "Working..." : decisionSet?.dismissAction?.label ?? "Skip"}
           </button>
         </div>
       </div>
@@ -1572,7 +1569,7 @@ function WorkstreamCard({ entry, active, onSelect, onDelete, deletingDisabled = 
         aria-label={`删除任务流 ${entry.title}`}
         disabled={deletingDisabled}
       >
-        删除
+        Remove
       </button>
     </div>
   );
@@ -1710,7 +1707,7 @@ export default function App() {
       )
     : TURN_INTENT_AUTO;
   const activeSessionWorkspaceId = activeSession?.workspaceId ?? "";
-  const layoutMode = activeSessionMode === SESSION_MODE_WORKSPACE ? "workbench" : "chat";
+  const layoutMode = "workbench";
   const hasCustomWindowChrome =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const activeDecisionPreviewId = activeSessionId ? decisionPreviewBySession[activeSessionId] ?? "" : "";
@@ -1800,7 +1797,7 @@ export default function App() {
           task?.summary?.trim() ||
           turn?.summary?.trim() ||
           snapshot.turnItems.at(-1)?.summary?.trim() ||
-          "当前还没有结构化任务摘要。";
+          "No structured task summary yet.";
         const meta = turn
           ? `${turnIntentLabel(turn.intent)} · ${formatRuntimeTime(turn.updatedAt ?? turn.createdAt)}`
           : `${sessionModeTrailLabel(session.interactionMode)} · ${formatRuntimeTime(session.updatedAt)}`;
@@ -3162,10 +3159,10 @@ export default function App() {
     activeTurnIntent
   );
   const composerHint = providerNeedsCodexLogin && !codexAuth.loggedIn
-    ? "先完成 Codex 登录才能发送。"
+    ? "Log in to Codex before sending."
     : activeProvider === "manual"
-      ? "当前为手动接入，发送后只会记录问题。"
-      : "Enter 发送，Shift+Enter 换行。";
+      ? "Manual provider: sending only records the request."
+      : "Enter to send, Shift+Enter for newline.";
   const modeLabel = sessionModeLabel(activeSessionMode);
   const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
   const previewTitle = selectedFilePath || "暂无文件";
@@ -3176,14 +3173,14 @@ export default function App() {
       : filePreview
         ? "ready"
         : "empty";
-  const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "已选择" : "未选择";
+  const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "linked" : "detached";
   const previewStateText = previewState.loading
     ? "读取中"
     : previewState.error
       ? "错误"
       : filePreview
-        ? "就绪"
-        : "空";
+        ? "ready"
+        : "empty";
   const collaborationEnabled = activeSessionMode === SESSION_MODE_WORKSPACE;
   const collaborationAvailable = Boolean(activeSessionWorkspaceId);
   const selectedChoiceLabel = selectedDecisionOption?.optionKey ?? selectedDecisionOption?.title ?? "";
@@ -3196,16 +3193,16 @@ export default function App() {
         ? "active"
         : "idle";
   const suggestionInspectorStatus = proposalPanelState.error
-    ? "加载失败"
+    ? "error"
     : showDecisionDeck
-      ? `${decisionOptions.length} 个方向`
+      ? `${decisionOptions.length} directions`
       : previewDeckActive
-        ? `${previewProposals.length} 张预览`
+        ? `${previewProposals.length} previews`
         : proposalPanelState.loading
-          ? "展开中"
+          ? "loading"
           : selectedDecisionOption
-            ? "已选择"
-            : "无待确认";
+            ? "selected"
+            : "clear";
   const showSuggestionPanel =
     proposalPanelState.loading ||
     Boolean(proposalPanelState.error) ||
@@ -3222,16 +3219,53 @@ export default function App() {
           ? runtimeTone(activeRuntimeTask.status)
           : "idle";
   const runtimePanelStatus = runtimePanelState.error
-    ? "加载失败"
+    ? "error"
     : runtimePanelState.loading
-      ? "读取中"
+      ? "loading"
       : activeRuntimeTurn
         ? turnStatusLabel(activeRuntimeTurn.status)
         : activeRuntimeTask
           ? taskStatusLabel(activeRuntimeTask.status)
-          : "空";
+          : "idle";
   const runtimeItemList = activeRuntimeItems.slice(-6);
   const runtimeTimelineItems = activeRuntimeItems.slice(-8).reverse();
+  const primaryObservedCodexAgent = observedCodexState.agents[0] ?? null;
+  const runtimeTimelineDisplayItems = runtimeTimelineItems.length
+    ? runtimeTimelineItems
+    : [
+        {
+          id: "fallback-task-target",
+          kind: "summary",
+          status: "pending",
+          approvalState: "notRequired",
+          title: "Task target missing",
+          summary: "Create a task to start a managed run.",
+          createdAt: null,
+          updatedAt: null,
+        },
+        {
+          id: "fallback-no-run",
+          kind: "statusUpdate",
+          status: "pending",
+          approvalState: "notRequired",
+          title: "No active run",
+          summary: "Solo is waiting for a concrete target.",
+          createdAt: null,
+          updatedAt: null,
+        },
+        primaryObservedCodexAgent
+          ? {
+              id: "fallback-external-codex",
+              kind: "statusUpdate",
+              status: primaryObservedCodexAgent.state === "running" ? "running" : "pending",
+              approvalState: "notRequired",
+              title: "External Codex observed",
+              summary: "observe-only resource; controls disabled.",
+              createdAt: primaryObservedCodexAgent.lastSeenAt,
+              updatedAt: primaryObservedCodexAgent.lastSeenAt,
+            }
+          : null,
+      ].filter(Boolean);
   const runtimePendingApprovalCount = activeRuntimeItems.filter(
     (item) => item.approvalState === "pending"
   ).length;
@@ -3246,40 +3280,142 @@ export default function App() {
     (activeSessionWorkspaceId ? 1 : 0) +
     (activeSessionMode === SESSION_MODE_WORKSPACE ? 1 : 0);
   const runtimeWorkstreamLabel =
-    activeRuntimeTask?.title || activeSession?.title || "当前 workstream 尚未命名";
+    activeRuntimeTask?.title || activeSession?.title || "Untitled workstream";
   const runtimeTaskCount = activeRuntimeSnapshot.tasks.length;
   const runtimeTurnCount = activeRuntimeSnapshot.turns.length;
   const runtimeArtifactCount = previewProposals.length + (filePreview ? 1 : 0);
   const runtimeExceptionCount = runtimePendingApprovalCount + runtimeFailedCount;
+  const hasPendingApproval =
+    showDecisionDeck || showPreviewCards || runtimePendingApprovalCount > 0;
+  const supervisionState = runtimeExceptionCount > 0
+    ? "blocked"
+    : hasPendingApproval
+      ? "waitingApproval"
+      : activeRuntimeTurn
+        ? "running"
+        : "idle";
+  const currentTaskTitle =
+    activeRuntimeTask?.title || (supervisionState === "idle" ? "No task target yet" : "Waiting task");
+  const currentTaskStateLabel =
+    supervisionState === "blocked"
+      ? "blocked"
+      : supervisionState === "waitingApproval"
+        ? "waiting approval"
+        : supervisionState === "running"
+          ? "running"
+          : "idle";
+  const currentRunStateLabel = activeRuntimeTurn
+    ? turnStatusLabel(activeRuntimeTurn.status)
+    : chatSending
+      ? "running"
+      : "idle";
+  const nextIntentLabel =
+    supervisionState === "waitingApproval"
+      ? "approve"
+      : supervisionState === "running"
+        ? "observe"
+        : supervisionState === "blocked"
+          ? "inspect"
+          : "create";
+  const visibleRuntimeTimelineItems = runtimeTimelineDisplayItems.slice(0, 2);
+  const hiddenRuntimeTimelineCount = Math.max(0, runtimeTimelineDisplayItems.length - visibleRuntimeTimelineItems.length);
+  
+  const runtimeOutputCards = [
+    ...previewProposals.map((card) => ({
+      id: card.id,
+      title: card.title || "Preview",
+      meta: card.relativePath || card.kind || "preview",
+      tone: card.status === "failed" ? "error" : "approval",
+    })),
+    ...(filePreview
+      ? [
+          {
+            id: "file-preview",
+            title: previewTitle,
+            meta: "file preview",
+            tone: "external",
+          },
+        ]
+      : []),
+    ...(selectedDecisionOption
+      ? [
+          {
+            id: selectedDecisionOption.id,
+            title: selectedDecisionOption.title || "Selected direction",
+            meta: "direction",
+            tone: "active",
+          },
+        ]
+      : []),
+  ];
+  const visibleOutputCards = runtimeOutputCards.slice(0, 3);
+  const outputOverflowCount = Math.max(0, runtimeOutputCards.length - visibleOutputCards.length);
+  const outputCountLabel =
+    runtimeOutputCards.length > 3 ? `3 +${outputOverflowCount}` : String(runtimeOutputCards.length);
   const activeRunLabel = activeRuntimeTurn
     ? `${turnIntentLabel(activeRuntimeTurn.intent)} · ${turnStatusLabel(activeRuntimeTurn.status)}`
-    : "当前没有活跃 run";
+    : "no active run";
   const activeRunTimeLabel = activeRuntimeTurn
     ? formatRuntimeTime(activeRuntimeTurn.updatedAt ?? activeRuntimeTurn.createdAt)
-    : "等待开始";
+    : "not started";
   const activeRunSummary = activeRuntimeItems.length
     ? truncateInline(
-        activeRuntimeItems.at(-1)?.summary || activeRuntimeItems.at(-1)?.content || "等待新的运行事件。",
+        activeRuntimeItems.at(-1)?.summary || activeRuntimeItems.at(-1)?.content || "Waiting for runtime events.",
         96
       )
-    : "当前还没有结构化运行事件。";
+    : "Waiting for a task target.";
   const runtimeFocusTitle = runtimeExceptionCount > 0
-    ? "需要介入"
+    ? "Needs review"
     : showPreviewCards || showDecisionDeck || runtimePendingApprovalCount > 0
-      ? "等待决策"
+      ? "Waiting approval"
       : activeRuntimeTurn
-        ? "执行健康"
-        : "等待任务";
+        ? "Run healthy"
+        : "Waiting task";
   const runtimeFocusDetail = runtimeExceptionCount > 0
-    ? `${runtimeExceptionCount} 个异常或待确认节点需要处理`
+    ? `${runtimeExceptionCount} exception or approval item needs review`
     : showDecisionDeck
-      ? `${decisionOptions.length} 个方向等待选择`
+      ? `${decisionOptions.length} directions waiting`
       : showPreviewCards
-        ? `${previewProposals.length} 个预览等待确认`
+        ? `${previewProposals.length} previews waiting`
         : activeRuntimeTurn
-          ? "当前运行正常推进，可继续观察时间线"
-          : "先创建任务或发送目标，让 Solo 启动第一条 run";
+          ? "Run is moving; inspect the timeline for detail"
+          : "Create a task or send a goal to start the first run";
   const showPreviewPanel = previewState.loading || Boolean(previewState.error) || Boolean(filePreview);
+  const inspectorTitle = hasPendingApproval
+    ? "Checkpoint · direction approval"
+    : supervisionState === "running"
+      ? "Active run"
+      : primaryObservedCodexAgent
+        ? "External Codex"
+        : "No checkpoint selected";
+  const inspectorStatus = hasPendingApproval
+    ? "Needs approval"
+    : supervisionState === "blocked"
+      ? "Blocked"
+      : supervisionState === "running"
+        ? "Running"
+        : "Idle";
+  const inspectorQuestion = hasPendingApproval
+    ? "Accept current direction?"
+    : supervisionState === "running"
+      ? "Inspect current run?"
+      : primaryObservedCodexAgent
+        ? "Review observed external run?"
+        : "Describe the next task target.";
+  const inspectorImpact = hasPendingApproval
+    ? "Impact: next phase can continue after approval"
+    : supervisionState === "running"
+      ? "Impact: runtime remains managed"
+      : primaryObservedCodexAgent
+        ? "Impact: observe-only, controls disabled"
+        : "Impact: no runtime changes until a task is created";
+  const inspectorEvidence = hasPendingApproval
+    ? ["Decision pending", "Preview available", "Runtime unchanged"]
+    : supervisionState === "running"
+      ? ["Active run present", "Timeline is authoritative", "Outputs remain evidence-only"]
+      : primaryObservedCodexAgent
+        ? ["External Codex observed", "observe-only", "Can convert later"]
+        : ["No active run", "No pending checkpoint", "Task target missing"];
   const inspectorTabs = [
     {
       id: "trace",
@@ -3291,14 +3427,14 @@ export default function App() {
     {
       id: "artifacts",
       label: "Artifacts",
-      description: runtimeArtifactCount > 0 ? `${runtimeArtifactCount} 个产物` : "暂无产物",
+      description: runtimeArtifactCount > 0 ? `${runtimeArtifactCount} outputs` : "no outputs",
       badgeTone: previewStateLabel === "empty" ? "idle" : previewStateLabel,
       badgeText: runtimeArtifactCount > 0 ? String(runtimeArtifactCount) : "0",
     },
     {
       id: "resources",
       label: "Resources",
-      description: activeWorkspace?.name ?? "未附加资源",
+      description: activeWorkspace?.name ?? "no resource",
       badgeTone: inspectorWorkspaceState,
       badgeText: String(runtimeResourceCount),
     },
@@ -3307,7 +3443,7 @@ export default function App() {
       label: "Controls",
       description: runtimeFocusTitle,
       badgeTone: runtimeExceptionCount > 0 ? "error" : showSuggestionPanel ? suggestionInspectorTone : "idle",
-      badgeText: runtimeExceptionCount > 0 ? String(runtimeExceptionCount) : showSuggestionPanel ? suggestionInspectorStatus : "空",
+      badgeText: runtimeExceptionCount > 0 ? String(runtimeExceptionCount) : showSuggestionPanel ? suggestionInspectorStatus : "clear",
     },
   ];
   const inspectorSummaryCards = [
@@ -3325,29 +3461,56 @@ export default function App() {
     },
     {
       label: "Items",
-      value: `${activeRuntimeSnapshot.turnItems.length} 个事件`,
+      value: `${activeRuntimeSnapshot.turnItems.length} events`,
       detail: `${runtimeTaskCount} task / ${runtimeTurnCount} turn / ${runtimeArtifactCount} artifact`,
       tone: activeRuntimeSnapshot.turnItems.length > 0 ? "active" : "idle",
     },
     {
       label: "Exceptions",
-      value: runtimeExceptionCount > 0 ? `${runtimeExceptionCount} 个待处理` : "运行正常",
+      value: runtimeExceptionCount > 0 ? `${runtimeExceptionCount} pending` : "clear",
       detail:
         runtimePendingApprovalCount > 0
-          ? `${runtimePendingApprovalCount} 个节点等待确认`
+          ? `${runtimePendingApprovalCount} approvals waiting`
           : runtimeFailedCount > 0
-            ? `${runtimeFailedCount} 个节点失败或被拒绝`
-            : "当前没有异常节点",
+            ? `${runtimeFailedCount} failed or rejected`
+            : "No exceptions",
       tone: runtimeExceptionCount > 0 ? "error" : "ready",
     },
   ];
   const composerPlaceholder = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
-      ? "描述目标，Solo 先给方向。"
+      ? "Describe the goal; Solo will propose directions first."
       : activeTurnIntent === TURN_INTENT_PREVIEW
-        ? "描述要展开的具体预览。"
-        : "描述目标或追加干预。"
-    : "描述目标或追加干预。";
+        ? "Describe the preview you want expanded."
+        : "Describe the task target..."
+    : supervisionState === "waitingApproval"
+      ? "Add approval condition..."
+      : supervisionState === "running"
+        ? "Steer the current run..."
+        : supervisionState === "blocked"
+          ? "Add recovery detail..."
+          : "Describe the task target...";
+  const commandBarTitle = supervisionState === "waitingApproval"
+    ? "Waiting approval"
+    : supervisionState === "running"
+      ? "Running"
+      : supervisionState === "blocked"
+        ? "Blocked"
+        : "Waiting task";
+  const commandPrimaryLabel = supervisionState === "waitingApproval"
+    ? "Approve"
+    : supervisionState === "running"
+      ? "Pause"
+      : supervisionState === "blocked"
+        ? "Inspect"
+        : "Create";
+  const commandPrimaryDisabled = supervisionState === "waitingApproval"
+    ? !hasPendingApproval
+    : supervisionState === "running"
+      ? !activeRuntimeTurn && !chatSending
+      : supervisionState === "blocked"
+        ? false
+        : !canSend;
   const modeIntentText = collaborationEnabled
     ? `这一轮会读取附加资源，当前阶段：${turnIntentLabel(activeTurnIntent)}`
     : collaborationAvailable
@@ -3363,21 +3526,21 @@ export default function App() {
       ? "目录只是附加资源。只有启用资源参与后，它才会真正进入回答。"
       : "先直接提问；只有需要代码依据时再补充目录。";
   const composerContextButtonLabel = activeSessionWorkspaceId
-    ? `更换附加资源，当前为 ${activeWorkspace?.name ?? "已选目录"}`
-    : "附加资源";
+    ? `Change resource, current: ${activeWorkspace?.name ?? "selected directory"}`
+    : "Attach resource";
   const connectionStatusLabel = providerNeedsCodexLogin
     ? (!codexAuth.available
-        ? "不可用"
+        ? "unavailable"
         : codexAuth.loggedIn
-          ? "已登录"
-          : "未登录")
+          ? "logged in"
+          : "logged out")
     : activeProvider === "manual"
-      ? "手动"
+      ? "manual"
       : settings.modelId
-        ? "已配置"
-        : "未配置";
-  const topbarWorkstreamState = activeSessionSummary?.statusLabel ?? "等待创建";
-  const topbarExceptionLabel = exceptionEntries.length > 0 ? `${exceptionEntries.length} 个待处理` : "运行正常";
+        ? "configured"
+        : "not configured";
+  const topbarWorkstreamState = activeSessionSummary?.statusLabel ?? "waiting";
+  const topbarExceptionLabel = exceptionEntries.length > 0 ? `${exceptionEntries.length} pending` : "clear";
   const topbarExceptionTone = exceptionEntries.length > 0 ? "error" : "ready";
   const externalAgentsByWorkspaceId = observedCodexState.agents.reduce((groups, agent) => {
     if (!agent.matchedWorkspaceId) {
@@ -3391,15 +3554,15 @@ export default function App() {
   const untrackedExternalAgents = observedCodexState.agents.filter((agent) => !agent.matchedWorkspaceId);
   const resourceDisplayCount = workspaces.length + untrackedExternalAgents.length;
   const topbarResourceLabel = observedCodexState.agents.length
-    ? `${workspaces.length} 资源 / ${observedCodexState.agents.length} 外部`
-    : `${workspaces.length} 个资源`;
+    ? `${workspaces.length} resources / ${observedCodexState.agents.length} external`
+    : `${workspaces.length} resources`;
   const topbarRunLabel = `${activeWorkstreamEntries.length} active / ${waitingWorkstreamEntries.length} waiting`;
   const primaryExceptionEntry = exceptionEntries[0] ?? null;
   const commandActionCards = [
     {
       id: "task",
       eyebrow: "Task",
-      title: "新任务",
+      title: "New",
       tone: "idle",
       disabled: false,
       onClick: handleCreateSession,
@@ -3407,7 +3570,7 @@ export default function App() {
     {
       id: "exception",
       eyebrow: "Intervene",
-      title: primaryExceptionEntry ? "介入" : "无异常",
+      title: primaryExceptionEntry ? "Review" : "Clear",
       tone: primaryExceptionEntry ? "error" : "ready",
       disabled: !primaryExceptionEntry,
       onClick: () => {
@@ -3420,7 +3583,6 @@ export default function App() {
       },
     },
   ];
-
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
       return;
@@ -3466,6 +3628,7 @@ export default function App() {
         >
           <div className="topbar-brand">
             <div className="topbar-route">
+              <span className="topbar-logo" aria-hidden="true" />
               <div className="topbar-trail" aria-label="current context">
                 <span className="topbar-app">solo</span>
                 <span className="topbar-separator">/</span>
@@ -3473,38 +3636,36 @@ export default function App() {
               </div>
               <span className="topbar-title-divider" aria-hidden="true" />
               <div className="topbar-title-stack">
-                <h1>{activeSession?.title ?? "新任务流"}</h1>
-                <span className="topbar-title-meta">{topbarWorkstreamState}</span>
+                <h1>{activeWorkspace?.path ?? "~/workspace/solo"}</h1>
+                <span className="topbar-title-meta">branch: ui-ddd</span>
               </div>
             </div>
           </div>
         </div>
         <div className="topbar-status">
-          <div className="status-pill status-pill-metric">
-            <span className="status-pill-label">Workstreams</span>
-            <strong className="status-pill-value">{topbarRunLabel}</strong>
-          </div>
-          <div className={`status-pill status-pill-metric status-pill-${topbarExceptionTone}`}>
-            <span className="status-pill-label">Exceptions</span>
-            <strong className="status-pill-value">{topbarExceptionLabel}</strong>
-          </div>
-          <div className={`status-pill status-pill-metric status-pill-${activeSessionWorkspaceId ? "active" : "idle"}`}>
-            <span className="status-pill-label">Resources</span>
-            <strong className="status-pill-value">{topbarResourceLabel}</strong>
-          </div>
           <button
             type="button"
-            className="status-pill status-pill-button"
+            className="status-pill status-pill-button status-pill-compact"
             onClick={() => {
               setConnectionState({ status: "idle", message: "" });
               setSettingsModalOpen(true);
             }}
           >
-            <span className="status-pill-label">
-              {providerNeedsCodexLogin ? "Codex 登录" : "连接"}
-            </span>
-            <strong className="status-pill-value">{connectionStatusLabel}</strong>
+            <strong className="status-pill-value">
+              {providerNeedsCodexLogin ? "Codex Login" : "Connection"}
+            </strong>
           </button>
+          <span className="status-pill status-pill-compact status-pill-active">
+            <strong className="status-pill-value">managed</strong>
+          </span>
+          <span
+            className={`status-pill status-pill-compact status-pill-${
+              observedCodexState.agents.length ? "active" : "idle"
+            }`}
+            title={topbarResourceLabel}
+          >
+            <strong className="status-pill-value">observe-only</strong>
+          </span>
         </div>
         {hasCustomWindowChrome ? (
           <div className="window-controls">
@@ -3565,12 +3726,12 @@ export default function App() {
               <div>
                   <p className="section-eyebrow">Workstreams</p>
                   <div className="section-title-row">
-                    <h2>任务流</h2>
+                    <h2>Workstreams</h2>
                     <span className="section-count">{sessions.length}</span>
                   </div>
               </div>
               <button type="button" className="ghost-button" onClick={handleCreateSession}>
-                新建
+                New
               </button>
             </div>
             <div className="workstream-groups">
@@ -3594,7 +3755,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="panel-collapsed-note">
-                    <EmptyVisual label="当前没有进行中的任务流" tone="active" />
+                    <EmptyVisual label="No active workstreams" tone="active" />
                   </div>
                 )}
               </section>
@@ -3619,7 +3780,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="panel-collapsed-note">
-                    <EmptyVisual label="当前没有等待确认的任务流" tone="loading" />
+                    <EmptyVisual label="No waiting workstreams" tone="loading" />
                   </div>
                 )}
               </section>
@@ -3644,7 +3805,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="panel-collapsed-note">
-                    <EmptyVisual label="当前还没有完成的任务流" tone="ready" />
+                    <EmptyVisual label="No completed workstreams" tone="ready" />
                   </div>
                 )}
               </section>
@@ -3656,7 +3817,7 @@ export default function App() {
               <div>
                 <p className="section-eyebrow">Exceptions</p>
                 <div className="section-title-row">
-                  <h2>异常收件箱</h2>
+                  <h2>Exceptions</h2>
                   <span className="section-count">{exceptionEntries.length}</span>
                 </div>
               </div>
@@ -3674,7 +3835,7 @@ export default function App() {
               </div>
             ) : (
               <div className="panel-collapsed-note">
-                <EmptyVisual label="当前没有需要处理的异常" tone="ready" />
+                <EmptyVisual label="No exceptions" tone="ready" />
               </div>
             )}
           </section>
@@ -3684,10 +3845,10 @@ export default function App() {
               <div>
                   <p className="section-eyebrow">Resources</p>
                   <div className="section-title-row">
-                    <h2>附加资源</h2>
+                    <h2>Resources</h2>
                     <span className="section-count">{resourceDisplayCount}</span>
                     {observedCodexState.error ? (
-                      <span className="list-badge list-badge-error">扫描失败</span>
+                      <span className="list-badge list-badge-error">scan failed</span>
                     ) : null}
                     {observedCodexState.agents.length ? (
                       <span className="list-badge list-badge-accent">
@@ -3701,7 +3862,7 @@ export default function App() {
               <div className="workspace-list">
                 {observedCodexState.error ? (
                   <div className="resource-inline-error">
-                    <strong>外部 Codex 扫描失败</strong>
+                    <strong>External Codex scan failed</strong>
                     <span>{observedCodexState.error}</span>
                   </div>
                 ) : null}
@@ -3722,7 +3883,7 @@ export default function App() {
                         <div className="workspace-row">
                           <span className="workspace-title">{workspace.name}</span>
                           {workspace.id === activeSessionWorkspaceId ? (
-                            <span className="list-badge list-badge-accent">当前资源</span>
+                            <span className="list-badge list-badge-accent">current</span>
                           ) : null}
                           {workspaceAgents.length ? (
                             <span className="list-badge list-badge-loading">
@@ -3737,7 +3898,7 @@ export default function App() {
                         className="danger-button"
                         onClick={() => handleRemoveWorkspace(workspace.id)}
                       >
-                        移除
+                        Remove
                       </button>
                       {workspaceAgents.length ? (
                         <div className="workspace-agent-stack">
@@ -3767,7 +3928,7 @@ export default function App() {
                       <span className="section-eyebrow">Untracked</span>
                       <span className="section-count">{untrackedExternalAgents.length}</span>
                     </div>
-                    {untrackedExternalAgents.slice(0, 3).map((agent) => {
+                    {untrackedExternalAgents.slice(0, 1).map((agent) => {
                       const matchedSession = sessions.find(
                         (session) => session.id === agent.matchedSessionId
                       );
@@ -3790,10 +3951,10 @@ export default function App() {
                 <EmptyVisual
                   label={
                     observedCodexState.error
-                      ? "外部 Codex 扫描失败"
+                      ? "External Codex scan failed"
                       : observedCodexState.loading
-                        ? "正在扫描外部 Codex"
-                        : "无资源"
+                        ? "Scanning external Codex"
+                        : "No resources"
                   }
                   tone={observedCodexState.error ? "error" : observedCodexState.loading ? "loading" : "idle"}
                 />
@@ -3808,7 +3969,7 @@ export default function App() {
               <div>
                   <p className="section-eyebrow">Resource Lens</p>
                   <div className="section-title-row">
-                    <h2>资源浏览</h2>
+                    <h2>Resource lens</h2>
                   </div>
               </div>
               <button
@@ -3817,20 +3978,20 @@ export default function App() {
                 onClick={() => setExplorerOpen((current) => !current)}
                 disabled={!activeWorkspace}
               >
-                {explorerOpen ? "收起" : "展开"}
+                {explorerOpen ? "Collapse" : "Expand"}
               </button>
             </div>
             {!explorerOpen ? (
               <div className="panel-collapsed-note">
                 <EmptyVisual
-                  label={activeWorkspace ? "文件树已折叠" : "当前没有可用目录资源"}
+                  label={activeWorkspace ? "File tree collapsed" : "No directory resource"}
                   tone={activeWorkspace ? "active" : "idle"}
                 />
               </div>
             ) : activeWorkspace ? (
               workspaceTreeLoading ? (
                 <div className="empty-state compact">
-                  <EmptyVisual label="正在加载文件树" tone="loading" />
+                  <EmptyVisual label="Loading file tree" tone="loading" />
                 </div>
               ) : workspaceTree ? (
                 <div className="tree-panel">
@@ -3843,12 +4004,12 @@ export default function App() {
                 </div>
               ) : (
                 <div className="empty-state compact">
-                  <EmptyVisual label="当前目录暂无可显示文件树" tone="idle" />
+                  <EmptyVisual label="No visible file tree" tone="idle" />
                 </div>
               )
             ) : (
               <div className="empty-state compact">
-                <EmptyVisual label="当前没有目录资源" tone="idle" />
+                <EmptyVisual label="No directory resource" tone="idle" />
               </div>
             )}
           </section>
@@ -3856,51 +4017,27 @@ export default function App() {
 
         <section className="chat-pane">
           <div className="chat-head">
-            <div className="chat-head-shell">
+            <div className="chat-head-shell runtime-head-shell">
               <div className="chat-head-main">
-                <p className="section-eyebrow">Workstream</p>
-                <h2>{runtimeWorkstreamLabel}</h2>
-                <div className="chat-context-strip task-context-strip">
-                  <div className="chat-context-item">
-                    <span className="chat-context-label">当前任务</span>
-                    <strong className="chat-context-value">
-                      {activeRuntimeTask
-                        ? `${taskStatusLabel(activeRuntimeTask.status)} · ${activeRuntimeTask.title}`
-                        : "尚未建立任务骨架"}
-                    </strong>
-                  </div>
-                  <div className="chat-context-item">
-                    <span className="chat-context-label">活跃 Run</span>
-                    <strong className="chat-context-value">{activeRunLabel}</strong>
-                  </div>
-                  <div className="chat-context-item">
-                    <span className="chat-context-label">异常 / 检查点</span>
-                    <strong className="chat-context-value">
-                      {runtimeExceptionCount > 0 ? `${runtimeExceptionCount} 个待处理` : "当前没有异常"}
-                    </strong>
-                  </div>
-                  <div className="chat-context-item">
-                    <span className="chat-context-label">附加资源</span>
-                    <strong className="chat-context-value">
-                      {activeWorkspace?.name ?? "当前没有目录资源"}
-                    </strong>
-                  </div>
-                </div>
+                <p className="section-eyebrow">Current task</p>
+                <h2>{currentTaskTitle}</h2>
+                <p className="runtime-task-subtitle">
+                  Workstream: {runtimeWorkstreamLabel} · {currentTaskStateLabel}
+                </p>
               </div>
-              <div className="chat-head-actions">
-                <button type="button" className="ghost-button" onClick={handleCreateSession}>
-                  新任务流
-                </button>
-                {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
-                  <button
-                    type="button"
-                    className="primary-button"
-                    disabled={codexChecking}
-                    onClick={handleCodexLogin}
-                  >
-                    {codexChecking ? "登录中…" : "登录 Codex"}
-                  </button>
-                ) : null}
+              <div className="runtime-state-strip" aria-label="task state">
+                <div className={`runtime-state-tile tone-${runtimePanelTone}`}>
+                  <span>Run</span>
+                  <strong>{currentRunStateLabel}</strong>
+                </div>
+                <div className={`runtime-state-tile tone-${nextIntentLabel === "approve" ? "approval" : "idle"}`}>
+                  <span>Next</span>
+                  <strong>{nextIntentLabel}</strong>
+                </div>
+                <div className={`runtime-state-tile tone-${runtimeOutputCards.length ? "active" : "idle"}`}>
+                  <span>Outputs</span>
+                  <strong>{outputCountLabel}</strong>
+                </div>
               </div>
             </div>
           </div>
@@ -3908,181 +4045,124 @@ export default function App() {
             <div className="conversation-stack">
               {!(providerNeedsCodexLogin && !codexAuth.loggedIn) ? (
                 <>
-                  <section className="shell-card task-cockpit">
+                  <section className="shell-card active-run-card">
                     <div className="task-panel-head">
                       <div>
-                        <p className="section-eyebrow">Task Board</p>
-                        <h3>工作流总览</h3>
+                        <p className="section-eyebrow">Active run</p>
+                        <h3>{activeRuntimeTurn ? "Managed Codex run" : "No active run"}</h3>
                       </div>
-                      <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{runtimePanelStatus}</span>
+                      <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>managed</span>
                     </div>
-                    <div className="runtime-summary-grid">
-                      <RuntimeSummaryCard
-                        label="任务"
-                        value={`${runtimeTaskCount}`}
-                        tone={activeRuntimeTask ? runtimeTone(activeRuntimeTask.status) : "idle"}
-                        detail={
-                          activeRuntimeTask
-                            ? truncateInline(activeRuntimeTask.title || "当前任务进行中", 44)
-                            : "当前还没有任务骨架"
-                        }
-                      />
-                      <RuntimeSummaryCard
-                        label="活跃 Run"
-                        value={`${runtimeTurnCount}`}
-                        tone={activeRuntimeTurn ? runtimeTone(activeRuntimeTurn.status) : "idle"}
-                        detail={activeRunTimeLabel}
-                      />
-                      <RuntimeSummaryCard
-                        label="异常 / 待确认"
-                        value={`${runtimeExceptionCount}`}
-                        tone={runtimeExceptionCount > 0 ? "error" : "ready"}
-                        detail={runtimeFocusDetail}
-                      />
-                      <RuntimeSummaryCard
-                        label="资源 / 产物"
-                        value={`${runtimeResourceCount} / ${runtimeArtifactCount}`}
-                        tone={runtimeArtifactCount > 0 || runtimeResourceCount > 0 ? "active" : "idle"}
-                        detail={activeWorkspace?.name ?? "当前没有附加目录资源"}
-                      />
+                    <div
+                      className={`active-run-summary tone-${
+                        activeRuntimeTurn ? (runtimeExceptionCount > 0 ? "error" : "active") : "idle"
+                      }`}
+                    >
+                      <div>
+                        <strong>{activeRunSummary}</strong>
+                        <p>next: {nextIntentLabel}</p>
+                      </div>
                     </div>
                   </section>
 
-                  <section className="shell-card task-board-shell">
+                  <section className="shell-card runtime-timeline-card">
                     <div className="task-panel-head">
                       <div>
-                        <p className="section-eyebrow">Workstream Board</p>
-                        <h3>多任务编排看板</h3>
+                        <p className="section-eyebrow">Timeline</p>
+                        <h3>Run events</h3>
                       </div>
-                      <span className="drawer-chip drawer-chip-active">
-                        {`${sessionRuntimeSummaries.length} 个任务流`}
+                      <span className="drawer-chip drawer-chip-idle">
+                        {hiddenRuntimeTimelineCount
+                          ? `${visibleRuntimeTimelineItems.length} shown`
+                          : `${visibleRuntimeTimelineItems.length} items`}
                       </span>
                     </div>
-                    <div className="task-board-grid">
-                      <TaskBoardLane
-                        title="执行中"
-                        eyebrow="In Progress"
-                        tone="active"
-                        entries={activeWorkstreamEntries}
-                        activeSessionId={activeSessionId}
-                        onSelect={handleSelectSession}
-                        emptyLabel="当前没有正在推进的任务流。"
-                      />
-                      <TaskBoardLane
-                        title="等待中"
-                        eyebrow="Waiting"
-                        tone="loading"
-                        entries={waitingWorkstreamEntries}
-                        activeSessionId={activeSessionId}
-                        onSelect={handleSelectSession}
-                        emptyLabel="当前没有等待决策或确认的任务流。"
-                      />
-                      <TaskBoardLane
-                        title="已完成"
-                        eyebrow="Done"
-                        tone="ready"
-                        entries={doneWorkstreamEntries}
-                        activeSessionId={activeSessionId}
-                        onSelect={handleSelectSession}
-                        emptyLabel="当前还没有完成态任务流。"
-                      />
+                    <div className="task-timeline-list runtime-timeline-list">
+                      {runtimePanelState.error ? (
+                        <div className="status-banner status-banner-error">
+                          <strong>Runtime read failed</strong>
+                          <span>{runtimePanelState.error}</span>
+                        </div>
+                      ) : (
+                        visibleRuntimeTimelineItems.map((item) => (
+                          <div key={item.id} className="task-timeline-item">
+                            <div className="task-timeline-marker" aria-hidden="true" />
+                            <div className="task-timeline-body">
+                              <div className="task-timeline-head">
+                                <span className="task-timeline-time">
+                                  {formatRuntimeTime(item.updatedAt ?? item.createdAt)}
+                                </span>
+                                <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
+                                <span
+                                  className={`drawer-chip drawer-chip-${runtimeTone(
+                                    item.status,
+                                    item.approvalState
+                                  )}`}
+                                >
+                                  {runtimeItemStateLabel(item)}
+                                </span>
+                              </div>
+                              <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
+                              <p>{item.summary || truncateInline(item.content || "No summary.", 120)}</p>
+                            </div>
+                          </div>
+                        ))
+                      )}
                     </div>
                   </section>
 
-                  <div className="task-flow-grid">
-                    <section className="shell-card task-stage-card">
+                  {visibleOutputCards.length ? (
+                    <section className="shell-card runtime-outputs-card">
                       <div className="task-panel-head">
                         <div>
-                          <p className="section-eyebrow">Selected Workstream</p>
-                          <h3>选中任务详情</h3>
+                          <p className="section-eyebrow">Outputs</p>
+                          <h3>Artifacts</h3>
                         </div>
-                        <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{runtimePanelStatus}</span>
-                      </div>
-                      <div className="drawer-meta-grid">
-                        <div className="drawer-meta-row">
-                          <span className="drawer-meta-label">任务流</span>
-                          <span className="drawer-meta-value">
-                            {activeSessionSummary?.title || "先创建任务流"}
-                          </span>
-                        </div>
-                        <div className="drawer-meta-row">
-                          <span className="drawer-meta-label">编排态</span>
-                          <span className="drawer-meta-value">
-                            {activeSessionSummary?.statusLabel || "空"}
-                          </span>
-                        </div>
-                        <div className="drawer-meta-row">
-                          <span className="drawer-meta-label">当前任务</span>
-                          <span className="drawer-meta-value">
-                            {activeRuntimeTask?.title || "先通过下方 command bar 创建任务"}
-                          </span>
-                        </div>
-                        <div className="drawer-meta-row">
-                          <span className="drawer-meta-label">Run</span>
-                          <span className="drawer-meta-value">{activeRunLabel}</span>
-                        </div>
-                        <div className="drawer-meta-row">
-                          <span className="drawer-meta-label">摘要</span>
-                          <span className="drawer-meta-value">{activeRunSummary}</span>
-                        </div>
-                      </div>
-                      <div className={`task-focus-banner tone-${runtimeExceptionCount > 0 ? "error" : "active"}`}>
-                        <span className="task-focus-label">{runtimeFocusTitle}</span>
-                        <p>{runtimeFocusDetail}</p>
-                      </div>
-                    </section>
-
-                    <section className="shell-card task-stage-card">
-                      <div className="task-panel-head">
-                        <div>
-                          <p className="section-eyebrow">Run Timeline</p>
-                          <h3>最近事件</h3>
-                        </div>
-                        <span className="drawer-chip drawer-chip-idle">
-                          {`${activeRuntimeSnapshot.turnItems.length} item`}
+                        <span className="drawer-chip drawer-chip-active">
+                          {`${runtimeOutputCards.length} visible`}
                         </span>
                       </div>
-                      <div className="task-timeline-list">
-                        {runtimePanelState.error ? (
-                          <div className="status-banner status-banner-error">
-                            <strong>Runtime 读取失败</strong>
-                            <span>{runtimePanelState.error}</span>
-                          </div>
-                        ) : runtimeTimelineItems.length > 0 ? (
-                          runtimeTimelineItems.map((item) => (
-                            <div key={item.id} className="task-timeline-item">
-                              <div className="task-timeline-marker" aria-hidden="true" />
-                              <div className="task-timeline-body">
-                                <div className="task-timeline-head">
-                                  <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
-                                  <span
-                                    className={`drawer-chip drawer-chip-${runtimeTone(
-                                      item.status,
-                                      item.approvalState
-                                    )}`}
-                                  >
-                                    {runtimeItemStateLabel(item)}
-                                  </span>
-                                </div>
-                                <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
-                                <p>{item.summary || truncateInline(item.content || "暂无摘要。", 120)}</p>
-                              </div>
-                            </div>
-                          ))
-                        ) : (
-                          <div className="proposal-empty">
-                            <EmptyVisual label="当前还没有运行事件" tone="idle" />
-                          </div>
-                        )}
+                      <div className="runtime-output-grid">
+                        {visibleOutputCards.map((output) => (
+                          <button
+                            key={output.id}
+                            type="button"
+                            className={`runtime-output-tile tone-${output.tone}`}
+                            onClick={() => setInspectorTab("artifacts")}
+                          >
+                            <strong>{output.title}</strong>
+                            <span>{output.meta}</span>
+                          </button>
+                        ))}
+                        {outputOverflowCount > 0 ? (
+                          <button
+                            type="button"
+                            className="runtime-output-tile tone-idle is-overflow"
+                            onClick={() => setInspectorTab("artifacts")}
+                          >
+                            <strong>{`+${outputOverflowCount}`}</strong>
+                            <span>more</span>
+                          </button>
+                        ) : null}
                       </div>
                     </section>
-                  </div>
+                  ) : (
+                    <section className="runtime-outputs-strip" aria-label="Outputs">
+                      <div>
+                        <p className="section-eyebrow">Outputs</p>
+                        <h3>Artifacts</h3>
+                      </div>
+                      <span className="drawer-chip drawer-chip-active">
+                        {`${runtimeOutputCards.length} visible`}
+                      </span>
+                    </section>
+                  )}
                 </>
               ) : null}
               {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
                 <div className="shell-card hero-card">
                   <p className="section-eyebrow">Codex</p>
-                  <h2>登录 Codex</h2>
+                  <h2>Codex Login</h2>
                   <p>{codexAuth.message}</p>
                   {codexLoginDetail ? <p className="field-hint">{codexLoginDetail}</p> : null}
                   <div className="compact-row">
@@ -4092,7 +4172,7 @@ export default function App() {
                       disabled={codexChecking}
                       onClick={handleCodexLogin}
                     >
-                      {codexChecking ? "登录中…" : "登录 Codex"}
+                      {codexChecking ? "Logging in..." : "Login"}
                     </button>
                     <button
                       type="button"
@@ -4100,11 +4180,11 @@ export default function App() {
                       disabled={codexChecking}
                       onClick={handleRefreshCodexStatus}
                     >
-                      {codexChecking ? "刷新中…" : "刷新状态"}
+                      {codexChecking ? "Refreshing..." : "Refresh"}
                     </button>
                   </div>
                 </div>
-              ) : activeSession?.messages?.length ? (
+              ) : layoutMode === "chat" && activeSession?.messages?.length ? (
                 <>
                   {activeSession.messages.map((message) => (
                     <MessageBubble
@@ -4134,7 +4214,7 @@ export default function App() {
                       <div className="inline-proposals-head decision-deck-head">
                         <div>
                           <p className="section-eyebrow">Decisions</p>
-                          <h3>方向</h3>
+                          <h3>Directions</h3>
                         </div>
                         <div className="decision-deck-meta">
                           <button
@@ -4144,8 +4224,8 @@ export default function App() {
                             onClick={() => handleDismissDecisionSet(activeDecisionSet)}
                           >
                             {rejectingAllDecisions
-                              ? "处理中…"
-                              : activeDecisionSet.dismissAction?.label ?? "都不选"}
+                              ? "Working..."
+                              : activeDecisionSet.dismissAction?.label ?? "Skip"}
                           </button>
                         </div>
                       </div>
@@ -4179,13 +4259,13 @@ export default function App() {
                     <section className="shell-card selected-choice-banner">
                       <div className="selected-choice-banner-head">
                         <p className="section-eyebrow">Selected</p>
-                        <span className="drawer-chip drawer-chip-active">已选择</span>
+                        <span className="drawer-chip drawer-chip-active">selected</span>
                       </div>
-                      <h3>{selectedChoiceLabel || "已选择一个方向"}</h3>
+                      <h3>{selectedChoiceLabel || "Selected direction"}</h3>
                       <p>
                         {previewDeckActive
-                          ? "这个方向的预览已经展开在下方，确认后才会应用。"
-                          : "正在沿这个方向生成更具体的预览。"}
+                          ? "Preview is expanded below. Approval is still required before applying."
+                          : "Solo is generating a more specific preview for this direction."}
                       </p>
                     </section>
                   ) : null}
@@ -4194,7 +4274,7 @@ export default function App() {
                       <div className="inline-proposals-head">
                         <div>
                           <p className="section-eyebrow">Preview</p>
-                          <h3>预览</h3>
+                          <h3>Preview</h3>
                         </div>
                       </div>
                       <div className="proposal-stack preview-card-grid">
@@ -4211,12 +4291,12 @@ export default function App() {
                     </section>
                   ) : null}
                 </>
-              ) : (
+              ) : layoutMode === "chat" ? (
                 <div className="empty-state hero">
                   <p className="section-eyebrow">Operator Log</p>
-                  <h2>今天推进什么？</h2>
+                  <h2>What should move next?</h2>
                 </div>
-              )}
+              ) : null}
             </div>
           </div>
 
@@ -4225,7 +4305,7 @@ export default function App() {
               <div className="composer-bar-head">
                 <div>
                   <p className="section-eyebrow">Command Bar</p>
-                  <strong>目标 / 干预</strong>
+                  <strong>{commandBarTitle}</strong>
                 </div>
               </div>
               <div className="composer-control-strip" aria-label="command quick actions">
@@ -4245,10 +4325,10 @@ export default function App() {
               {activeSessionWorkspaceId ? (
                 <div className="composer-resource-strip">
                   <div className="composer-resource-main">
-                    <span className="composer-resource-label">当前资源</span>
-                    <strong>{activeWorkspace?.name ?? "已选目录"}</strong>
+                    <span className="composer-resource-label">Resource</span>
+                    <strong>{activeWorkspace?.name ?? "selected directory"}</strong>
                     <span className="composer-resource-path">
-                      {activeWorkspace?.path ?? "目录路径暂不可用"}
+                      {activeWorkspace?.path ?? "path unavailable"}
                     </span>
                   </div>
                   <div className="composer-resource-actions">
@@ -4257,10 +4337,10 @@ export default function App() {
                       className="ghost-button"
                       onClick={() => setWorkspaceModalOpen(true)}
                     >
-                      更换
+                      Change
                     </button>
                     <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                      移除
+                      Detach
                     </button>
                   </div>
                 </div>
@@ -4279,23 +4359,42 @@ export default function App() {
                 <div className="composer-button-row">
                   <button
                     type="button"
-                    className={`ghost-button composer-attach-button ${
-                      activeSessionWorkspaceId ? "has-context" : ""
-                    }`}
-                    aria-label={composerContextButtonLabel}
-                    title={composerContextButtonLabel}
-                    onClick={() => setWorkspaceModalOpen(true)}
-                  >
-                    <PaperclipIcon />
-                  </button>
-                  <button
-                    type="button"
                     className="primary-button"
-                    disabled={!canSend}
-                    onClick={handleSend}
+                    disabled={commandPrimaryDisabled}
+                    onClick={() => {
+                      if (supervisionState === "idle") {
+                        handleSend();
+                      }
+                    }}
                   >
-                    发送
+                    {commandPrimaryLabel}
                   </button>
+                  {supervisionState === "waitingApproval" ? (
+                    <>
+                      <button type="button" className="ghost-button">
+                        Revise
+                      </button>
+                      <button type="button" className="ghost-button">
+                        Evidence
+                      </button>
+                    </>
+                  ) : null}
+                  {supervisionState === "idle" ? (
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => setWorkspaceModalOpen(true)}
+                      aria-label={composerContextButtonLabel}
+                      title={composerContextButtonLabel}
+                    >
+                      More
+                    </button>
+                  ) : null}
+                  {supervisionState === "blocked" ? (
+                    <button type="button" className="danger-button">
+                      Abort
+                    </button>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -4305,10 +4404,58 @@ export default function App() {
         <aside className="inspector">
           <div className="inspector-head">
             <div>
-              <p className="section-eyebrow">Run Detail</p>
-              <h2>运行详情</h2>
+              <p className="section-eyebrow">Inspecting</p>
+              <h2>{inspectorTitle}</h2>
             </div>
             <span className="section-count">{runtimePanelStatus}</span>
+          </div>
+
+          <div className="inspector-cockpit">
+            <section className="inspector-checkpoint-card">
+              <span className="section-eyebrow">{inspectorStatus}</span>
+              <h3>{inspectorQuestion}</h3>
+              <p>{inspectorImpact}</p>
+              {hasPendingApproval ? (
+                <div className="inspector-action-row">
+                  <button type="button" className="primary-button">
+                    Approve
+                  </button>
+                  <button type="button" className="ghost-button">
+                    Revise
+                  </button>
+                  <button type="button" className="ghost-button">
+                    Evidence
+                  </button>
+                </div>
+              ) : null}
+            </section>
+
+            <section className="inspector-evidence-card">
+              <h3>Evidence</h3>
+              <div className="inspector-evidence-list">
+                {inspectorEvidence.map((item) => (
+                  <p key={item}>{item}</p>
+                ))}
+              </div>
+            </section>
+
+            <section className="inspector-external-card">
+              <div>
+                <span className="section-eyebrow">External Codex</span>
+                <h3>
+                  {primaryObservedCodexAgent
+                    ? `${codexAgentStateLabel(primaryObservedCodexAgent.state)} · observe-only`
+                    : "observe-only"}
+                </h3>
+              </div>
+              <p>
+                {primaryObservedCodexAgent
+                  ? `workspace: ${primaryObservedCodexAgent.cwd}`
+                  : observedCodexState.loading
+                    ? "scanning local Codex processes"
+                    : "no external run selected"}
+              </p>
+            </section>
           </div>
 
           <div className="inspector-summary-strip" aria-label="运行摘要">
