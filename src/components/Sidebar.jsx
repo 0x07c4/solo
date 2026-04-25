@@ -134,7 +134,7 @@ export function Sidebar({
           </div>
         ) : (
           <div className="empty-state compact">
-            <p>给当前会话绑定工作区后，这里会显示文件树。</p>
+            <p>给当前 run 附加目录资源后，这里会显示文件树。</p>
           </div>
         )}
       </section>

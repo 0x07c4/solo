@@ -132,6 +132,33 @@
 - 人不是默认执行器
 - 人是监督者、调度者和最后的升级处理点
 
+### 4.6 外部 Agent 观测
+
+`Solo` 还需要支持一种很常见的真实场景：
+
+- 用户已经在某个终端里启动了 `codex`
+- 这个 `codex` 正在某个 workspace 里执行任务
+- 用户打开 `Solo` 不是为了再启动一个新会话，而是想监督现有 agent 的状态
+
+这类对象不应该被建模成新的 `provider`，也不应该被硬塞进聊天 `session`。
+
+更准确的归属是：
+
+- 它是一个外部 `run`
+- 它占用一个 workspace/resource
+- 它能被观测，但默认不能被控制
+
+第一版能力边界：
+
+- 扫描本机正在运行的 `codex` 进程
+- 读取进程 `pid / cwd / command / state`
+- 用 `cwd` 匹配 Solo 已登记的 workspace
+- UI 标记为 `observe-only`
+- 不向外部终端注入输入
+- 不承诺能暂停、继续、批准或接管
+
+后续只有在 `codex` 由 Solo 自己通过 managed runtime 启动，或通过明确的 `pty/tmux/wrapper` 归 Solo 管理时，才升级为可控制 run。
+
 ## 5. 产品边界
 
 ### 应该是

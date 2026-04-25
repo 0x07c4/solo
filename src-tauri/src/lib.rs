@@ -6,6 +6,7 @@ use crate::models::{
     ChatMessage, ChatSession, ChatStreamDoneEvent, ChatStreamStatusEvent, ChatStreamTokenEvent,
     CodexLoginProgressEvent, CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent,
     ConnectionTestResult, ItemApprovalState, ManualImportResult, MessageAttachment,
+    ObservedCodexAgent,
     ProposalChooseResult, SessionInteractionMode, SessionRuntimeSnapshot, Settings,
     SettingsUpdate, TaskRecord, TaskStatus, ToolProposal, ToolProposalPayload, TurnIntent,
     TurnItem, TurnItemKind, TurnItemStatus, TurnRecord, TurnStatus, Workspace,
@@ -80,6 +81,7 @@ pub fn run() {
             open_chatgpt_in_browser,
             codex_login_status,
             codex_login_start,
+            codex_running_agents,
             settings_get,
             settings_update,
             settings_test_connection,
@@ -333,6 +335,135 @@ fn codex_login_start(app: tauri::AppHandle, state: State<'_, SharedState>) -> Re
         let _ = app_handle.emit("codex-login-progress", status_message);
     });
     Ok(true)
+}
+
+#[tauri::command]
+fn codex_running_agents(state: State<'_, SharedState>) -> Result<Vec<ObservedCodexAgent>, String> {
+    let (workspaces, sessions) = state.read(|store| (store.workspaces.clone(), store.sessions.clone()));
+    discover_codex_processes(&workspaces, &sessions)
+}
+
+#[cfg(target_os = "linux")]
+fn discover_codex_processes(
+    workspaces: &[Workspace],
+    sessions: &[ChatSession],
+) -> Result<Vec<ObservedCodexAgent>, String> {
+    let entries = fs::read_dir("/proc").map_err(|err| format!("读取 /proc 失败：{err}"))?;
+    let mut agents = Vec::new();
+    let last_seen_at = now_millis();
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let Some(pid_text) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+
+        let proc_path = entry.path();
+        let Some((command, is_codex)) = read_proc_cmdline(&proc_path) else {
+            continue;
+        };
+        if !is_codex {
+            continue;
+        }
+
+        let cwd = fs::read_link(proc_path.join("cwd"))
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let state = fs::read_to_string(proc_path.join("stat"))
+            .ok()
+            .map(|stat| proc_state_label(&stat))
+            .unwrap_or_else(|| "unknown".to_string());
+        let matched_workspace_id = match_workspace_for_cwd(&cwd, workspaces);
+        let matched_session_id = match_session_for_workspace(matched_workspace_id.as_deref(), sessions);
+
+        agents.push(ObservedCodexAgent {
+            id: format!("external-codex-{pid}"),
+            pid,
+            cwd,
+            command,
+            started_at: None,
+            state,
+            ownership: "external".to_string(),
+            control_level: "observeOnly".to_string(),
+            matched_workspace_id,
+            matched_session_id,
+            last_seen_at,
+        });
+    }
+
+    agents.sort_by(|left, right| left.cwd.cmp(&right.cwd).then_with(|| left.pid.cmp(&right.pid)));
+    Ok(agents)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discover_codex_processes(
+    _workspaces: &[Workspace],
+    _sessions: &[ChatSession],
+) -> Result<Vec<ObservedCodexAgent>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cmdline(proc_path: &Path) -> Option<(String, bool)> {
+    let raw = fs::read(proc_path.join("cmdline")).ok()?;
+    let args = raw
+        .split(|byte| *byte == 0)
+        .filter_map(|part| {
+            if part.is_empty() {
+                return None;
+            }
+            Some(String::from_utf8_lossy(part).to_string())
+        })
+        .collect::<Vec<_>>();
+    let first_arg = args.first()?;
+    let first_name = Path::new(first_arg)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first_arg);
+    let is_codex = first_name == "codex";
+    Some((args.join(" "), is_codex))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_state_label(stat: &str) -> String {
+    let Some((_, rest)) = stat.rsplit_once(") ") else {
+        return "unknown".to_string();
+    };
+    match rest.split_whitespace().next() {
+        Some("R") => "running",
+        Some("S") | Some("D") | Some("I") => "sleeping",
+        Some(_) => "unknown",
+        None => "unknown",
+    }
+    .to_string()
+}
+
+fn match_workspace_for_cwd(cwd: &str, workspaces: &[Workspace]) -> Option<String> {
+    let cwd_path = Path::new(cwd);
+    workspaces
+        .iter()
+        .filter(|workspace| cwd_path.starts_with(Path::new(&workspace.path)))
+        .max_by_key(|workspace| workspace.path.len())
+        .map(|workspace| workspace.id.clone())
+}
+
+fn match_session_for_workspace(
+    workspace_id: Option<&str>,
+    sessions: &[ChatSession],
+) -> Option<String> {
+    let workspace_id = workspace_id?;
+    sessions
+        .iter()
+        .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
+        .max_by_key(|session| session.updated_at)
+        .map(|session| session.id.clone())
 }
 
 #[tauri::command]

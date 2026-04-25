@@ -56,17 +56,12 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
       <div className="modal-card">
         <div className="section-header">
           <div>
-            <p className="section-eyebrow">Context</p>
-            <h2>添加代码上下文</h2>
+            <p className="section-eyebrow">Resource</p>
+            <h2>添加目录资源</h2>
           </div>
           <button type="button" className="ghost-button" onClick={onClose}>
             关闭
           </button>
-        </div>
-
-        <div className="modal-copy">
-          <p>当前版本会直接打开系统目录选择器，由你挑选一个项目目录。</p>
-          <p>这一步只是告诉 Solo 哪个目录可在工作区协作里读取；默认不会替你改文件或执行命令。</p>
         </div>
 
         <label className="field">
@@ -76,7 +71,6 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
             readOnly
             placeholder="点击下方按钮选择目录"
           />
-          <small>你可以反复更换，直到确认这是这轮协作真正需要的目录。</small>
         </label>
 
         {error ? (
@@ -101,7 +95,7 @@ export function WorkspaceModal({ open, onClose, onSubmit }) {
             disabled={submitting || !path.trim()}
             onClick={handleSubmit}
           >
-            添加为上下文
+            添加为资源
           </button>
         </div>
       </div>

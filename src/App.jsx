@@ -7,6 +7,7 @@ import "./App.css";
 
 const LOGIN_POLL_ATTEMPTS = 15;
 const LOGIN_POLL_INTERVAL_MS = 2000;
+const CODEX_AGENT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_THEME = "gruvbox-dark";
 const MAX_STREAM_PROGRESS_ITEMS = 12;
 const STREAM_NO_TOKEN_WARN_S = 12;
@@ -19,15 +20,6 @@ const TURN_INTENT_AUTO = "auto";
 const TURN_INTENT_CHOICE = "choice";
 const TURN_INTENT_PREVIEW = "preview";
 const REJECT_ALL_DECISIONS_ACTION_ID = "reject_all_decisions";
-const THEME_OPTIONS = [
-  { value: "gruvbox-dark", label: "Gruvbox Dark" },
-  { value: "tokyonight", label: "Tokyo Night" },
-  { value: "nord", label: "Nord Night" },
-  { value: "kanagawa", label: "Kanagawa Ink" },
-  { value: "gruvbox-light", label: "Gruvbox Light" },
-  { value: "paper-light", label: "Paper Light" },
-  { value: "nord-light", label: "Nord Light" },
-];
 const DEFAULT_SETTINGS = {
   provider: "codex_cli",
   baseUrl: "https://api.openai.com/v1",
@@ -43,14 +35,8 @@ const DEFAULT_SETTINGS = {
   codexNoProxy: "",
 };
 
-const SUPPORTED_THEMES = new Set(THEME_OPTIONS.map((theme) => theme.value));
-
-function normalizeTheme(theme) {
-  if (typeof theme !== "string") {
-    return DEFAULT_THEME;
-  }
-  const normalized = theme.trim().toLowerCase();
-  return SUPPORTED_THEMES.has(normalized) ? normalized : DEFAULT_THEME;
+function normalizeTheme() {
+  return DEFAULT_THEME;
 }
 
 function normalizeSettings(settings) {
@@ -99,11 +85,11 @@ function normalizeSessionMode(mode) {
 }
 
 function sessionModeLabel(mode) {
-  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "工作区协作" : "对话";
+  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "资源参与" : "资源未参与";
 }
 
 function sessionModeTrailLabel(mode) {
-  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "协作" : "对话";
+  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "资源参与" : "纯对话";
 }
 
 function normalizeTurnIntent(intent) {
@@ -134,7 +120,7 @@ function pendingAssistantLabel(seconds, sessionMode, turnIntent = TURN_INTENT_AU
     const normalizedIntent = normalizeTurnIntent(turnIntent);
     if (normalizedIntent === TURN_INTENT_CHOICE) {
       if (seconds >= 20) {
-        return `正在查看工作区并整理方向建议…（${seconds}s）`;
+        return `正在查看附加资源并整理方向建议…（${seconds}s）`;
       }
       if (seconds >= 3) {
         return `正在整理方向建议…（${seconds}s）`;
@@ -143,7 +129,7 @@ function pendingAssistantLabel(seconds, sessionMode, turnIntent = TURN_INTENT_AU
     }
     if (normalizedIntent === TURN_INTENT_PREVIEW) {
       if (seconds >= 20) {
-        return `正在查看工作区并展开具体预览…（${seconds}s）`;
+        return `正在查看附加资源并展开具体预览…（${seconds}s）`;
       }
       if (seconds >= 3) {
         return `正在展开具体预览…（${seconds}s）`;
@@ -151,7 +137,7 @@ function pendingAssistantLabel(seconds, sessionMode, turnIntent = TURN_INTENT_AU
       return "正在展开具体预览…";
     }
     if (seconds >= 20) {
-      return `正在查看工作区并整理协作分析…（${seconds}s）`;
+      return `正在查看附加资源并整理协作分析…（${seconds}s）`;
     }
     if (seconds >= 3) {
       return `正在整理协作分析…（${seconds}s）`;
@@ -339,6 +325,88 @@ function normalizeRuntimeSnapshot(snapshot, sessionId = "") {
     turns: Array.isArray(snapshot.turns) ? snapshot.turns : [],
     turnItems: Array.isArray(snapshot.turnItems) ? snapshot.turnItems : [],
   };
+}
+
+function normalizeObservedCodexAgents(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((agent) => agent && typeof agent === "object")
+    .map((agent) => ({
+      id: typeof agent.id === "string" && agent.id.trim() ? agent.id : `external-codex-${agent.pid ?? "unknown"}`,
+      pid: Number.isFinite(agent.pid) ? agent.pid : 0,
+      cwd: typeof agent.cwd === "string" && agent.cwd.trim() ? agent.cwd : "unknown",
+      command: typeof agent.command === "string" ? agent.command : "",
+      startedAt: agent.startedAt ?? null,
+      state: typeof agent.state === "string" && agent.state.trim() ? agent.state : "unknown",
+      ownership: typeof agent.ownership === "string" && agent.ownership.trim() ? agent.ownership : "external",
+      controlLevel:
+        typeof agent.controlLevel === "string" && agent.controlLevel.trim()
+          ? agent.controlLevel
+          : "observeOnly",
+      matchedWorkspaceId:
+        typeof agent.matchedWorkspaceId === "string" && agent.matchedWorkspaceId.trim()
+          ? agent.matchedWorkspaceId
+          : null,
+      matchedSessionId:
+        typeof agent.matchedSessionId === "string" && agent.matchedSessionId.trim()
+          ? agent.matchedSessionId
+          : null,
+      lastSeenAt: Number.isFinite(agent.lastSeenAt) ? agent.lastSeenAt : Date.now(),
+    }));
+}
+
+function codexAgentStateLabel(state) {
+  if (state === "running") {
+    return "运行中";
+  }
+  if (state === "sleeping") {
+    return "空闲/等待";
+  }
+  return "未知";
+}
+
+function codexAgentTone(agent) {
+  if (agent?.state === "running") {
+    return "active";
+  }
+  if (agent?.state === "sleeping") {
+    return "loading";
+  }
+  return "idle";
+}
+
+function ExternalAgentResourceCard({ agent, workspace, session, current, onFocusSession }) {
+  return (
+    <div className={`external-resource-agent-card ${current ? "is-current" : ""}`}>
+      <div className="external-resource-agent-head">
+        <div>
+          <span className="section-eyebrow">External Codex</span>
+          <strong>{workspace?.name ?? "Untracked workspace"}</strong>
+        </div>
+        <span className={`drawer-chip drawer-chip-${codexAgentTone(agent)}`}>
+          {codexAgentStateLabel(agent.state)}
+        </span>
+      </div>
+      <p>{agent.cwd}</p>
+      <div className="external-agent-meta">
+        <span>pid {agent.pid || "unknown"}</span>
+        <span>observe-only</span>
+        <span>{workspace ? "workspace linked" : "workspace unknown"}</span>
+        <span>{formatRuntimeTime(agent.lastSeenAt)}</span>
+      </div>
+      {session ? (
+        <button
+          type="button"
+          className="ghost-button external-agent-action"
+          onClick={() => onFocusSession(session.id)}
+        >
+          聚焦会话
+        </button>
+      ) : null}
+    </div>
+  );
 }
 
 function taskStatusLabel(status) {
@@ -827,9 +895,9 @@ function summarizeProgress(progress) {
   if (latest.stage === "思考" || latest.stage === "生成回复") {
     title = "正在整理建议与预览…";
   } else if (latest.stage === "执行工具") {
-    title = "正在查看相关文件和上下文…";
+    title = "正在查看相关文件和资源…";
   } else if (latest.stage === "工作区") {
-    title = latestDetail || "正在接入当前工作区…";
+    title = latestDetail || "正在接入当前资源…";
   }
 
   return {
@@ -1073,6 +1141,16 @@ function PaperclipIcon() {
   );
 }
 
+function EmptyVisual({ label = "空状态", tone = "idle" }) {
+  return (
+    <div className={`empty-visual empty-visual-${tone}`} aria-label={label} role="img">
+      <span />
+      <span />
+      <span />
+    </div>
+  );
+}
+
 function MessageBubble({ message, progress = [] }) {
   const status = messageStatusLabel(message.status);
   const roleLabel = message.role === "user" ? "你" : "ChatGPT";
@@ -1228,7 +1306,6 @@ function DecisionOptionCard({ option, active, index, total, onPreview }) {
           <p>{option.summary}</p>
         </div>
         <div className="decision-option-foot">
-          <span className="decision-option-hint">点击卡片先查看这个方向的预览</span>
           <span className="decision-option-arrow" aria-hidden="true">
             ↗
           </span>
@@ -1371,7 +1448,6 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
       ) : null}
 
       <div className="decision-preview-footer">
-        <p>先看判断板，再决定是否进入下一层具体预览。</p>
         <div className="decision-preview-actions">
           <button
             type="button"
@@ -1397,10 +1473,14 @@ function DecisionPreviewPanel({ option, decisionSet, busy, skipBusy, onConfirm, 
 
 function RuntimeSummaryCard({ label, value, tone = "idle", detail = "" }) {
   return (
-    <article className={`runtime-summary-card runtime-summary-card-${tone}`}>
+    <article className={`runtime-summary-card runtime-summary-card-${tone}`} title={detail || label}>
       <span className="runtime-summary-label">{label}</span>
       <strong className="runtime-summary-value">{value}</strong>
-      {detail ? <p className="runtime-summary-detail">{detail}</p> : null}
+      <span className="runtime-summary-signal" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
     </article>
   );
 }
@@ -1462,7 +1542,7 @@ function TaskBoardLane({
         </div>
       ) : (
         <div className="task-board-empty">
-          <span>{emptyLabel}</span>
+          <EmptyVisual label={emptyLabel} tone={tone} />
         </div>
       )}
     </section>
@@ -1517,8 +1597,55 @@ function ExceptionCard({ entry, active, onSelect }) {
 }
 
 export default function App() {
+  const [observedCodexState, setObservedCodexState] = useState({
+    agents: [],
+    loading: false,
+    error: "",
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadObservedCodexAgents = async () => {
+      setObservedCodexState((current) => ({
+        ...current,
+        loading: current.agents.length === 0,
+        error: "",
+      }));
+      try {
+        const agents = normalizeObservedCodexAgents(await desktop.codexRunningAgents());
+        if (cancelled) {
+          return;
+        }
+        setObservedCodexState({
+          agents,
+          loading: false,
+          error: "",
+        });
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setObservedCodexState((current) => ({
+          ...current,
+          loading: false,
+          error: normalizeError(error),
+        }));
+      }
+    };
+
+    void loadObservedCodexAgents();
+    const timer = window.setInterval(() => void loadObservedCodexAgents(), CODEX_AGENT_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const mountedRef = useRef(true);
   const activeSessionIdRef = useRef("");
+  const composerInputRef = useRef(null);
 
   const [codexAuth, setCodexAuth] = useState({
     available: true,
@@ -1533,7 +1660,6 @@ export default function App() {
   const [streamProgressBySession, setStreamProgressBySession] = useState({});
   const [streamMonitorBySession, setStreamMonitorBySession] = useState({});
   const [draft, setDraft] = useState("");
-  const [theme, setTheme] = useState(DEFAULT_THEME);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [connectionState, setConnectionState] = useState({ status: "idle", message: "" });
@@ -1830,8 +1956,8 @@ export default function App() {
   }, [streamMonitorBySession]);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-  }, [theme]);
+    document.documentElement.setAttribute("data-theme", DEFAULT_THEME);
+  }, []);
 
   useEffect(() => {
     if (!hasCustomWindowChrome) {
@@ -1901,7 +2027,6 @@ export default function App() {
           return;
         }
 
-        setTheme(normalizedSettings.theme);
         setSettings(normalizedSettings);
         setWorkspaces(loadedWorkspaces);
         setSessions(sortSessions(nextSessions));
@@ -2357,7 +2482,7 @@ export default function App() {
           stage: "监控",
           detail:
             activeSessionMode === SESSION_MODE_WORKSPACE
-              ? `已进入工作区协作，${noTokenWarnS}s 仍在整理建议与预览。`
+              ? `已启用附加资源，${noTokenWarnS}s 仍在整理建议与预览。`
               : `已收到内部状态，但 ${noTokenWarnS}s 仍无正文输出。`,
           level: "warn",
         });
@@ -2392,7 +2517,7 @@ export default function App() {
           stage: "监控",
           detail:
             activeSessionMode === SESSION_MODE_WORKSPACE
-              ? `${stallWarnS}s 没有新进展，工作区协作仍在等待结果。`
+              ? `${stallWarnS}s 没有新进展，资源参与 run 仍在等待结果。`
               : `${stallWarnS}s 无新进展，回复时间偏长。`,
           level: "warn",
         });
@@ -2604,7 +2729,7 @@ export default function App() {
     ) {
       setNotice({
         kind: "info",
-        text: "需要代码上下文时，先为当前会话选择一个目录。",
+        text: "当前没有待授权的资源请求。",
       });
       return;
     }
@@ -2622,8 +2747,8 @@ export default function App() {
         kind: "info",
         text:
           normalizedNextMode === SESSION_MODE_WORKSPACE
-            ? "当前会话已切到工作区协作，默认先给方向建议。"
-            : "当前会话已切回对话模式。",
+            ? "当前 run 已启用附加资源，默认先给方向建议。"
+            : "当前 run 已切回纯对话，不会读取附加资源。",
       });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
@@ -2720,7 +2845,7 @@ export default function App() {
     setWorkspaceModalOpen(false);
     setNotice({
       kind: "success",
-      text: `已添加目录：${workspace.name}。Solo 只有在工作区协作时才会读取它。`,
+      text: `已添加目录资源：${workspace.name}。Solo 只会在你启用资源参与时读取它。`,
     });
   };
 
@@ -2757,7 +2882,7 @@ export default function App() {
       setSessions((current) => upsertSession(current, updated));
       setNotice({
         kind: "info",
-        text: "已为当前会话选择代码上下文。是否使用它，由你切换模式决定。",
+        text: "已附加到当前 run。是否读取它，由资源参与开关决定。",
       });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
@@ -2778,7 +2903,7 @@ export default function App() {
       setActiveWorkspaceId("");
       setExplorerOpen(false);
       resetPreview();
-      setNotice({ kind: "info", text: "已清除当前代码上下文，会话继续保持对话模式。" });
+      setNotice({ kind: "info", text: "已移除当前资源，后续 run 不会读取该目录。" });
     } catch (error) {
       setNotice({ kind: "error", text: normalizeError(error) });
     }
@@ -2974,17 +3099,6 @@ export default function App() {
     }
   };
 
-  const handleThemeChange = async (event) => {
-    const nextTheme = normalizeTheme(event.target.value);
-    setTheme(nextTheme);
-    try {
-      await desktop.settingsUpdate({ theme: nextTheme });
-      setSettings((current) => ({ ...current, theme: nextTheme }));
-    } catch (error) {
-      setNotice({ kind: "error", text: `主题保存失败：${normalizeError(error)}` });
-    }
-  };
-
   const handleSaveSettings = async (form) => {
     const normalized = normalizeSettings(form);
     const saved = normalizeSettings(await desktop.settingsUpdate(normalized));
@@ -2992,7 +3106,6 @@ export default function App() {
     if (!providerUsesCodexLogin(saved.provider)) {
       setCodexLoginDetail("");
     }
-    setTheme(saved.theme);
     setConnectionState({
       status: "success",
       message: saved.provider === "codex_cli"
@@ -3051,15 +3164,9 @@ export default function App() {
   const composerHint = providerNeedsCodexLogin && !codexAuth.loggedIn
     ? "先完成 Codex 登录才能发送。"
     : activeProvider === "manual"
-      ? "当前为手动协作模式，发送后只会记录问题。"
-      : activeSessionWorkspaceId
-        ? "Enter 发送，Shift+Enter 换行。需要代码依据时，Solo 会按当前资源设置读取目录。"
-        : "Enter 发送，Shift+Enter 换行。需要代码时点回形针。";
-  const workspaceStatusText = activeSessionWorkspaceId
-    ? activeWorkspace?.name ?? "已选择"
-    : "按需添加";
+      ? "当前为手动接入，发送后只会记录问题。"
+      : "Enter 发送，Shift+Enter 换行。";
   const modeLabel = sessionModeLabel(activeSessionMode);
-  const topbarContextLabel = sessionModeTrailLabel(activeSessionMode);
   const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
   const previewTitle = selectedFilePath || "暂无文件";
   const previewStateLabel = previewState.loading
@@ -3236,27 +3343,16 @@ export default function App() {
   ];
   const composerPlaceholder = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
-      ? "描述你想让 Solo 给出的方向建议；它会先生成方向卡，再由你点开预览。"
+      ? "描述目标，Solo 先给方向。"
       : activeTurnIntent === TURN_INTENT_PREVIEW
-        ? "描述你想直接展开的具体预览；Solo 会先给改动范围和影响点，不会直接应用。"
-        : "描述你想让 Solo 结合当前工作区分析的事；它会先查看相关文件再回答。"
-    : collaborationAvailable
-      ? "直接提问；如果这轮需要代码上下文，再切到工作区协作。"
-      : "直接提问；需要代码上下文时再补充一个目录，并切到工作区协作。";
-  const chatSubtitle = collaborationEnabled
-    ? activeTurnIntent === TURN_INTENT_CHOICE
-      ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先给方向建议，再由你点开预览并确认。`
-      : activeTurnIntent === TURN_INTENT_PREVIEW
-        ? `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，直接沿当前方向展开具体预览。`
-        : `当前会话会显式结合工作区 ${activeWorkspace?.name ?? "当前项目"} 协作，先看相关文件，再给结论和依据。`
-    : collaborationAvailable
-      ? `当前为对话模式。目录 ${activeWorkspace?.name ?? "当前项目"} 已作为可选上下文接入，只有切到工作区协作时才会参与。`
-      : "当前为对话模式。先直接提问；需要代码上下文时再补充目录并进入工作区协作。";
+        ? "描述要展开的具体预览。"
+        : "描述目标或追加干预。"
+    : "描述目标或追加干预。";
   const modeIntentText = collaborationEnabled
-    ? `这一轮会结合工作区，当前阶段：${turnIntentLabel(activeTurnIntent)}`
+    ? `这一轮会读取附加资源，当前阶段：${turnIntentLabel(activeTurnIntent)}`
     : collaborationAvailable
-      ? "这一轮只对话，不自动读工作区"
-      : "当前为普通对话";
+      ? "这一轮不读取附加资源"
+      : "当前没有附加资源";
   const modeGuidanceText = collaborationEnabled
     ? activeTurnIntent === TURN_INTENT_CHOICE
       ? "Solo 会先查看相关文件，再把多个方向整理成可点开的方向卡。"
@@ -3264,11 +3360,66 @@ export default function App() {
         ? "Solo 会直接展开更具体的改动预览，但仍然不会自动应用。"
         : "Solo 会先查看相关文件，再给结论、依据和下一步建议。"
     : collaborationAvailable
-      ? "代码目录只是可选上下文。只有你切到“工作区协作”后，它才会真正参与回答。"
+      ? "目录只是附加资源。只有启用资源参与后，它才会真正进入回答。"
       : "先直接提问；只有需要代码依据时再补充目录。";
   const composerContextButtonLabel = activeSessionWorkspaceId
     ? `更换附加资源，当前为 ${activeWorkspace?.name ?? "已选目录"}`
     : "附加资源";
+  const connectionStatusLabel = providerNeedsCodexLogin
+    ? (!codexAuth.available
+        ? "不可用"
+        : codexAuth.loggedIn
+          ? "已登录"
+          : "未登录")
+    : activeProvider === "manual"
+      ? "手动"
+      : settings.modelId
+        ? "已配置"
+        : "未配置";
+  const topbarWorkstreamState = activeSessionSummary?.statusLabel ?? "等待创建";
+  const topbarExceptionLabel = exceptionEntries.length > 0 ? `${exceptionEntries.length} 个待处理` : "运行正常";
+  const topbarExceptionTone = exceptionEntries.length > 0 ? "error" : "ready";
+  const externalAgentsByWorkspaceId = observedCodexState.agents.reduce((groups, agent) => {
+    if (!agent.matchedWorkspaceId) {
+      return groups;
+    }
+    return {
+      ...groups,
+      [agent.matchedWorkspaceId]: [...(groups[agent.matchedWorkspaceId] ?? []), agent],
+    };
+  }, {});
+  const untrackedExternalAgents = observedCodexState.agents.filter((agent) => !agent.matchedWorkspaceId);
+  const resourceDisplayCount = workspaces.length + untrackedExternalAgents.length;
+  const topbarResourceLabel = observedCodexState.agents.length
+    ? `${workspaces.length} 资源 / ${observedCodexState.agents.length} 外部`
+    : `${workspaces.length} 个资源`;
+  const topbarRunLabel = `${activeWorkstreamEntries.length} active / ${waitingWorkstreamEntries.length} waiting`;
+  const primaryExceptionEntry = exceptionEntries[0] ?? null;
+  const commandActionCards = [
+    {
+      id: "task",
+      eyebrow: "Task",
+      title: "新任务",
+      tone: "idle",
+      disabled: false,
+      onClick: handleCreateSession,
+    },
+    {
+      id: "exception",
+      eyebrow: "Intervene",
+      title: primaryExceptionEntry ? "介入" : "无异常",
+      tone: primaryExceptionEntry ? "error" : "ready",
+      disabled: !primaryExceptionEntry,
+      onClick: () => {
+        if (!primaryExceptionEntry) {
+          return;
+        }
+        handleSelectSession(primaryExceptionEntry.id);
+        setInspectorTab("controls");
+        composerInputRef.current?.focus();
+      },
+    },
+  ];
 
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
@@ -3318,49 +3469,28 @@ export default function App() {
               <div className="topbar-trail" aria-label="current context">
                 <span className="topbar-app">solo</span>
                 <span className="topbar-separator">/</span>
-                <span className="topbar-context">{topbarContextLabel}</span>
+                <span className="topbar-context">control plane</span>
               </div>
               <span className="topbar-title-divider" aria-hidden="true" />
-              <h1>{activeSession?.title ?? "新会话"}</h1>
+              <div className="topbar-title-stack">
+                <h1>{activeSession?.title ?? "新任务流"}</h1>
+                <span className="topbar-title-meta">{topbarWorkstreamState}</span>
+              </div>
             </div>
           </div>
         </div>
         <div className="topbar-status">
-          <div className="status-pill">
-            <span className="status-pill-label">
-              {providerNeedsCodexLogin ? "Codex 登录" : "连接"}
-            </span>
-            <strong className="status-pill-value">
-              {providerNeedsCodexLogin
-                ? (!codexAuth.available
-                    ? "不可用"
-                    : codexAuth.loggedIn
-                      ? "已登录"
-                      : "未登录")
-                : activeProvider === "manual"
-                  ? "手动"
-                  : settings.modelId
-                    ? "已配置"
-                    : "未配置"}
-            </strong>
+          <div className="status-pill status-pill-metric">
+            <span className="status-pill-label">Workstreams</span>
+            <strong className="status-pill-value">{topbarRunLabel}</strong>
           </div>
-          <div className="status-pill">
-            <span className="status-pill-label">模式</span>
-            <strong className="status-pill-value">{modeLabel}</strong>
+          <div className={`status-pill status-pill-metric status-pill-${topbarExceptionTone}`}>
+            <span className="status-pill-label">Exceptions</span>
+            <strong className="status-pill-value">{topbarExceptionLabel}</strong>
           </div>
-          <label className="status-pill status-pill-theme">
-            <span className="status-pill-label">主题</span>
-            <select className="theme-select" value={theme} onChange={(event) => void handleThemeChange(event)}>
-              {THEME_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="status-pill">
-            <span className="status-pill-label">上下文</span>
-            <strong className="status-pill-value status-pill-code">{workspaceStatusText}</strong>
+          <div className={`status-pill status-pill-metric status-pill-${activeSessionWorkspaceId ? "active" : "idle"}`}>
+            <span className="status-pill-label">Resources</span>
+            <strong className="status-pill-value">{topbarResourceLabel}</strong>
           </div>
           <button
             type="button"
@@ -3370,8 +3500,10 @@ export default function App() {
               setSettingsModalOpen(true);
             }}
           >
-            <span className="status-pill-label">设置</span>
-            <strong className="status-pill-value">网络</strong>
+            <span className="status-pill-label">
+              {providerNeedsCodexLogin ? "Codex 登录" : "连接"}
+            </span>
+            <strong className="status-pill-value">{connectionStatusLabel}</strong>
           </button>
         </div>
         {hasCustomWindowChrome ? (
@@ -3462,7 +3594,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="panel-collapsed-note">
-                    <p>当前没有进行中的任务流。</p>
+                    <EmptyVisual label="当前没有进行中的任务流" tone="active" />
                   </div>
                 )}
               </section>
@@ -3487,7 +3619,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="panel-collapsed-note">
-                    <p>当前没有等待你确认的任务流。</p>
+                    <EmptyVisual label="当前没有等待确认的任务流" tone="loading" />
                   </div>
                 )}
               </section>
@@ -3512,7 +3644,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="panel-collapsed-note">
-                    <p>当前还没有完成的任务流。</p>
+                    <EmptyVisual label="当前还没有完成的任务流" tone="ready" />
                   </div>
                 )}
               </section>
@@ -3527,7 +3659,6 @@ export default function App() {
                   <h2>异常收件箱</h2>
                   <span className="section-count">{exceptionEntries.length}</span>
                 </div>
-                <p className="section-note">集中查看失败、阻塞和待确认节点。</p>
               </div>
             </div>
             {exceptionEntries.length ? (
@@ -3543,7 +3674,7 @@ export default function App() {
               </div>
             ) : (
               <div className="panel-collapsed-note">
-                <p>当前没有需要立即处理的异常。</p>
+                <EmptyVisual label="当前没有需要处理的异常" tone="ready" />
               </div>
             )}
           </section>
@@ -3554,51 +3685,118 @@ export default function App() {
                   <p className="section-eyebrow">Resources</p>
                   <div className="section-title-row">
                     <h2>附加资源</h2>
-                    <span className="section-count">{workspaces.length}</span>
+                    <span className="section-count">{resourceDisplayCount}</span>
+                    {observedCodexState.error ? (
+                      <span className="list-badge list-badge-error">扫描失败</span>
+                    ) : null}
+                    {observedCodexState.agents.length ? (
+                      <span className="list-badge list-badge-accent">
+                        {observedCodexState.agents.length} external
+                      </span>
+                    ) : null}
                   </div>
-                  <p className="section-note">目录只是资源。需要时再通过回形针附加到当前任务流。</p>
               </div>
             </div>
-            {workspaces.length ? (
+            {workspaces.length || observedCodexState.agents.length ? (
               <div className="workspace-list">
-                {workspaces.map((workspace) => (
-                  <div
-                    key={workspace.id}
-                    className={`workspace-card ${
-                      workspace.id === activeWorkspaceId ? "is-active" : ""
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      className="workspace-main"
-                      onClick={() => void handleSelectWorkspace(workspace.id)}
-                    >
-                      <div className="workspace-row">
-                        <span className="workspace-title">{workspace.name}</span>
-                        {workspace.id === activeSessionWorkspaceId ? (
-                          <span className="list-badge list-badge-accent">当前上下文</span>
-                        ) : null}
-                      </div>
-                      <span className="workspace-path">{workspace.path}</span>
-                      <span className="workspace-caption">
-                        {workspace.id === activeSessionWorkspaceId
-                          ? "当前会话会在工作区协作里读取这个目录"
-                          : "设为当前上下文"}
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="danger-button"
-                      onClick={() => handleRemoveWorkspace(workspace.id)}
-                    >
-                      移除
-                    </button>
+                {observedCodexState.error ? (
+                  <div className="resource-inline-error">
+                    <strong>外部 Codex 扫描失败</strong>
+                    <span>{observedCodexState.error}</span>
                   </div>
-                ))}
+                ) : null}
+                {workspaces.map((workspace) => {
+                  const workspaceAgents = externalAgentsByWorkspaceId[workspace.id] ?? [];
+                  return (
+                    <div
+                      key={workspace.id}
+                      className={`workspace-card ${
+                        workspace.id === activeWorkspaceId ? "is-active" : ""
+                      } ${workspaceAgents.length ? "has-external-agent" : ""}`}
+                    >
+                      <button
+                        type="button"
+                        className="workspace-main"
+                        onClick={() => void handleSelectWorkspace(workspace.id)}
+                      >
+                        <div className="workspace-row">
+                          <span className="workspace-title">{workspace.name}</span>
+                          {workspace.id === activeSessionWorkspaceId ? (
+                            <span className="list-badge list-badge-accent">当前资源</span>
+                          ) : null}
+                          {workspaceAgents.length ? (
+                            <span className="list-badge list-badge-loading">
+                              {workspaceAgents.length} external
+                            </span>
+                          ) : null}
+                        </div>
+                        <span className="workspace-path">{workspace.path}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-button"
+                        onClick={() => handleRemoveWorkspace(workspace.id)}
+                      >
+                        移除
+                      </button>
+                      {workspaceAgents.length ? (
+                        <div className="workspace-agent-stack">
+                          {workspaceAgents.slice(0, 2).map((agent) => {
+                            const matchedSession = sessions.find(
+                              (session) => session.id === agent.matchedSessionId
+                            );
+                            return (
+                              <ExternalAgentResourceCard
+                                key={agent.id}
+                                agent={agent}
+                                workspace={workspace}
+                                session={matchedSession}
+                                current={workspace.id === activeWorkspaceId}
+                                onFocusSession={setActiveSessionId}
+                              />
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+                {untrackedExternalAgents.length ? (
+                  <div className="workspace-untracked-group">
+                    <div className="workspace-untracked-head">
+                      <span className="section-eyebrow">Untracked</span>
+                      <span className="section-count">{untrackedExternalAgents.length}</span>
+                    </div>
+                    {untrackedExternalAgents.slice(0, 3).map((agent) => {
+                      const matchedSession = sessions.find(
+                        (session) => session.id === agent.matchedSessionId
+                      );
+                      return (
+                        <ExternalAgentResourceCard
+                          key={agent.id}
+                          agent={agent}
+                          workspace={null}
+                          session={matchedSession}
+                          current={false}
+                          onFocusSession={setActiveSessionId}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="panel-collapsed-note">
-                <p>还没有保存的目录。需要代码上下文时，用输入框旁的回形针添加。</p>
+                <EmptyVisual
+                  label={
+                    observedCodexState.error
+                      ? "外部 Codex 扫描失败"
+                      : observedCodexState.loading
+                        ? "正在扫描外部 Codex"
+                        : "无资源"
+                  }
+                  tone={observedCodexState.error ? "error" : observedCodexState.loading ? "loading" : "idle"}
+                />
               </div>
             )}
           </section>
@@ -3624,16 +3822,15 @@ export default function App() {
             </div>
             {!explorerOpen ? (
               <div className="panel-collapsed-note">
-                <p>
-                  {activeWorkspace
-                    ? "文件树默认折叠。需要看文件时再展开。"
-                    : "还没有可用代码目录。需要时再添加。"}
-                </p>
+                <EmptyVisual
+                  label={activeWorkspace ? "文件树已折叠" : "当前没有可用目录资源"}
+                  tone={activeWorkspace ? "active" : "idle"}
+                />
               </div>
             ) : activeWorkspace ? (
               workspaceTreeLoading ? (
                 <div className="empty-state compact">
-                  <p>正在加载文件树…</p>
+                  <EmptyVisual label="正在加载文件树" tone="loading" />
                 </div>
               ) : workspaceTree ? (
                 <div className="tree-panel">
@@ -3646,12 +3843,12 @@ export default function App() {
                 </div>
               ) : (
                 <div className="empty-state compact">
-                  <p>当前目录暂无可显示的文件树。</p>
+                  <EmptyVisual label="当前目录暂无可显示文件树" tone="idle" />
                 </div>
               )
             ) : (
               <div className="empty-state compact">
-                <p>需要代码时，再添加一个目录。</p>
+                <EmptyVisual label="当前没有目录资源" tone="idle" />
               </div>
             )}
           </section>
@@ -3663,7 +3860,6 @@ export default function App() {
               <div className="chat-head-main">
                 <p className="section-eyebrow">Workstream</p>
                 <h2>{runtimeWorkstreamLabel}</h2>
-                <p className="chat-subtitle">{chatSubtitle}</p>
                 <div className="chat-context-strip task-context-strip">
                   <div className="chat-context-item">
                     <span className="chat-context-label">当前任务</span>
@@ -3689,7 +3885,6 @@ export default function App() {
                       {activeWorkspace?.name ?? "当前没有目录资源"}
                     </strong>
                   </div>
-                  <p className="chat-context-note">{modeGuidanceText}</p>
                 </div>
               </div>
               <div className="chat-head-actions">
@@ -3763,9 +3958,6 @@ export default function App() {
                         {`${sessionRuntimeSummaries.length} 个任务流`}
                       </span>
                     </div>
-                    <p className="task-board-note">
-                      主面板先看队列状态，再下钻到当前选中任务的详情和运行时间线。
-                    </p>
                     <div className="task-board-grid">
                       <TaskBoardLane
                         title="执行中"
@@ -3879,7 +4071,7 @@ export default function App() {
                           ))
                         ) : (
                           <div className="proposal-empty">
-                            <p>当前还没有运行事件。先创建任务或发送目标，让 Solo 启动第一条 run。</p>
+                            <EmptyVisual label="当前还没有运行事件" tone="idle" />
                           </div>
                         )}
                       </div>
@@ -3942,14 +4134,9 @@ export default function App() {
                       <div className="inline-proposals-head decision-deck-head">
                         <div>
                           <p className="section-eyebrow">Decisions</p>
-                          <h3>先选一个方向</h3>
+                          <h3>方向</h3>
                         </div>
                         <div className="decision-deck-meta">
-                          <p className="inline-proposals-note">
-                            {decisionOptions.length > 1
-                              ? "先左右看完方向卡，再锁定一个方向继续展开预览。"
-                              : "先点开这个方向的预览，再决定是否确认。"}
-                          </p>
                           <button
                             type="button"
                             className="ghost-button"
@@ -4007,9 +4194,8 @@ export default function App() {
                       <div className="inline-proposals-head">
                         <div>
                           <p className="section-eyebrow">Preview</p>
-                          <h3>确认具体预览</h3>
+                          <h3>预览</h3>
                         </div>
-                        <p className="inline-proposals-note">这些都只是预览，确认后才会真正应用。</p>
                       </div>
                       <div className="proposal-stack preview-card-grid">
                         {previewProposals.map((card) => (
@@ -4028,18 +4214,7 @@ export default function App() {
               ) : (
                 <div className="empty-state hero">
                   <p className="section-eyebrow">Operator Log</p>
-                  <h2>先创建任务，再决定是否补充资源。</h2>
-                  <p>
-                    {collaborationEnabled
-                      ? "你已经进入工作区协作。Solo 会先查看相关文件，再给出建议、权衡和改动预览。"
-                      : collaborationAvailable
-                        ? providerNeedsCodexLogin
-                          ? "你已经完成 Codex 登录。现在可以继续直接提问；如果需要代码上下文，再显式切到工作区协作。"
-                          : "当前连接已就绪。现在可以继续直接提问；如果需要代码上下文，再显式切到工作区协作。"
-                        : providerNeedsCodexLogin
-                          ? "你已经完成 Codex 登录。现在可以直接提问；需要代码依据时再补充目录并切到工作区协作。"
-                          : "当前连接已就绪。现在可以直接提问；需要代码依据时再补充目录并切到工作区协作。"}
-                  </p>
+                  <h2>今天推进什么？</h2>
                 </div>
               )}
             </div>
@@ -4050,11 +4225,22 @@ export default function App() {
               <div className="composer-bar-head">
                 <div>
                   <p className="section-eyebrow">Command Bar</p>
-                  <strong>创建任务或追加干预</strong>
+                  <strong>目标 / 干预</strong>
                 </div>
-                <span className={`drawer-chip drawer-chip-${activeSessionWorkspaceId ? "active" : "idle"}`}>
-                  {activeSessionWorkspaceId ? "已附加资源" : "未附加资源"}
-                </span>
+              </div>
+              <div className="composer-control-strip" aria-label="command quick actions">
+                {commandActionCards.map((action) => (
+                  <button
+                    key={action.id}
+                    type="button"
+                    className={`composer-control-card tone-${action.tone}`}
+                    disabled={action.disabled}
+                    onClick={action.onClick}
+                  >
+                    <span className="section-eyebrow">{action.eyebrow}</span>
+                    <strong>{action.title}</strong>
+                  </button>
+                ))}
               </div>
               {activeSessionWorkspaceId ? (
                 <div className="composer-resource-strip">
@@ -4078,13 +4264,9 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-              ) : (
-                <div className="composer-resource-empty">
-                  <PaperclipIcon />
-                  <span>目录只是附加资源。需要代码上下文时，再用回形针添加。</span>
-                </div>
-              )}
+              ) : null}
               <textarea
+                ref={composerInputRef}
                 className="composer-input"
                 value={draft}
                 disabled={loginBlocked || chatSending || hasStreamingAssistant}
@@ -4155,7 +4337,6 @@ export default function App() {
                   <span className="inspector-tab-label">{tab.label}</span>
                   <span className={`drawer-chip drawer-chip-${tab.badgeTone}`}>{tab.badgeText}</span>
                 </span>
-                <span className="inspector-tab-description">{tab.description}</span>
               </button>
             ))}
           </div>
@@ -4234,7 +4415,7 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="proposal-empty">
-                        <p>当前会话还没有可展示的结构化 item。</p>
+                        <EmptyVisual label="当前会话还没有可展示的结构化 item" tone="idle" />
                       </div>
                     )}
                   </div>
@@ -4279,10 +4460,8 @@ export default function App() {
                       <span className="drawer-meta-value">{`${runtimeArtifactCount} 个产物或预览节点`}</span>
                     </div>
                     <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">说明</span>
-                      <span className="drawer-meta-value">
-                        这里专门查看文件预览与可交付结果，不再和运行事件混在一起。
-                      </span>
+                      <span className="drawer-meta-label">视图</span>
+                      <span className="drawer-meta-value">artifact</span>
                     </div>
                   </div>
                 </section>
@@ -4297,7 +4476,7 @@ export default function App() {
                       <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
                     </div>
                     <div className="drawer-preview-body">
-                      {previewState.loading ? <p>正在读取文件…</p> : null}
+                      {previewState.loading ? <EmptyVisual label="正在读取文件" tone="loading" /> : null}
                       {previewState.error ? (
                         <div className="status-banner status-banner-error">
                           <strong>预览失败</strong>
@@ -4325,11 +4504,10 @@ export default function App() {
                     </div>
                     <div className="drawer-preview-body">
                       <div className="proposal-empty">
-                        <p>
-                          {previewDeckActive
-                            ? "主区已经生成预览卡，确认后这里会显示更具体的文件内容。"
-                            : "当前还没有文件级产物。先选择方向、展开预览，或者让 Solo 读取一个具体文件。"}
-                        </p>
+                        <EmptyVisual
+                          label={previewDeckActive ? "主区已经生成预览卡" : "当前还没有文件级产物"}
+                          tone={previewDeckActive ? "active" : "idle"}
+                        />
                       </div>
                     </div>
                   </section>
@@ -4362,7 +4540,7 @@ export default function App() {
                     <div className="drawer-meta-row">
                       <span className="drawer-meta-label">路径</span>
                       <span className="drawer-meta-value drawer-meta-path">
-                        {activeWorkspace?.path ?? "需要代码上下文时，再通过回形针添加目录。"}
+                        {activeWorkspace?.path ?? "需要代码依据时，再通过回形针添加目录资源。"}
                       </span>
                     </div>
                     <div className="drawer-meta-row">
@@ -4381,6 +4559,108 @@ export default function App() {
                 <section className="drawer-panel">
                   <div className="drawer-panel-head">
                     <div className="drawer-panel-title">
+                      <span className="section-eyebrow">External Codex</span>
+                      <strong>外部运行</strong>
+                    </div>
+                    <span
+                      className={`drawer-chip drawer-chip-${
+                        observedCodexState.error
+                          ? "error"
+                          : observedCodexState.agents.length > 0
+                            ? "active"
+                            : observedCodexState.loading
+                              ? "loading"
+                              : "idle"
+                      }`}
+                    >
+                      {observedCodexState.error
+                        ? "读取失败"
+                        : observedCodexState.agents.length > 0
+                          ? `${observedCodexState.agents.length} agent`
+                          : observedCodexState.loading
+                            ? "扫描中"
+                            : "无外部运行"}
+                    </span>
+                  </div>
+                  <div className="drawer-preview-body">
+                    {observedCodexState.error ? (
+                      <div className="status-banner status-banner-error">
+                        <strong>外部 Codex 扫描失败</strong>
+                        <span>{observedCodexState.error}</span>
+                      </div>
+                    ) : observedCodexState.agents.length > 0 ? (
+                      <div className="external-agent-list">
+                        {observedCodexState.agents
+                          .slice(0, 6)
+                          .map((agent) => {
+                            const matchedWorkspace = workspaces.find(
+                              (workspace) => workspace.id === agent.matchedWorkspaceId
+                            );
+                            const matchedSession = sessions.find(
+                              (session) => session.id === agent.matchedSessionId
+                            );
+                            const isCurrentResource =
+                              activeWorkspace?.id && agent.matchedWorkspaceId === activeWorkspace.id;
+                            return (
+                              <div
+                                key={agent.id}
+                                className={`external-agent-card ${isCurrentResource ? "is-current" : ""}`}
+                              >
+                                <div className="external-agent-head">
+                                  <span className="section-eyebrow">pid {agent.pid || "unknown"}</span>
+                                  <span className={`drawer-chip drawer-chip-${codexAgentTone(agent)}`}>
+                                    {codexAgentStateLabel(agent.state)}
+                                  </span>
+                                </div>
+                                <strong>{matchedWorkspace?.name ?? "Codex"}</strong>
+                                <p>{agent.cwd}</p>
+                                <div className="external-agent-meta">
+                                  <span>external</span>
+                                  <span>observe-only</span>
+                                  {matchedWorkspace ? (
+                                    <span>{isCurrentResource ? "current resource" : "matched workspace"}</span>
+                                  ) : (
+                                    <span>unmatched workspace</span>
+                                  )}
+                                  {matchedSession ? <span>{truncateInline(matchedSession.title, 48)}</span> : null}
+                                  <span>{formatRuntimeTime(agent.lastSeenAt)}</span>
+                                </div>
+                                {agent.command ? <pre>{truncateInline(agent.command, 220)}</pre> : null}
+                                {matchedSession ? (
+                                  <button
+                                    type="button"
+                                    className="ghost-button external-agent-action"
+                                    onClick={() => setActiveSessionId(matchedSession.id)}
+                                  >
+                                    聚焦匹配会话
+                                  </button>
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        {activeWorkspace?.id &&
+                        observedCodexState.agents.every(
+                          (agent) => agent.matchedWorkspaceId !== activeWorkspace.id
+                        ) ? (
+                          <div className="proposal-empty">
+                            <EmptyVisual label="当前资源没有匹配到外部 Codex，已显示全部外部运行" tone="idle" />
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="proposal-empty">
+                        <EmptyVisual
+                          label={observedCodexState.loading ? "正在扫描本机 Codex 进程" : "没有检测到外部 Codex"}
+                          tone={observedCodexState.loading ? "loading" : "idle"}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </section>
+
+                <section className="drawer-panel">
+                  <div className="drawer-panel-head">
+                    <div className="drawer-panel-title">
                       <span className="section-eyebrow">Boundary</span>
                       <strong>资源边界</strong>
                     </div>
@@ -4388,7 +4668,7 @@ export default function App() {
                   </div>
                   <div className="drawer-preview-body">
                     <div className="proposal-empty">
-                      <p>{modeGuidanceText}</p>
+                      <EmptyVisual label={modeGuidanceText} tone={collaborationEnabled ? "active" : "idle"} />
                     </div>
                   </div>
                 </section>
@@ -4420,17 +4700,20 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="proposal-empty">
-                        <p>
-                          {showDecisionDeck
-                            ? `主区有 ${decisionOptions.length} 个方向卡，先选一个方向。`
-                            : previewDeckActive
-                              ? `主区有 ${previewProposals.length} 张预览卡，确认后再应用。`
-                              : proposalPanelState.loading
-                                ? "正在根据你刚选的方向展开具体预览…"
-                                : selectedDecisionOption
-                                  ? `已选择 ${selectedChoiceLabel || "一个方向"}，等待预览完成。`
-                                  : "当前没有额外建议。"}
-                        </p>
+                        <EmptyVisual
+                          label={
+                            showDecisionDeck
+                              ? `主区有 ${decisionOptions.length} 个方向卡`
+                              : previewDeckActive
+                                ? `主区有 ${previewProposals.length} 张预览卡`
+                                : proposalPanelState.loading
+                                  ? "正在展开具体预览"
+                                  : selectedDecisionOption
+                                    ? `已选择 ${selectedChoiceLabel || "一个方向"}`
+                                    : "当前没有额外建议"
+                          }
+                          tone={showDecisionDeck || previewDeckActive || selectedDecisionOption ? "active" : "idle"}
+                        />
                       </div>
                     )}
                   </div>
@@ -4445,7 +4728,7 @@ export default function App() {
                     <span className="drawer-chip drawer-chip-idle">{modeLabel}</span>
                   </div>
                   <div className="drawer-preview-body control-stack">
-                    <div className="mode-switch" role="tablist" aria-label="会话模式">
+                    <div className="mode-switch" role="tablist" aria-label="资源参与方式">
                       <button
                         type="button"
                         className={`ghost-button mode-switch-button ${
@@ -4454,7 +4737,7 @@ export default function App() {
                         onClick={() => void handleSetSessionMode(SESSION_MODE_CONVERSATION)}
                         aria-pressed={activeSessionMode === SESSION_MODE_CONVERSATION}
                       >
-                        对话
+                        不使用资源
                       </button>
                       <button
                         type="button"
@@ -4465,10 +4748,10 @@ export default function App() {
                         onClick={() => void handleSetSessionMode(SESSION_MODE_WORKSPACE)}
                         aria-pressed={activeSessionMode === SESSION_MODE_WORKSPACE}
                         title={
-                          collaborationAvailable ? "结合当前工作区协作" : "先选择一个代码目录，再进入工作区协作"
+                          collaborationAvailable ? "让当前 run 读取附加资源" : "等待资源请求"
                         }
                       >
-                        工作区协作
+                        使用资源
                       </button>
                     </div>
                     {collaborationEnabled ? (
@@ -4523,7 +4806,7 @@ export default function App() {
                     <div className="control-button-grid">
                       {activeSessionWorkspaceId ? (
                         <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                          清除上下文
+                          移除资源
                         </button>
                       ) : null}
                       <button type="button" className="ghost-button" onClick={handleCreateSession}>

@@ -66,7 +66,7 @@ export function InspectorPane({
 }) {
   const modelLabel =
     settings.provider === "manual"
-      ? "手动协作模式"
+      ? "手动接入"
       : settings.provider === "codex_cli"
         ? "ChatGPT 账号模式（Codex CLI）"
         : settings.provider === "openai-codex"
@@ -85,7 +85,7 @@ export function InspectorPane({
       <div className="section-header">
         <div>
           <p className="section-eyebrow">Inspector</p>
-          <h2>上下文</h2>
+          <h2>资源与产物</h2>
         </div>
         <button type="button" className="ghost-button" onClick={onOpenSettings}>
           设置
@@ -108,9 +108,9 @@ export function InspectorPane({
       {activeTab === "context" ? (
         <div className="inspector-scroll">
           <div className="info-card">
-            <span className="section-eyebrow">Workspace</span>
-            <strong>{activeWorkspace?.name ?? "未绑定"}</strong>
-            <p>{activeWorkspace?.path ?? "当前会话还没有绑定工作区。"}</p>
+            <span className="section-eyebrow">Resource</span>
+            <strong>{activeWorkspace?.name ?? "未附加"}</strong>
+            <p>{activeWorkspace?.path ?? "当前 run 还没有附加目录资源。"}</p>
           </div>
 
           <div className="info-card">

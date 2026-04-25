@@ -65,6 +65,8 @@
 
 - 目录、文件、URL、需求文档、本地说明，都属于 resource
 - “工作区协作”不应继续占据一级产品模式
+- resource 不应该默认要求用户预先配置
+- agent 需要访问资源时，应在 checkpoint 上提出清晰的授权请求
 
 ### 3.5 人只在 checkpoint / exception 出现
 
@@ -248,11 +250,13 @@
 
 ### 7.3 追加资源
 
-1. 用户点击回形针或 command bar 的 `Attach Resource`
-2. 选择目录、文件、文档或链接
-3. 系统把它记录为 resource attach event
-4. 该 resource 出现在右侧 `Resources`
+1. agent 判断当前 run 需要某个资源或权限
+2. 系统把请求投影为 checkpoint
+3. 用户授权目录、文件、文档或链接
+4. 系统记录 resource attach event
 5. 后续 run 明确声明是否消费了这些资源
+
+回形针仍然保留，但它是主动附加的快捷入口，不应成为默认起步动作。
 
 ### 7.4 查看产物
 
@@ -302,6 +306,7 @@
 - attach 入口统一成 `resource attach`
 - workspace / file / URL 共用一套 attach 语义
 - UI 上弱化“是否绑定工作区”，强化“本 run 使用了哪些资源”
+- 默认流程不要求用户先添加资源；资源权限由 agent 在需要时请求
 
 ### 阶段 4：让 runtime 成为真相源
 

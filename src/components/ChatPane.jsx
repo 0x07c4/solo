@@ -67,8 +67,8 @@ export function ChatPane({
             <h2>对话、读代码、提补丁。</h2>
             <p>
               {manualMode
-                ? "手动模式下，先记录你的问题，再把外部回复导回 Solo。"
-                : "先完成设置并测试连接，然后给当前会话绑定一个工作区。"}
+                ? "手动接入时，先记录你的问题，再把外部回复导回 Solo。"
+                : "先完成设置并测试连接；需要代码依据时，再附加目录资源。"}
             </p>
           </div>
         )}
@@ -92,7 +92,7 @@ export function ChatPane({
           value={draft}
           onChange={(event) => onChangeDraft(event.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="描述你要做的事，或者让 Solo 读取当前工作区里的文件。"
+          placeholder="描述你要做的事，或者让 Solo 读取当前附加资源里的文件。"
         />
         <div className="composer-actions">
           <p className="composer-hint">

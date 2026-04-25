@@ -6,6 +6,7 @@ export const desktop = {
   openChatGptInBrowser: () => invoke("open_chatgpt_in_browser"),
   codexLoginStatus: () => invoke("codex_login_status"),
   codexLoginStart: () => invoke("codex_login_start"),
+  codexRunningAgents: () => invoke("codex_running_agents"),
   settingsGet: () => invoke("settings_get"),
   settingsUpdate: (payload) => invoke("settings_update", { update: payload }),
   settingsTestConnection: (settings) => invoke("settings_test_connection", { settings }),

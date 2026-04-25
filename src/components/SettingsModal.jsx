@@ -7,7 +7,7 @@ function providerUsesCodexLogin(provider) {
 function validateForm(form) {
   const errors = {};
   if (!form.provider?.trim()) {
-    errors.provider = "请先选择模式";
+    errors.provider = "请先选择接入方式";
   }
   if (form.provider === "manual" || providerUsesCodexLogin(form.provider)) {
     return errors;
@@ -53,7 +53,7 @@ export function SettingsModal({
 
   const connectionLabel = useMemo(() => {
     if (form.provider === "manual") {
-      return "当前为手动协作模式：问题在本地记录，外部回复手动导入。";
+      return "当前为手动接入：问题在本地记录，外部回复手动导入。";
     }
     if (providerUsesCodexLogin(form.provider)) {
       return form.provider === "codex_cli"
@@ -69,7 +69,7 @@ export function SettingsModal({
     if (connectionState.status === "testing") {
       return "正在测试连接…";
     }
-    return "保存后请先测试连接，再开始聊天。";
+    return "保存后请先测试连接，再开始任务。";
   }, [connectionState, form.provider]);
   const proxyMode = form.codexProxyMode || "inherit";
 
@@ -133,13 +133,13 @@ export function SettingsModal({
         </div>
 
         <label className="field">
-          <span>工作模式</span>
+          <span>接入方式</span>
           <select
             value={form.provider}
             onChange={(event) => updateField("provider", event.target.value)}
           >
             <option value="codex_cli">ChatGPT 账号模式（Codex CLI）</option>
-            <option value="manual">手动协作模式</option>
+            <option value="manual">手动接入</option>
             <option value="openai">OpenAI API</option>
           </select>
           {errors.provider ? <small className="field-error">{errors.provider}</small> : null}

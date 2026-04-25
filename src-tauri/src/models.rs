@@ -339,6 +339,22 @@ pub struct CodexLoginStatus {
     pub message: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedCodexAgent {
+    pub id: String,
+    pub pid: u32,
+    pub cwd: String,
+    pub command: String,
+    pub started_at: Option<i64>,
+    pub state: String,
+    pub ownership: String,
+    pub control_level: String,
+    pub matched_workspace_id: Option<String>,
+    pub matched_session_id: Option<String>,
+    pub last_seen_at: i64,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexLoginProgressEvent {
