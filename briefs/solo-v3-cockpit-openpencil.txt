@@ -1,0 +1,12 @@
+Design a high-fidelity desktop app screen for Solo v3.
+Platform: local Linux desktop control-plane app, 16:9 wide canvas.
+Style: graphite dark developer cockpit, one step brighter than near-black, no moss-green wash, tight grid, compact instrument-panel density, mono labels, no visible scrollbars.
+Product: Solo is a personal local observability and control plane for agent work.
+Core layout: top bar, left workstream/resource rail, center live run cockpit, right contextual detail rail, bottom command bar.
+Top bar: show "solo / control plane", workspace "/home/chikee/workspace/cocoa", branch "ui-ddd", chips "Codex Login", "managed", "observe-only 1". Do not add repeated top metrics.
+Left rail: Workstreams grouped Active, Waiting, Done. Add compact cards for "Review cocoa next direction" active, "New session" waiting, and Resources with current workspace plus secondary external Codex observe-only.
+Center cockpit: main current run strip shows task "Review cocoa next direction", agent state "running", phase "Inspecting repo", heartbeat "18s no token", phase steps Plan, Inspect, Edit, Check. Below it show a live status/risk card, then Evidence timeline with 4 meaningful events: Assistant response, User request, non-blocking CLI failure, Older history folded. Failures and decisions visually outrank routine status. Outputs strip is compact and mostly empty.
+Right detail rail: contextual Detail showing selected non-blocking CLI failure. Show cause, impact, recovery, evidence; raw log collapsed. Include a visible "Back to live run" control. Do not show permanent External Codex panel.
+Bottom command bar: state is Running. It should say "Steer run", input placeholder "Add instruction or interrupt condition...", actions "Send", "Interrupt", "More". Do not just look like a generic chat input.
+Color semantics: running muted green, decision amber, risk/failure red, done/stable muted grey, external observe-only desaturated teal. Use amber only for control emphasis, red only for real risk.
+Text rules: short labels, no paragraphs in primary cards, no Chinese-English mixed machine translation. Technical entities like workspace, agent, diff can remain English.
