@@ -1,6 +1,7 @@
 use crate::models::{
-    ChatSession, FileReadResult, FileTreeNode, SessionRuntimeSnapshot, Settings, TaskRecord,
-    ToolProposal, ToolProposalPayload, TurnItem, TurnRecord, Workspace,
+    ChatSession, FileReadResult, FileTreeNode, ItemApprovalState, SessionRuntimeSnapshot, Settings,
+    TaskRecord, ToolProposal, ToolProposalPayload, TurnItem, TurnItemKind, TurnItemStatus,
+    TurnRecord, Workspace,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -216,6 +217,7 @@ impl Store {
     }
 
     pub fn session_runtime_snapshot(&self, session_id: &str) -> SessionRuntimeSnapshot {
+        let session = self.sessions.iter().find(|session| session.id == session_id);
         let tasks = self.sorted_tasks(Some(session_id));
         let turns = self.sorted_turns(Some(session_id), None);
         let mut turn_items = self
@@ -228,6 +230,87 @@ impl Store {
             Ordering::Equal => left.id.cmp(&right.id),
             other => other,
         });
+
+        if let Some(session) = session {
+            for turn in &turns {
+                let has_agent_item = turn_items.iter().any(|item| {
+                    item.turn_id == turn.id && matches!(item.kind, TurnItemKind::AgentMessage)
+                });
+                if has_agent_item {
+                    continue;
+                }
+
+                let assistant_message = turn
+                    .assistant_message_id
+                    .as_ref()
+                    .and_then(|message_id| {
+                        session
+                            .messages
+                            .iter()
+                            .find(|message| &message.id == message_id)
+                    })
+                    .or_else(|| {
+                        let user_message_id = turn.user_message_id.as_ref()?;
+                        let user_index = session
+                            .messages
+                            .iter()
+                            .position(|message| &message.id == user_message_id)?;
+                        session
+                            .messages
+                            .iter()
+                            .skip(user_index + 1)
+                            .find(|message| {
+                                message.role == "assistant" && !message.content.trim().is_empty()
+                            })
+                    });
+
+                let Some(message) = assistant_message else {
+                    continue;
+                };
+
+                let summary = message
+                    .content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let summary = if summary.chars().count() > 84 {
+                    format!("{}…", summary.chars().take(84).collect::<String>())
+                } else {
+                    summary
+                };
+
+                turn_items.push(TurnItem {
+                    id: format!("synthetic_agent_message_{}_{}", turn.id, message.id),
+                    session_id: session_id.to_string(),
+                    task_id: turn.task_id.clone(),
+                    turn_id: turn.id.clone(),
+                    created_at: message.timestamp,
+                    updated_at: message.timestamp,
+                    kind: TurnItemKind::AgentMessage,
+                    status: if message.status == "error" {
+                        TurnItemStatus::Failed
+                    } else {
+                        TurnItemStatus::Completed
+                    },
+                    approval_state: ItemApprovalState::NotRequired,
+                    title: "助手回复".to_string(),
+                    summary: Some(summary),
+                    source_message_id: Some(message.id.clone()),
+                    source_proposal_id: None,
+                    content: Some(message.content.clone()),
+                    metadata: serde_json::json!({
+                        "role": "assistant",
+                        "messageStatus": message.status,
+                        "source": "session_message_repair",
+                    }),
+                });
+            }
+
+            turn_items.sort_by(|left, right| match left.created_at.cmp(&right.created_at) {
+                Ordering::Equal => left.id.cmp(&right.id),
+                other => other,
+            });
+        }
 
         SessionRuntimeSnapshot {
             session_id: session_id.to_string(),

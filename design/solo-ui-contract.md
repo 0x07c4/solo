@@ -6,6 +6,8 @@ This contract translates `solo-ui-overview-v2.op` into implementation rules.
 
 It is not a visual spec. It defines what each region means, which existing state may feed it, and what must not be implemented in the first pass.
 
+See `design/solo-observability-model.md` for the ownership, observation-level, and control-boundary rules that gate runtime work. This UI contract must not imply stronger control than that model allows.
+
 ## 1. Implementation boundary
 
 First pass scope:
@@ -19,6 +21,7 @@ First pass scope:
 | Inspector | Start with checkpoint-focused inspector only. Do not build full entity routing yet. |
 | Timeline | Show a curated event projection, not raw provider logs. |
 | Outputs | Show artifacts only. Do not mix resources, file tree nodes, or runtime events into outputs. |
+| External Codex supervision | Treat discovered external Codex processes as observe-only evidence/resources. Do not promote them into managed workstreams or rewrite the main task IA. |
 
 Do not use this pass to solve:
 
@@ -29,6 +32,7 @@ Do not use this pass to solve:
 | Full artifact gallery | The v2 output tray is intentionally shallow. |
 | Inspector multi-object routing | Requires a selected object model that should be staged. |
 | OpenPencil-to-code pixel matching | The design artifact is directional, not a production layout source. |
+| External Codex takeover | Supervising an existing process is not the same as controlling or converting it. |
 
 ## 2. Regions
 
@@ -80,6 +84,14 @@ Purpose:
 | Workstream navigation | List active, waiting, and done workstreams or sessions. |
 | Exception inventory | Compact list of blocked incidents. |
 | Resource inventory | Workspaces, attached resources, external Codex resources. |
+
+External Codex rule:
+
+| Rule | Reason |
+| --- | --- |
+| External Codex appears under `Resources`, not as a workstream lane. | It is observe-only evidence unless Solo created or explicitly adopted the run. |
+| Workstream cards remain managed Solo sessions/tasks. | Prevents process discovery from changing the product information architecture. |
+| Codex processes spawned by Solo are not counted as external. | Prevents managed runs from being double-counted as observe-only resources and prevents silent takeover. |
 
 Allowed card fields:
 
@@ -217,6 +229,15 @@ type SelectedObject =
   | { type: "resource"; id: string };
 ```
 
+Inspector External Codex evidence rule (minimum contract):
+
+- Level 1 external discovery in inspector is read-only session-log activity observation (not semantic supervision).
+- Show up to 3 external Codex sessions in the inspector with workspace/CWD readability, `visibility`, `activityState`, `last activity`, and `last event`.
+- Do not treat this as semantic supervision or adopt semantic control.
+- `pid` is debug metadata only; it must not be the primary visual signal.
+- Show `+N` only when overflowed (with total external count tracked by backend).
+- Inspector presentation is read-only; no control buttons should appear in this panel.
+
 First pass implementation may simplify to:
 
 ```ts
@@ -259,6 +280,7 @@ First pass states:
 | `waitingApproval` | Approve | Revise, Evidence, More | Enabled for conditions |
 | `blocked` | Inspect | Retry, Abort, More | Enabled for recovery context |
 | `observeOnly` | Inspect | Convert to task, More | Ask/comment only |
+| `externalObserve` | Inspect | More | Ask/comment only |
 
 Do not duplicate all Inspector actions in the command bar. The command bar may expose the current primary action and a `More` menu only.
 
@@ -320,8 +342,8 @@ Observe-only rule:
 | --- | --- |
 | Ask/comment | Approve |
 | Inspect | Pause |
-| Convert to local task | Abort |
 | Open resource detail | Retry controlled run |
+| Show PID/path/state evidence | Convert or adopt silently |
 
 ### 3.3 Region state
 
@@ -345,7 +367,7 @@ This table maps v2 regions to current app state. It should be refined during imp
 | Region | Current candidate sources | First pass projection |
 | --- | --- | --- |
 | `TopStatusBar` | `settings`, `codexAuth`, `activeWorkspace`, `activeSessionMode` | identity + control boundary badges |
-| `WorkstreamRail` | `sessions`, `tasksBySession`, `observedCodexState`, `workspaces` | session/workstream cards + resource/exception compact groups |
+| `WorkstreamRail` | `sessions`, `tasksBySession`, `observedCodexState`, `workspaces` | session/workstream cards + resource/exception compact groups; external Codex stays in resources |
 | `CurrentTask` | `activeSession`, `tasksBySession`, `turnIntentBySession`, `proposalPanelState` | current task title + workstream context + status strip |
 | `ActiveRun` | `runtimeSnapshotBySession`, `streamProgressBySession`, `streamMonitorBySession` | current run summary and capability |
 | `Timeline` | `runtimeSnapshot.items`, stream monitor, proposals, decisions | curated event rows |
@@ -427,3 +449,4 @@ Before implementation is considered aligned with v2:
 | Outputs are artifacts only | No resources or logs mixed into output tray. |
 | Empty outputs do not create a large panel | `0 visible` is a strip, not a blank gallery. |
 | Topbar does not repeat local status | It only shows identity and control boundary. |
+| External supervision does not alter IA | Observed Codex is visible in Resources/Inspector without becoming a managed workstream. |

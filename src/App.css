@@ -441,13 +441,13 @@
 :root,
 :root[data-theme="gruvbox-dark"] {
   color-scheme: dark;
-  --bg: #151412;
-  --bg-soft: #0f0f0e;
-  --panel: rgba(29, 29, 26, 0.96);
-  --panel-strong: #1e1e1b;
-  --panel-muted: #25241f;
-  --line: rgba(116, 119, 103, 0.16);
-  --line-strong: rgba(142, 146, 124, 0.26);
+  --bg: #131211;
+  --bg-soft: #0e0e0d;
+  --panel: rgba(27, 26, 23, 0.96);
+  --panel-strong: #1b1a17;
+  --panel-muted: #22211d;
+  --line: rgba(136, 126, 102, 0.17);
+  --line-strong: rgba(164, 149, 116, 0.28);
   --text: #e7dfd0;
   --muted: #a39a86;
   --text-contrast: #fff4d8;
@@ -455,18 +455,18 @@
   --accent-soft: rgba(210, 154, 46, 0.1);
   --danger: #f0645f;
   --success: #9fb568;
-  --focus-ring: rgba(168, 189, 99, 0.28);
-  --body-glow-1: rgba(169, 182, 101, 0.035);
-  --body-glow-2: rgba(125, 174, 163, 0.03);
-  --body-grad-1: #181817;
-  --body-grad-2: #131412;
-  --body-grad-3: #0f100e;
-  --topbar-bg: rgba(24, 25, 22, 0.9);
-  --status-pill-bg: rgba(34, 36, 31, 0.86);
-  --sidebar-glow: rgba(169, 182, 101, 0.035);
-  --sidebar-grad-1: rgba(24, 26, 23, 0.98);
-  --sidebar-grad-2: rgba(29, 31, 27, 0.96);
-  --sidebar-grad-3: rgba(19, 20, 18, 0.98);
+  --focus-ring: rgba(210, 154, 46, 0.24);
+  --body-glow-1: rgba(210, 154, 46, 0.025);
+  --body-glow-2: rgba(210, 154, 46, 0.018);
+  --body-grad-1: #151412;
+  --body-grad-2: #11100f;
+  --body-grad-3: #0c0c0b;
+  --topbar-bg: rgba(22, 21, 19, 0.92);
+  --status-pill-bg: rgba(31, 30, 26, 0.86);
+  --sidebar-glow: rgba(210, 154, 46, 0.025);
+  --sidebar-grad-1: rgba(22, 21, 19, 0.98);
+  --sidebar-grad-2: rgba(27, 26, 23, 0.96);
+  --sidebar-grad-3: rgba(16, 16, 15, 0.98);
   --sidebar-sheen: rgba(236, 226, 205, 0.035);
   --panel-grad-1: rgba(31, 31, 28, 0.94);
   --panel-grad-2: rgba(24, 24, 22, 0.92);
@@ -1379,6 +1379,9 @@ select {
 }
 
 .active-run-summary {
+  width: 100%;
+  color: inherit;
+  text-align: left;
   min-height: 70px;
   border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border-default) 72%);
   border-radius: 12px;
@@ -1387,6 +1390,7 @@ select {
   display: flex;
   align-items: center;
   box-shadow: inset 4px 0 0 color-mix(in srgb, var(--accent) 76%, transparent);
+  cursor: pointer;
 }
 
 .active-run-summary.tone-idle {
@@ -1420,6 +1424,12 @@ select {
   font-family: var(--font-mono);
   font-size: 0.76rem;
   line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.active-run-summary.is-selected,
+.task-timeline-item.is-selected .task-timeline-body {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border-default) 42%);
 }
 
 .task-timeline-list {
@@ -1433,6 +1443,13 @@ select {
   grid-template-columns: 10px minmax(0, 1fr);
   gap: 10px;
   align-items: stretch;
+  width: 100%;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
 }
 
 .task-timeline-marker {
@@ -2597,10 +2614,20 @@ select {
   flex-direction: column;
   gap: 6px;
   min-width: 0;
+  width: 100%;
   border: 1px solid color-mix(in srgb, #75bab2 36%, var(--border-default) 64%);
   border-radius: 10px;
   padding: 9px 10px;
   background: color-mix(in srgb, #142b29 46%, var(--surface-pane-strong) 54%);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.external-resource-agent-card:hover,
+.external-resource-agent-card:focus-visible {
+  border-color: color-mix(in srgb, #75bab2 58%, var(--border-default) 42%);
 }
 
 .external-resource-agent-card.is-current {
@@ -3418,9 +3445,14 @@ select {
   background: color-mix(in srgb, var(--surface-pane-strong) 86%, var(--surface-app-soft) 14%);
 }
 
-.inspector-checkpoint-card {
+.inspector-checkpoint-card.tone-decision {
   border-color: color-mix(in srgb, #e6a018 54%, var(--border-default) 46%);
   background: color-mix(in srgb, #3e2812 72%, var(--surface-pane-strong) 28%);
+}
+
+.inspector-checkpoint-card.tone-detail {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border-default) 76%);
+  background: color-mix(in srgb, var(--surface-pane-strong) 88%, var(--surface-app-soft) 12%);
 }
 
 .inspector-checkpoint-card h3,
@@ -3446,10 +3478,78 @@ select {
   font-family: var(--font-mono);
   font-size: 0.76rem;
   line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .inspector-checkpoint-card p {
   margin-top: 7px;
+}
+
+.inspector-agent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.inspector-agent-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid color-mix(in srgb, #75bab2 24%, var(--border-default) 76%);
+  border-radius: 9px;
+  padding: 8px 9px;
+  background: color-mix(in srgb, #122927 32%, var(--surface-pane-strong) 68%);
+}
+
+.inspector-agent-row div {
+  min-width: 0;
+}
+
+.inspector-agent-meta {
+  display: grid;
+  gap: 3px;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.inspector-agent-meta span {
+  display: block;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inspector-agent-row strong,
+.inspector-agent-row span,
+.inspector-agent-more {
+  margin: 0;
+  font-family: var(--font-mono);
+}
+
+.inspector-agent-row strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-agent-row div > span,
+.inspector-agent-more {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: 0.66rem;
+  line-height: 1.35;
 }
 
 .inspector-action-row {
@@ -3480,6 +3580,71 @@ select {
   flex-direction: column;
   gap: 8px;
   margin-top: 12px;
+}
+
+.inspector-evidence-list p {
+  overflow-wrap: anywhere;
+}
+
+.inspector-history-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.inspector-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inspector-history-item {
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--accent) 12%, var(--border-default) 88%);
+  border-radius: 10px;
+  padding: 9px 10px;
+  color: inherit;
+  text-align: left;
+  background: color-mix(in srgb, var(--surface-pane-strong) 92%, var(--surface-app-soft) 8%);
+  cursor: pointer;
+}
+
+.inspector-history-item span,
+.inspector-history-item small {
+  display: block;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-history-item strong {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-history-item small {
+  margin-top: 3px;
+}
+
+.inspector-history-nav {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.inspector-history-nav .ghost-button {
+  min-height: 32px;
+  padding-inline: 12px;
 }
 
 .inspector-external-card {
@@ -4572,11 +4737,12 @@ select {
 }
 
 .app-shell.mode-workbench .runtime-timeline-card {
-  height: clamp(230px, 30vh, 320px);
+  height: auto;
+  min-height: 0;
 }
 
 .app-shell.mode-workbench .runtime-timeline-list {
-  min-height: 150px;
+  min-height: 0;
   max-height: none;
   overflow: hidden;
 }
@@ -4823,11 +4989,12 @@ select {
 }
 
 .app-shell.mode-workbench .runtime-timeline-card {
-  height: clamp(188px, 23vh, 240px);
+  height: auto;
+  min-height: 0;
 }
 
 .app-shell.mode-workbench .runtime-timeline-list {
-  max-height: 142px;
+  max-height: none;
 }
 
 .app-shell.mode-workbench .task-timeline-body {
@@ -4839,11 +5006,12 @@ select {
 }
 
 .app-shell.mode-workbench .runtime-timeline-card {
-  height: clamp(224px, 27vh, 280px);
+  height: auto;
+  min-height: 0;
 }
 
 .app-shell.mode-workbench .runtime-timeline-list {
-  max-height: 188px;
+  max-height: none;
 }
 
 .app-shell.mode-workbench .runtime-outputs-card {
@@ -4987,6 +5155,7 @@ select {
   font-size: 1rem;
 }
 
+
 .app-shell.mode-workbench .conversation-stack > .runtime-outputs-strip {
   width: 100%;
   flex: 0 0 72px !important;
@@ -4997,9 +5166,9 @@ select {
 }
 
 .app-shell.mode-workbench .conversation-stack > .runtime-timeline-card.runtime-timeline-card {
-  flex: 1 1 auto !important;
+  flex: 0 0 auto !important;
   block-size: auto !important;
-  min-block-size: 220px !important;
+  min-block-size: 0 !important;
   max-block-size: none !important;
 }
 
@@ -5008,27 +5177,27 @@ select {
 }
 
 .app-shell.mode-workbench {
-  --bg: #141312;
-  --bg-soft: #0f0f0e;
-  --panel: rgba(26, 25, 22, 0.96);
-  --panel-strong: #1b1a17;
-  --panel-muted: #222018;
-  --line: rgba(126, 119, 100, 0.17);
-  --line-strong: rgba(150, 139, 111, 0.27);
-  --body-glow-1: rgba(210, 154, 46, 0.025);
-  --body-glow-2: rgba(117, 186, 178, 0.022);
-  --body-grad-1: #151412;
-  --body-grad-2: #11110f;
-  --body-grad-3: #0d0d0c;
-  --sidebar-grad-1: rgba(23, 22, 20, 0.98);
-  --sidebar-grad-2: rgba(25, 24, 21, 0.96);
-  --sidebar-grad-3: rgba(15, 15, 14, 0.98);
+  --bg: #11100f;
+  --bg-soft: #0c0c0b;
+  --panel: rgba(24, 23, 20, 0.96);
+  --panel-strong: #181713;
+  --panel-muted: #1f1e19;
+  --line: rgba(133, 122, 97, 0.16);
+  --line-strong: rgba(158, 144, 110, 0.26);
+  --body-glow-1: rgba(210, 154, 46, 0.018);
+  --body-glow-2: rgba(210, 154, 46, 0.012);
+  --body-grad-1: #12110f;
+  --body-grad-2: #0f0f0e;
+  --body-grad-3: #0a0a09;
+  --sidebar-grad-1: rgba(20, 19, 17, 0.98);
+  --sidebar-grad-2: rgba(24, 23, 20, 0.96);
+  --sidebar-grad-3: rgba(13, 13, 12, 0.98);
 }
 
 .app-shell.mode-workbench .sidebar,
 .app-shell.mode-workbench .chat-pane,
 .app-shell.mode-workbench .inspector {
-  background: color-mix(in srgb, #1b1a17 76%, #10100f 24%);
+  background: color-mix(in srgb, #181713 76%, #0e0e0d 24%);
 }
 
 .app-shell.mode-workbench .runtime-head-shell,
@@ -5036,5 +5205,5 @@ select {
 .app-shell.mode-workbench .runtime-timeline-card,
 .app-shell.mode-workbench .runtime-outputs-card,
 .app-shell.mode-workbench .runtime-outputs-strip {
-  background: color-mix(in srgb, #1d1c19 78%, #10100f 22%);
+  background: color-mix(in srgb, #191815 78%, #0e0e0d 22%);
 }

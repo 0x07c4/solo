@@ -18,18 +18,26 @@ use crate::storage::{
     resolve_workspace_file, update_recent_files, SharedState,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use std::{
     fs,
-    io::{BufRead, BufReader},
-    path::Path,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager, State};
+
+const EXTERNAL_CODEX_SESSION_SCAN_LIMIT: usize = 40;
+const SESSION_META_SCAN_LINES: usize = 22;
+const SESSION_TAIL_SCAN_LINES: usize = 60;
+const SESSION_TAIL_SCAN_BYTES: usize = 24_000;
+const EXTERNAL_ACTIVITY_ACTIVE_MS: i64 = 60_000;
+const EXTERNAL_ACTIVITY_RECENT_MS: i64 = 600_000;
 
 fn is_codex_auth_provider(provider: &str) -> bool {
     matches!(provider.trim(), "codex_cli" | "openai-codex")
@@ -349,8 +357,10 @@ fn discover_codex_processes(
     sessions: &[ChatSession],
 ) -> Result<Vec<ObservedCodexAgent>, String> {
     let entries = fs::read_dir("/proc").map_err(|err| format!("读取 /proc 失败：{err}"))?;
+    let session_logs = discover_codex_session_jsonl_candidates();
     let mut agents = Vec::new();
     let last_seen_at = now_millis();
+    let app_pid = std::process::id();
 
     for entry in entries {
         let Ok(entry) = entry else {
@@ -376,12 +386,38 @@ fn discover_codex_processes(
             .ok()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let state = fs::read_to_string(proc_path.join("stat"))
+        let proc_status = fs::read_to_string(proc_path.join("stat"))
             .ok()
-            .map(|stat| proc_state_label(&stat))
-            .unwrap_or_else(|| "unknown".to_string());
+            .and_then(|stat| proc_status_from_stat(&stat))
+            .unwrap_or_else(|| ProcStatus {
+                state: "unknown".to_string(),
+                parent_pid: None,
+            });
+        if is_descendant_of_pid(pid, app_pid) {
+            continue;
+        }
         let matched_workspace_id = match_workspace_for_cwd(&cwd, workspaces);
         let matched_session_id = match_session_for_workspace(matched_workspace_id.as_deref(), sessions);
+        let observed_session = find_observed_session_for_cwd(&cwd, &session_logs);
+        let visibility = observed_session
+            .as_ref()
+            .and_then(|session| session.session_id.as_ref())
+            .map(|_| "sessionLog")
+            .unwrap_or("processOnly")
+            .to_string();
+        let last_activity_at = observed_session.as_ref().and_then(|session| session.last_activity_at);
+        let last_event_type = observed_session.as_ref().and_then(|session| session.last_event_type.clone());
+        let last_event_summary = observed_session
+            .as_ref()
+            .and_then(|session| session.last_event_summary.clone());
+        let observed_session_id = if visibility == "sessionLog" {
+            observed_session
+                .as_ref()
+                .and_then(|session| session.session_id.clone())
+        } else {
+            None
+        };
+        let activity_state = derive_external_activity_state(last_activity_at, last_seen_at);
 
         agents.push(ObservedCodexAgent {
             id: format!("external-codex-{pid}"),
@@ -389,9 +425,15 @@ fn discover_codex_processes(
             cwd,
             command,
             started_at: None,
-            state,
+            state: proc_status.state,
             ownership: "external".to_string(),
             control_level: "observeOnly".to_string(),
+            visibility,
+            activity_state,
+            last_activity_at,
+            last_event_type,
+            last_event_summary,
+            observed_session_id,
             matched_workspace_id,
             matched_session_id,
             last_seen_at,
@@ -400,6 +442,408 @@ fn discover_codex_processes(
 
     agents.sort_by(|left, right| left.cwd.cmp(&right.cwd).then_with(|| left.pid.cmp(&right.pid)));
     Ok(agents)
+}
+
+#[cfg(target_os = "linux")]
+fn discover_codex_session_jsonl_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(root) = codex_session_root() else {
+        return candidates;
+    };
+
+    let mut paths = Vec::new();
+    let year_dirs = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return candidates,
+    };
+
+    for year_dir in year_dirs.flatten() {
+        if !year_dir.path().is_dir() {
+            continue;
+        }
+        let month_dirs = match fs::read_dir(year_dir.path()) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for month_dir in month_dirs.flatten() {
+            if !month_dir.path().is_dir() {
+                continue;
+            }
+            let day_dirs = match fs::read_dir(month_dir.path()) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for day_dir in day_dirs.flatten() {
+                if !day_dir.path().is_dir() {
+                    continue;
+                }
+                let files = match fs::read_dir(day_dir.path()) {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+                for file_entry in files.flatten() {
+                    let path = file_entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let modified = match path.metadata().and_then(|meta| meta.modified()) {
+                        Ok(modified) => modified
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+                            .unwrap_or(0),
+                        Err(_) => 0,
+                    };
+                    paths.push((modified, path));
+                }
+            }
+        }
+    }
+
+    paths.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in paths
+        .into_iter()
+        .take(EXTERNAL_CODEX_SESSION_SCAN_LIMIT)
+    {
+        candidates.push(path);
+    }
+    candidates
+}
+
+#[cfg(target_os = "linux")]
+fn codex_session_root() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".codex").join("sessions"))
+}
+
+#[cfg(target_os = "linux")]
+fn find_observed_session_for_cwd(cwd: &str, session_logs: &[PathBuf]) -> Option<ObservedSessionProbe> {
+    for session_log in session_logs {
+        let session_id = find_session_meta_for_cwd(session_log, cwd)?;
+        let activity = read_session_recent_activity(session_log);
+        return Some(ObservedSessionProbe {
+            session_id: Some(session_id),
+            last_activity_at: activity.last_activity_at,
+            last_event_type: activity.last_event_type,
+            last_event_summary: activity.last_event_summary,
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct ObservedSessionProbe {
+    session_id: Option<String>,
+    last_activity_at: Option<i64>,
+    last_event_type: Option<String>,
+    last_event_summary: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn find_session_meta_for_cwd(path: &Path, cwd: &str) -> Option<String> {
+    let target = normalize_cwd(cwd);
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    for _ in 0..SESSION_META_SCAN_LINES {
+        line.clear();
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(_) => return None,
+        };
+        if read == 0 {
+            break;
+        }
+        let Some((session_id, session_cwd)) = parse_session_meta_line(&line) else {
+            continue;
+        };
+        if normalize_cwd(&session_cwd) == target {
+            return Some(session_id);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_session_meta_line(line: &str) -> Option<(String, String)> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    let id = payload.get("id")?.as_str()?.trim();
+    let session_cwd = payload.get("cwd")?.as_str()?.trim();
+    if id.is_empty() || session_cwd.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), session_cwd.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn read_session_recent_activity(path: &Path) -> ObservedSessionProbe {
+    let metadata_len = match path.metadata() {
+        Ok(metadata) => {
+            let len = metadata.len();
+            if len == 0 {
+                return ObservedSessionProbe::default();
+            }
+            len
+        }
+        Err(_) => return ObservedSessionProbe::default(),
+    };
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return ObservedSessionProbe::default(),
+    };
+    let start = metadata_len.saturating_sub(SESSION_TAIL_SCAN_BYTES as u64);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return ObservedSessionProbe::default();
+    }
+
+    let mut tail_bytes = vec![0u8; (metadata_len - start) as usize];
+    if file.read_exact(&mut tail_bytes).is_err() {
+        return ObservedSessionProbe::default();
+    }
+
+    let mut text = String::from_utf8_lossy(&tail_bytes).to_string();
+    if start > 0 {
+        if let Some(next_newline) = text.find('\n') {
+            text = text[next_newline + 1..].to_string();
+        } else {
+            return ObservedSessionProbe::default();
+        }
+    }
+
+    for line in text.lines().rev().take(SESSION_TAIL_SCAN_LINES) {
+        if let Some(event) = parse_session_event_line(line) {
+            return ObservedSessionProbe {
+                last_activity_at: Some(event.timestamp),
+                last_event_type: Some(event.event_type),
+                last_event_summary: event.summary,
+                ..ObservedSessionProbe::default()
+            };
+        }
+    }
+    ObservedSessionProbe::default()
+}
+
+#[cfg(target_os = "linux")]
+struct ObservedSessionEvent {
+    timestamp: i64,
+    event_type: String,
+    summary: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_session_event_line(line: &str) -> Option<ObservedSessionEvent> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let Some(timestamp) = parse_timestamp(value.get("timestamp")) else {
+        return None;
+    };
+    let event_type = value
+        .get("payload")
+        .and_then(|payload| payload.get("type"))
+        .and_then(|value| value.as_str())
+        .or_else(|| value.get("type").and_then(|value| value.as_str()))
+        .map(ToString::to_string)?;
+    if is_low_signal_session_event(&event_type) {
+        return None;
+    }
+    let summary = summarize_session_event(&value, &event_type);
+    Some(ObservedSessionEvent {
+        timestamp,
+        event_type,
+        summary,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_timestamp(value: Option<&Value>) -> Option<i64> {
+    let Some(value) = value else {
+        return None;
+    };
+    let millis = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|value| value.round() as i64))
+        .or_else(|| value.as_str().and_then(parse_rfc3339_utc_millis))
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()).map(|value| value.round() as i64))?;
+
+    if millis <= 0 {
+        return None;
+    }
+
+    if millis < 1_000_000_000_000 {
+        Some(millis.saturating_mul(1000))
+    } else {
+        Some(millis)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_rfc3339_utc_millis(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second_part = time_parts.next()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    let (second_text, fraction_text) = second_part
+        .split_once('.')
+        .map_or((second_part, ""), |(second, fraction)| (second, fraction));
+    let second = second_text.parse::<u32>().ok()?;
+    if !(1..=12).contains(&month) || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let millis = parse_millis_fraction(fraction_text);
+    let days = days_from_civil(year, month, day);
+    Some(
+        (days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+            .saturating_mul(1000)
+            .saturating_add(i64::from(millis)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn parse_millis_fraction(value: &str) -> u32 {
+    let mut millis = 0;
+    let mut scale = 100;
+    for character in value.chars().take(3) {
+        let Some(digit) = character.to_digit(10) else {
+            break;
+        };
+        millis += digit * scale;
+        if scale == 1 {
+            break;
+        }
+        scale /= 10;
+    }
+    millis
+}
+
+#[cfg(target_os = "linux")]
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - i32::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = i32::try_from(month).unwrap_or(1) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i32::try_from(day).unwrap_or(1) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    i64::from(era * 146_097 + day_of_era - 719_468)
+}
+
+#[cfg(target_os = "linux")]
+fn is_low_signal_session_event(event_type: &str) -> bool {
+    matches!(event_type, "token_count" | "reasoning")
+}
+
+#[cfg(target_os = "linux")]
+fn summarize_session_event(value: &Value, event_type: &str) -> Option<String> {
+    let payload = value.get("payload");
+    if event_type == "function_call" {
+        return payload
+            .and_then(|payload| payload.get("name"))
+            .and_then(|value| value.as_str())
+            .map(|name| format!("tool call: {name}"));
+    }
+    if event_type == "function_call_output" {
+        return Some("tool output received".to_string());
+    }
+    if event_type == "exec_command_end" {
+        return Some("command finished".to_string());
+    }
+    if event_type == "exec_command_start" {
+        return Some("command started".to_string());
+    }
+    if let Some(message) = payload
+        .and_then(|payload| payload.get("message"))
+        .and_then(|value| value.as_str())
+        .map(|message| compact_observed_summary(message, 72))
+    {
+        return Some(message);
+    }
+    if let Some(text) = payload
+        .and_then(|payload| payload.get("content"))
+        .and_then(first_json_text)
+        .map(|message| compact_observed_summary(&message, 72))
+    {
+        return Some(text);
+    }
+    Some(event_type.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn first_json_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Array(values) => values.iter().find_map(first_json_text),
+        Value::Object(map) => map
+            .get("text")
+            .and_then(first_json_text)
+            .or_else(|| map.get("content").and_then(first_json_text)),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compact_observed_summary(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut compact = normalized.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+    compact.push('…');
+    compact
+}
+
+#[cfg(target_os = "linux")]
+fn derive_external_activity_state(last_activity_at: Option<i64>, now_ms: i64) -> String {
+    let Some(last_activity_at) = last_activity_at else {
+        return "unknown".to_string();
+    };
+    let delta = if now_ms >= last_activity_at {
+        now_ms - last_activity_at
+    } else {
+        last_activity_at - now_ms
+    };
+    if delta <= EXTERNAL_ACTIVITY_ACTIVE_MS {
+        return "active".to_string();
+    }
+    if delta <= EXTERNAL_ACTIVITY_RECENT_MS {
+        return "recent".to_string();
+    }
+    "stale".to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_cwd(cwd: &str) -> String {
+    cwd.replace('\\', "/").trim().trim_end_matches('/').to_string()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -432,17 +876,59 @@ fn read_proc_cmdline(proc_path: &Path) -> Option<(String, bool)> {
 }
 
 #[cfg(target_os = "linux")]
-fn proc_state_label(stat: &str) -> String {
-    let Some((_, rest)) = stat.rsplit_once(") ") else {
-        return "unknown".to_string();
-    };
-    match rest.split_whitespace().next() {
-        Some("R") => "running",
-        Some("S") | Some("D") | Some("I") => "sleeping",
-        Some(_) => "unknown",
-        None => "unknown",
+fn is_descendant_of_pid(pid: u32, ancestor_pid: u32) -> bool {
+    let mut current = pid;
+    if current == 0 || ancestor_pid == 0 || current == ancestor_pid {
+        return false;
     }
-    .to_string()
+
+    for _ in 0..64 {
+        let parent_pid = match read_proc_parent_pid(current) {
+            Some(pid) => pid,
+            None => return false,
+        };
+        if parent_pid == ancestor_pid {
+            return true;
+        }
+        if parent_pid == 0 || parent_pid == current {
+            return false;
+        }
+        current = parent_pid;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    proc_status_from_stat(&stat).and_then(|status| status.parent_pid)
+}
+
+#[cfg(target_os = "linux")]
+struct ProcStatus {
+    state: String,
+    parent_pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn proc_status_from_stat(stat: &str) -> Option<ProcStatus> {
+    let Some((_, rest)) = stat.rsplit_once(") ") else {
+        return None;
+    };
+
+    let mut fields = rest.split_whitespace();
+    let raw_state = fields.next()?;
+    let parent_pid = fields.next().and_then(|value| value.parse::<u32>().ok());
+    let state = match raw_state {
+        "R" => "running",
+        "S" | "D" | "I" => "sleeping",
+        _ => "unknown",
+    };
+
+    Some(ProcStatus {
+        state: state.to_string(),
+        parent_pid,
+    })
 }
 
 fn match_workspace_for_cwd(cwd: &str, workspaces: &[Workspace]) -> Option<String> {
@@ -904,8 +1390,8 @@ async fn chat_send(
         Ok((cloned, latest_user_message_id))
     })?;
 
-    state_handle.update(|store| {
-        start_turn_for_session(
+    let current_turn_id = state_handle.update(|store| {
+        let turn_id = start_turn_for_session(
             store,
             &session_id,
             &input,
@@ -915,7 +1401,7 @@ async fn chat_send(
         store.save_tasks()?;
         store.save_turns()?;
         store.save_turn_items()?;
-        Ok(())
+        Ok(turn_id)
     })?;
 
     if is_manual_provider(&effective_provider) {
@@ -935,6 +1421,7 @@ async fn chat_send(
             state_handle.clone(),
             session_id.clone(),
             latest_user_message_id,
+            current_turn_id.clone(),
             input.clone(),
             attachments,
             effective_provider,
@@ -1150,8 +1637,8 @@ async fn proposal_choose(
 
     let _ = app.emit("approval-updated", &proposal);
 
-    state_handle.update(|store| {
-        start_turn_for_session(
+    let current_turn_id = state_handle.update(|store| {
+        let turn_id = start_turn_for_session(
             store,
             &session.id,
             &followup_input,
@@ -1161,7 +1648,7 @@ async fn proposal_choose(
         store.save_tasks()?;
         store.save_turns()?;
         store.save_turn_items()?;
-        Ok(())
+        Ok(turn_id)
     })?;
 
     if effective_provider == "openai-codex" {
@@ -1177,6 +1664,7 @@ async fn proposal_choose(
                 state_handle.clone(),
                 session_id.clone(),
                 latest_user_message_id,
+                current_turn_id,
                 followup_input.clone(),
                 Vec::new(),
                 effective_provider,
@@ -1432,6 +1920,7 @@ async fn process_chat_turn(
     state: SharedState,
     session_id: String,
     latest_user_message_id: String,
+    current_turn_id: String,
     latest_user_input: String,
     attachment_paths: Vec<String>,
     effective_provider: String,
@@ -1529,6 +2018,8 @@ async fn process_chat_turn(
             app.clone(),
             session_id.clone(),
             assistant_message_id.clone(),
+            state.clone(),
+            current_turn_id.clone(),
             &settings,
             &latest_user_input,
             execution_mode,
@@ -1737,6 +2228,8 @@ async fn run_codex_chat_turn_streaming(
     app: tauri::AppHandle,
     session_id: String,
     message_id: String,
+    state: SharedState,
+    turn_id: String,
     settings: &Settings,
     latest_user_input: &str,
     execution_mode: TurnExecutionMode,
@@ -1747,19 +2240,33 @@ async fn run_codex_chat_turn_streaming(
 ) -> Result<(String, bool), String> {
     let status = run_codex_login_status(settings)?;
     if !status.logged_in {
+        let _ = upsert_codex_turn_status_update(
+            &state,
+            &turn_id,
+            "失败",
+            "未登录 ChatGPT，请先点击“登录 ChatGPT”。",
+            "error",
+            &execution_mode,
+            &turn_intent,
+        );
         return Err("未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string());
     }
 
     let prompt = build_codex_exec_prompt(
         messages,
         execution_mode,
-        turn_intent,
+        turn_intent.clone(),
         workspace_ignore_patterns,
     );
     let workspace_path = workspace.map(|entry| entry.path.clone());
     let codex_settings = settings.clone();
     let latest_user_input = latest_user_input.to_string();
     let workspace_ignore_patterns = workspace_ignore_patterns.to_vec();
+
+    let state_for_status = state.clone();
+    let turn_id_for_status = turn_id.clone();
+    let execution_mode_for_status = execution_mode.clone();
+    let turn_intent_for_status = turn_intent.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let output_file =
@@ -1850,9 +2357,31 @@ async fn run_codex_chat_turn_streaming(
         }
 
         command.arg(&prompt);
-        let mut child = command
-            .spawn()
-            .map_err(|err| format!("启动 Codex 对话失败：{err}"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let message = format!("启动 Codex 对话失败：{err}");
+                let _ = upsert_codex_turn_status_update(
+                    &state_for_status,
+                    &turn_id_for_status,
+                    "失败",
+                    &message,
+                    "error",
+                    &execution_mode_for_status,
+                    &turn_intent_for_status,
+                );
+                return Err(message);
+            }
+        };
+        let _ = upsert_codex_turn_status_update(
+            &state_for_status,
+            &turn_id_for_status,
+            "连接",
+            "已连接模型，开始接收中间过程…",
+            "info",
+            &execution_mode_for_status,
+            &turn_intent_for_status,
+        );
         emit_chat_stream_status(
             &app,
             &session_id,
@@ -1878,6 +2407,10 @@ async fn run_codex_chat_turn_streaming(
         let last_activity_stderr = Arc::clone(&last_activity_at);
         let app_stdout = app.clone();
         let app_status = app.clone();
+        let state_for_status_stdout = state_for_status.clone();
+        let turn_id_for_status_stdout = turn_id_for_status.clone();
+        let execution_mode_for_status_stdout = execution_mode_for_status.clone();
+        let turn_intent_for_status_stdout = turn_intent_for_status.clone();
         let session_for_stdout = session_id.clone();
         let message_for_stdout = message_id.clone();
         let session_for_status = session_id.clone();
@@ -1899,10 +2432,19 @@ async fn run_codex_chat_turn_streaming(
                             ChatStreamStatusEvent {
                                 session_id: session_for_status.clone(),
                                 message_id: message_for_status.clone(),
-                                stage,
-                                detail,
-                                level,
+                                stage: stage.clone(),
+                                detail: detail.clone(),
+                                level: level.clone(),
                             },
+                        );
+                        let _ = upsert_codex_turn_status_update(
+                            &state_for_status_stdout,
+                            &turn_id_for_status_stdout,
+                            &stage,
+                            &detail,
+                            &level,
+                            &execution_mode_for_status_stdout,
+                            &turn_intent_for_status_stdout,
                         );
                     }
                 }
@@ -1929,6 +2471,10 @@ async fn run_codex_chat_turn_streaming(
         let reconnect_attempts = Arc::new(AtomicUsize::new(0));
         let reconnect_attempts_stderr = Arc::clone(&reconnect_attempts);
         let app_stderr = app.clone();
+        let state_for_status_stderr = state_for_status.clone();
+        let turn_id_for_status_stderr = turn_id_for_status.clone();
+        let execution_mode_for_status_stderr = execution_mode_for_status.clone();
+        let turn_intent_for_status_stderr = turn_intent_for_status.clone();
         let session_for_stderr = session_id.clone();
         let message_for_stderr = message_id.clone();
         let stderr_handle = std::thread::spawn(move || {
@@ -1984,10 +2530,19 @@ async fn run_codex_chat_turn_streaming(
                     ChatStreamStatusEvent {
                         session_id: session_for_stderr.clone(),
                         message_id: message_for_stderr.clone(),
-                        stage,
-                        detail,
-                        level,
+                        stage: stage.clone(),
+                        detail: detail.clone(),
+                        level: level.clone(),
                     },
+                );
+                let _ = upsert_codex_turn_status_update(
+                    &state_for_status_stderr,
+                    &turn_id_for_status_stderr,
+                    &stage,
+                    &detail,
+                    &level,
+                    &execution_mode_for_status_stderr,
+                    &turn_intent_for_status_stderr,
                 );
             }
         });
@@ -2012,6 +2567,24 @@ async fn run_codex_chat_turn_streaming(
                         .unwrap_or(true);
                     let reconnect_attempts = reconnect_attempts.load(Ordering::Relaxed);
                     if reconnect_exhausted.load(Ordering::Relaxed) {
+                        let reconnect_error = if reconnect_attempts > 0 {
+                            "Codex CLI 多次重连仍未恢复，请重试。"
+                        } else {
+                            "Codex CLI 重连失败，请重试。"
+                        };
+                        let _ = upsert_codex_turn_status_update(
+                            &state_for_status,
+                            &turn_id_for_status,
+                            "失败",
+                            if reconnect_attempts > 0 {
+                                "Codex CLI 连续重连且未恢复，本轮请求已提前终止。"
+                            } else {
+                                "Codex CLI 重连失败，本轮请求已终止。"
+                            },
+                            "error",
+                            &execution_mode_for_status,
+                            &turn_intent_for_status,
+                        );
                         emit_chat_stream_status(
                             &app,
                             &session_id,
@@ -2027,11 +2600,7 @@ async fn run_codex_chat_turn_streaming(
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = fs::remove_file(&output_file);
-                        return Err(if reconnect_attempts > 0 {
-                            "Codex CLI 多次重连仍未恢复，请重试。".to_string()
-                        } else {
-                            "Codex CLI 重连失败，请重试。".to_string()
-                        });
+                        return Err(reconnect_error.to_string());
                     }
                     if no_stream_text && !warned_no_text_20s && elapsed >= no_text_warn_1 {
                         warned_no_text_20s = true;
@@ -2089,26 +2658,46 @@ async fn run_codex_chat_turn_streaming(
                         );
                     }
                     if idle_elapsed >= idle_timeout {
+                        let timeout_error = format!(
+                            "{} 秒没有任何新进展，终止本轮请求。",
+                            idle_timeout.as_secs()
+                        );
+                        let _ = upsert_codex_turn_status_update(
+                            &state_for_status,
+                            &turn_id_for_status,
+                            "超时",
+                            &timeout_error,
+                            "error",
+                            &execution_mode_for_status,
+                            &turn_intent_for_status,
+                        );
                         emit_chat_stream_status(
                             &app,
                             &session_id,
                             &message_id,
                             "超时",
-                            &format!(
-                                "{} 秒没有任何新进展，终止本轮请求。",
-                                idle_timeout.as_secs()
-                            ),
+                            &timeout_error,
                             "error",
                         );
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = fs::remove_file(&output_file);
-                        return Err(format!(
-                            "请求超时：{} 秒没有任何新进展，请重试。",
-                            idle_timeout.as_secs()
-                        ));
+                        return Err(format!("请求超时：{timeout_error}"));
                     }
                     if started_at.elapsed() >= max_total_timeout {
+                        let timeout_error = format!(
+                            "{} 秒内未收到模型完成信号。",
+                            max_total_timeout.as_secs()
+                        );
+                        let _ = upsert_codex_turn_status_update(
+                            &state_for_status,
+                            &turn_id_for_status,
+                            "超时",
+                            &timeout_error,
+                            "error",
+                            &execution_mode_for_status,
+                            &turn_intent_for_status,
+                        );
                         emit_chat_stream_status(
                             &app,
                             &session_id,
@@ -2121,13 +2710,24 @@ async fn run_codex_chat_turn_streaming(
                         let _ = child.wait();
                         let _ = fs::remove_file(&output_file);
                         return Err(format!(
-                            "请求超时：{} 秒内未收到模型完成信号，请重试。",
-                            max_total_timeout.as_secs()
+                            "请求超时：{timeout_error}请重试。",
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(150));
                 }
-                Err(err) => return Err(format!("等待 Codex 返回失败：{err}")),
+                Err(err) => {
+                    let failure = format!("等待 Codex 返回失败：{err}");
+                    let _ = upsert_codex_turn_status_update(
+                        &state_for_status,
+                        &turn_id_for_status,
+                        "失败",
+                        &failure,
+                        "error",
+                        &execution_mode_for_status,
+                        &turn_intent_for_status,
+                    );
+                    return Err(failure);
+                }
             }
         };
         let _ = stdout_handle.join();
@@ -2150,6 +2750,15 @@ async fn run_codex_chat_turn_streaming(
             if error.contains("Please run `codex login`") || error.contains("logged in") {
                 error = "未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string();
             }
+            let _ = upsert_codex_turn_status_update(
+                &state_for_status,
+                &turn_id_for_status,
+                "失败",
+                &error,
+                "error",
+                &execution_mode_for_status,
+                &turn_intent_for_status,
+            );
             emit_chat_stream_status(
                 &app,
                 &session_id,
@@ -2170,6 +2779,15 @@ async fn run_codex_chat_turn_streaming(
                 .lock()
                 .map(|text| text.trim().is_empty())
                 .unwrap_or(true);
+            let _ = upsert_codex_turn_status_update(
+                &state_for_status,
+                &turn_id_for_status,
+                "完成",
+                "回复生成完成。",
+                "success",
+                &execution_mode_for_status,
+                &turn_intent_for_status,
+            );
             emit_chat_stream_status(
                 &app,
                 &session_id,
@@ -2186,6 +2804,15 @@ async fn run_codex_chat_turn_streaming(
             .map(|text| text.trim().to_string())
             .unwrap_or_default();
         if !streamed.is_empty() {
+            let _ = upsert_codex_turn_status_update(
+                &state_for_status,
+                &turn_id_for_status,
+                "完成",
+                "回复生成完成。",
+                "success",
+                &execution_mode_for_status,
+                &turn_intent_for_status,
+            );
             emit_chat_stream_status(
                 &app,
                 &session_id,
@@ -2204,6 +2831,15 @@ async fn run_codex_chat_turn_streaming(
             "失败",
             "模型没有返回可显示内容。",
             "error",
+        );
+        let _ = upsert_codex_turn_status_update(
+            &state_for_status,
+            &turn_id_for_status,
+            "失败",
+            "模型没有返回可显示内容。",
+            "error",
+            &execution_mode_for_status,
+            &turn_intent_for_status,
         );
         Err("Codex 没有返回可显示的回复，请重试。".to_string())
     })
@@ -3509,6 +4145,25 @@ fn current_turn_index_for_session(
         .map(|(index, _)| index)
 }
 
+fn attachable_turn_index_for_session(
+    store: &crate::storage::Store,
+    session_id: &str,
+) -> Option<usize> {
+    current_turn_index_for_session(store, session_id).or_else(|| {
+        store
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(_, turn)| turn.session_id == session_id && turn.assistant_message_id.is_none())
+            .max_by(|(_, left), (_, right)| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .map(|(index, _)| index)
+    })
+}
+
 fn proposal_turn_item_state(proposal: &ToolProposal) -> (TurnItemStatus, ItemApprovalState) {
     match proposal.status.as_str() {
         "pending" => (TurnItemStatus::Pending, ItemApprovalState::Pending),
@@ -3621,6 +4276,176 @@ fn append_turn_item(
     Ok(item_id)
 }
 
+fn turn_execution_mode_label(mode: &TurnExecutionMode) -> &'static str {
+    match mode {
+        TurnExecutionMode::QuickChat => "quickChat",
+        TurnExecutionMode::Agent => "agent",
+    }
+}
+
+fn turn_intent_label(intent: &TurnIntent) -> &'static str {
+    match intent {
+        TurnIntent::Auto => "auto",
+        TurnIntent::Choice => "choice",
+        TurnIntent::Preview => "preview",
+    }
+}
+
+fn codex_turn_item_status(stage: &str, level: &str) -> TurnItemStatus {
+    let lower_stage = stage.to_ascii_lowercase();
+    let lower_level = level.to_ascii_lowercase();
+    if lower_stage == "完成" || lower_stage == "完成。" || lower_stage == "done" {
+        return TurnItemStatus::Completed;
+    }
+    if lower_stage == "失败" || lower_stage == "超时" || lower_stage == "error" {
+        return TurnItemStatus::Failed;
+    }
+    if lower_level == "error" || lower_level == "fatal" {
+        return TurnItemStatus::Failed;
+    }
+    if lower_level == "success" || lower_level == "success." || lower_level == "done" {
+        return TurnItemStatus::Completed;
+    }
+
+    TurnItemStatus::Running
+}
+
+fn upsert_codex_turn_status_update(
+    state: &SharedState,
+    turn_id: &str,
+    stage: &str,
+    detail: &str,
+    level: &str,
+    execution_mode: &TurnExecutionMode,
+    turn_intent: &TurnIntent,
+) -> Result<(), String> {
+    state.update(|store| {
+        upsert_codex_turn_status_item_into_store(
+            store,
+            turn_id,
+            stage,
+            detail,
+            level,
+            execution_mode,
+            turn_intent,
+            now_millis(),
+        )
+    })
+}
+
+fn upsert_codex_turn_status_item_into_store(
+    store: &mut crate::storage::Store,
+    turn_id: &str,
+    stage: &str,
+    detail: &str,
+    level: &str,
+    execution_mode: &TurnExecutionMode,
+    turn_intent: &TurnIntent,
+    timestamp: i64,
+) -> Result<(), String> {
+    let stage = summarize_status_text(stage, 64);
+    let detail = summarize_status_text(detail, 140);
+    let level = level.trim().to_ascii_lowercase();
+    if stage.is_empty() || detail.is_empty() {
+        return Ok(());
+    }
+
+    let source = "codex_cli_stream";
+    let key_stage = stage.as_str();
+    let key_detail = detail.as_str();
+    let is_terminal_update = key_stage == "完成" || key_stage == "done" || key_stage == "失败" || level == "error" || level == "success";
+    let item_status = codex_turn_item_status(&stage, &level);
+
+    if let Some(existing_index) = store
+        .turn_items
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, item)| {
+            item.turn_id == turn_id
+                && matches!(
+                    item.kind,
+                    TurnItemKind::StatusUpdate | TurnItemKind::CommandOutput | TurnItemKind::CommandResult
+                )
+                && item
+                    .metadata
+                    .get("source")
+                    .and_then(|entry| entry.as_str())
+                    == Some(source)
+                && item
+                    .metadata
+                    .get("stage")
+                    .and_then(|entry| entry.as_str())
+                    == Some(key_stage)
+                && item
+                    .metadata
+                    .get("detail")
+                    .and_then(|entry| entry.as_str())
+                    == Some(key_detail)
+        })
+        .map(|(index, _)| index)
+    {
+        if !is_terminal_update {
+            return Ok(());
+        }
+        if let Some(existing_item) = store.turn_items.get_mut(existing_index) {
+            existing_item.updated_at = timestamp;
+            existing_item.status = item_status.clone();
+            existing_item.title = stage.to_string();
+            existing_item.summary = Some(detail.to_string());
+            existing_item.metadata = serde_json::json!({
+                "stage": stage,
+                "level": level,
+                "source": source,
+                "executionMode": turn_execution_mode_label(execution_mode),
+                "intent": turn_intent_label(turn_intent),
+            });
+        }
+        return Ok(());
+    }
+
+    if let Some(turn_index) = store.turns.iter().position(|turn| turn.id == turn_id) {
+        match item_status {
+            TurnItemStatus::Completed => store.turns[turn_index].status = TurnStatus::Completed,
+            TurnItemStatus::Failed => store.turns[turn_index].status = TurnStatus::Failed,
+            _ => store.turns[turn_index].status = TurnStatus::Running,
+        }
+        store.turns[turn_index].updated_at = timestamp;
+    }
+
+    let _ = append_turn_item(
+        store,
+        turn_id,
+        TurnItemKind::StatusUpdate,
+        item_status.clone(),
+        ItemApprovalState::NotRequired,
+        &stage,
+        Some(detail.to_string()),
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "stage": stage,
+            "level": level,
+            "source": source,
+            "executionMode": turn_execution_mode_label(execution_mode),
+            "intent": turn_intent_label(turn_intent),
+        }),
+    )?;
+
+    if let Some(task_id) = store
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .and_then(|turn| turn.task_id.as_deref())
+    {
+        if let Some(task) = store.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.updated_at = timestamp;
+        }
+    }
+    Ok(())
+}
+
 fn start_turn_for_session(
     store: &mut crate::storage::Store,
     session_id: &str,
@@ -3677,7 +4502,7 @@ fn attach_assistant_message_to_current_turn(
     content: &str,
     status: &str,
 ) -> Result<(), String> {
-    let Some(turn_index) = current_turn_index_for_session(store, session_id) else {
+    let Some(turn_index) = attachable_turn_index_for_session(store, session_id) else {
         return Ok(());
     };
 

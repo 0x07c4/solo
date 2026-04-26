@@ -20,6 +20,8 @@ const TURN_INTENT_AUTO = "auto";
 const TURN_INTENT_CHOICE = "choice";
 const TURN_INTENT_PREVIEW = "preview";
 const REJECT_ALL_DECISIONS_ACTION_ID = "reject_all_decisions";
+const SOLO_OBS_STALE_MS = 5 * 60 * 1000;
+const SOLO_PROJECTION_EVIDENCE_MAX = 3;
 const DEFAULT_SETTINGS = {
   provider: "codex_cli",
   baseUrl: "https://api.openai.com/v1",
@@ -82,10 +84,6 @@ function normalizeError(error) {
 
 function normalizeSessionMode(mode) {
   return mode === SESSION_MODE_WORKSPACE ? SESSION_MODE_WORKSPACE : SESSION_MODE_CONVERSATION;
-}
-
-function sessionModeLabel(mode) {
-  return normalizeSessionMode(mode) === SESSION_MODE_WORKSPACE ? "resource-attached" : "managed";
 }
 
 function sessionModeTrailLabel(mode) {
@@ -354,17 +352,29 @@ function normalizeObservedCodexAgents(value) {
           ? agent.matchedSessionId
           : null,
       lastSeenAt: Number.isFinite(agent.lastSeenAt) ? agent.lastSeenAt : Date.now(),
+      visibility:
+        typeof agent.visibility === "string" && agent.visibility.trim()
+          ? agent.visibility.trim()
+          : "processOnly",
+      activityState:
+        typeof agent.activityState === "string" && agent.activityState.trim()
+          ? agent.activityState.trim()
+          : "unknown",
+      lastActivityAt:
+        agent.lastActivityAt === null ? null : Number.isFinite(agent.lastActivityAt) ? agent.lastActivityAt : null,
+      lastEventType:
+        typeof agent.lastEventType === "string" && agent.lastEventType.trim()
+          ? agent.lastEventType.trim()
+          : "",
+      lastEventSummary:
+        typeof agent.lastEventSummary === "string" && agent.lastEventSummary.trim()
+          ? agent.lastEventSummary.trim()
+          : "",
+      observedSessionId:
+        typeof agent.observedSessionId === "string" && agent.observedSessionId.trim()
+          ? agent.observedSessionId.trim()
+          : null,
     }));
-}
-
-function codexAgentStateLabel(state) {
-  if (state === "running") {
-    return "running";
-  }
-  if (state === "sleeping") {
-    return "waiting";
-  }
-  return "unknown";
 }
 
 function codexAgentTone(agent) {
@@ -377,32 +387,416 @@ function codexAgentTone(agent) {
   return "idle";
 }
 
-function ExternalAgentResourceCard({ agent, workspace, session, current, onFocusSession }) {
+function compactText(value, maxChars) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) {
+    return "unknown";
+  }
+  const maxLength = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 54;
+  if (text.length <= maxLength) {
+    return text;
+  }
+  const head = Math.max(16, Math.floor(maxLength * 0.48));
+  const tail = Math.max(14, maxLength - head - 3);
+  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+}
+
+function compactAgentWorkspaceLabel(agent) {
+  const cwd = typeof agent?.cwd === "string" ? agent.cwd.trim() : "";
+  if (!cwd) {
+    return "untracked workspace";
+  }
+  const normalized = cwd.split("\\").join("/");
+  const segments = normalized.split("/").filter(Boolean);
+  const label = segments.length > 0 ? segments[segments.length - 1] : normalized;
+  return compactText(label, 32);
+}
+
+function compactAgentVisibilityLabel(agent) {
+  const visibility = typeof agent?.visibility === "string" ? agent.visibility.trim().toLowerCase() : "";
+  if (visibility === "sessionlog" || visibility === "session-log" || visibility === "session_log") {
+    return "session log";
+  }
+  return "process only";
+}
+
+function compactAgentActivityState(agent) {
+  const state = typeof agent?.activityState === "string" ? agent.activityState.trim().toLowerCase() : "";
+  if (state === "active" || state === "recent" || state === "stale") {
+    return state;
+  }
+  return "unknown";
+}
+
+function formatObservedActivityTime(timestamp) {
+  if (!timestamp || !Number.isFinite(timestamp)) {
+    return "unknown";
+  }
+  return new Date(timestamp).toLocaleString("en-US", {
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function projectEvidenceText(values, maxCount = SOLO_PROJECTION_EVIDENCE_MAX) {
+  const normalized = values
+    .filter((value) => typeof value === "string" && value.trim())
+    .map((value) => compactText(value, 72));
+  return normalized.slice(0, Math.max(1, Math.min(maxCount, normalized.length)));
+}
+
+function pickLatestTime(...values) {
+  return values
+    .map((value) => (Number.isFinite(value) ? value : NaN))
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => right - left)[0];
+}
+
+function mapActivityStateFromTimestamp({ state, activityState, lastActivityAt, hasRecent = false }) {
+  const normalizedState = typeof state === "string" ? state.trim().toLowerCase() : "";
+  const normalizedActivity = typeof activityState === "string" ? activityState.trim().toLowerCase() : "";
+
+  if (normalizedState === "running") {
+    return "running";
+  }
+  if (normalizedState === "sleeping" || normalizedActivity === "waiting") {
+    return "waiting";
+  }
+  if (normalizedActivity === "active" || normalizedActivity === "recent") {
+    return "running";
+  }
+  if (normalizedActivity === "stale") {
+    return "stale";
+  }
+
+  if (typeof lastActivityAt === "number" && Number.isFinite(lastActivityAt)) {
+    if (Date.now() - lastActivityAt > SOLO_OBS_STALE_MS) {
+      return "stale";
+    }
+    if (hasRecent || Number.isFinite(lastActivityAt)) {
+      return "running";
+    }
+  }
+
+  if (normalizedActivity) {
+    return normalizedActivity;
+  }
+  return "unknown";
+}
+
+function buildManagedRuntimeProjection({
+  activeSession,
+  runtimeTask,
+  runtimeTurn,
+  runtimeFailedCount = 0,
+  pendingApprovalCount = 0,
+  providerNeedsCodexLogin,
+  codexAuth,
+  chatSending = false,
+}) {
+  const isCodexReady =
+    !providerNeedsCodexLogin ||
+    (providerNeedsCodexLogin && codexAuth?.loggedIn && codexAuth?.available);
+
+  const hasTask = Boolean(runtimeTask);
+  const hasTurn = Boolean(runtimeTurn);
+  const turnIntent = runtimeTurn?.intent && normalizeTurnIntent(runtimeTurn.intent);
+  const turnStatus = runtimeTurn?.status;
+  const taskStatus = runtimeTask?.status;
+  const hasFailure = runtimeFailedCount > 0;
+  const hasTerminalTurn = ["completed", "failed", "cancelled"].includes(String(turnStatus ?? ""));
+  const isRunning =
+    turnStatus === "running" ||
+    chatSending ||
+    (!hasTerminalTurn && (taskStatus === "active" || taskStatus === "running"));
+  const isWaiting =
+    turnStatus === "pending" || taskStatus === "waitingUser" || taskStatus === "waiting";
+  const hasPendingApproval = pendingApprovalCount > 0;
+  const latestTs = pickLatestTime(
+    runtimeTurn?.updatedAt,
+    runtimeTurn?.createdAt,
+    runtimeTask?.updatedAt,
+    runtimeTask?.createdAt,
+    activeSession?.updatedAt
+  );
+  const hasRecentEvent =
+    Number.isFinite(latestTs) && Date.now() - latestTs < SOLO_OBS_STALE_MS;
+
+  let activityState = "idle";
+  if (!activeSession) {
+    activityState = "unknown";
+  } else if (!isCodexReady) {
+    activityState = "waiting";
+  } else if (hasFailure) {
+    activityState = "blocked";
+  } else if (hasPendingApproval) {
+    activityState = "waiting";
+  } else if (isRunning) {
+    activityState = "running";
+  } else if (isWaiting) {
+    activityState = "waiting";
+  } else if (hasTerminalTurn) {
+    activityState = "idle";
+  } else if (!hasRecentEvent && (hasTurn || hasTask)) {
+    activityState = "stale";
+  } else if (hasTask || hasTurn) {
+    activityState = "idle";
+  } else {
+    activityState = "idle";
+  }
+
+  let currentIntent = "wait";
+  if (providerNeedsCodexLogin && !codexAuth?.loggedIn) {
+    currentIntent = "wait";
+  } else if (hasPendingApproval || runtimeTurn?.status === "waitingUser") {
+    currentIntent = "approve";
+  } else if (hasFailure) {
+    currentIntent = "revise";
+  } else if (isRunning || chatSending) {
+    currentIntent = "send";
+  } else if (hasTask || hasTurn) {
+    currentIntent = "inspect";
+  } else if (activeSession) {
+    currentIntent = "create";
+  }
+
+  const evidence = projectEvidenceText([
+    runtimeTask?.title ? `任务: ${compactText(runtimeTask.title, 48)}` : "",
+    runtimeTurn?.id ? `turn: ${compactText(runtimeTurn.id, 40)}` : "",
+    hasPendingApproval
+      ? `${pendingApprovalCount}条待审批`
+      : hasFailure
+        ? `${runtimeFailedCount}条异常`
+        : taskStatus
+          ? `任务状态: ${taskStatus}`
+          : turnStatus
+            ? `执行状态: ${turnStatus}`
+            : turnIntent
+              ? `意图: ${turnIntent}`
+              : "No active run.  Create first task."
+  ]);
+
+  return {
+    owner: activeSession ? "solo" : "external",
+    capability: isCodexReady
+      ? activeSession
+        ? "managed"
+        : "readonly"
+      : "requiresLogin",
+    activityState,
+    currentIntent,
+    evidence,
+    debug: {
+      sessionId: activeSession?.id ?? "",
+      runtimeTaskId: runtimeTask?.id ?? "",
+      runtimeTurnId: runtimeTurn?.id ?? "",
+      runtimeTaskTitle: runtimeTask?.title ?? activeSession?.title ?? "",
+      runtimeTurnStatus: turnStatus ?? "",
+      turnIntent,
+      pendingApprovalCount,
+      runtimeFailedCount,
+      latestTs,
+    },
+  };
+}
+
+function buildObservedCodexProjection(agent, index = 0) {
+  const hasRecent = Number.isFinite(agent?.lastActivityAt)
+    ? Date.now() - agent.lastActivityAt < SOLO_OBS_STALE_MS
+    : false;
+  const activityState = mapActivityStateFromTimestamp({
+    state: agent?.state,
+    activityState: agent?.activityState,
+    lastActivityAt: agent?.lastActivityAt,
+    hasRecent,
+  });
+  const lastEventLabel = agent?.lastEventSummary || agent?.lastEventType || "unknown";
+
+  const evidence = projectEvidenceText([
+    `workspace: ${compactAgentWorkspaceLabel(agent)}`,
+    `visibility: ${compactAgentVisibilityLabel(agent)}`,
+    `activity: ${compactAgentActivityState(agent)}`,
+    `last event: ${compactText(lastEventLabel, 48)}`,
+    `last activity: ${formatObservedActivityTime(agent?.lastActivityAt)}`,
+  ]);
+
+  return {
+    owner: "external",
+    capability: "observeOnly",
+    activityState,
+    currentIntent: "inspect",
+    evidence,
+    debug: {
+      order: index,
+      pid: Number.isFinite(agent?.pid) ? agent.pid : 0,
+      id: agent?.id ?? "",
+      matchedWorkspaceId: agent?.matchedWorkspaceId ?? null,
+      matchedSessionId: agent?.matchedSessionId ?? null,
+      cwd: agent?.cwd ?? "",
+      command: agent?.command ?? "",
+      visibility: agent?.visibility ?? "unknown",
+      lastActivityAt: agent?.lastActivityAt ?? null,
+      lastEventType: agent?.lastEventType ?? "",
+      lastEventSummary: agent?.lastEventSummary ?? "",
+    },
+  };
+}
+
+function buildSoloProjection({ managedProjection, observedAgents }) {
+  const external = (Array.isArray(observedAgents) ? observedAgents : [])
+    .map((agent, index) => ({
+      ...agent,
+      projection: buildObservedCodexProjection(agent, index),
+    }))
+    .sort((left, right) => {
+      const leftWeight = left.projection.activityState === "running" ? 2 : 1;
+      const rightWeight = right.projection.activityState === "running" ? 2 : 1;
+      if (rightWeight !== leftWeight) {
+        return rightWeight - leftWeight;
+      }
+      return (right.lastSeenAt ?? 0) - (left.lastSeenAt ?? 0);
+    });
+
+  return {
+    managed: managedProjection,
+    external,
+    externalCount: external.length,
+    primaryExternal: external[0] ?? null,
+    canControl: managedProjection?.capability === "managed" && managedProjection?.owner === "solo",
+  };
+}
+
+function projectionToTone(activityState) {
+  if (activityState === "running") {
+    return "active";
+  }
+  if (activityState === "waiting") {
+    return "loading";
+  }
+  if (activityState === "blocked") {
+    return "error";
+  }
+  if (activityState === "stale") {
+    return "idle";
+  }
+  return "ready";
+}
+
+function projectionToStatus(activityState, currentIntent) {
+  if (currentIntent === "approve") {
+    return "approval";
+  }
+  if (activityState === "running") {
+    return "running";
+  }
+  if (activityState === "waiting") {
+    return "waiting";
+  }
+  if (activityState === "stale") {
+    return "stale";
+  }
+  if (activityState === "blocked") {
+    return "blocked";
+  }
+  return "idle";
+}
+
+function projectionRuntimeStatusLabel(activityState) {
+  if (activityState === "running") {
+    return "running";
+  }
+  if (activityState === "waiting") {
+    return "waiting";
+  }
+  if (activityState === "blocked") {
+    return "blocked";
+  }
+  if (activityState === "stale") {
+    return "stale";
+  }
+  return "idle";
+}
+
+function projectionNextIntentChipLabel(intent) {
+  if (intent === "approve") {
+    return "approve";
+  }
+  if (intent === "revise") {
+    return "revise";
+  }
+  if (intent === "send") {
+    return "send";
+  }
+  if (intent === "inspect") {
+    return "inspect";
+  }
+  if (intent === "create") {
+    return "create";
+  }
+  return "wait";
+}
+
+function projectionPrimaryActionLabel(intent) {
+  if (intent === "approve") {
+    return "Approve";
+  }
+  if (intent === "revise") {
+    return "Revise";
+  }
+  if (intent === "send") {
+    return "Pause";
+  }
+  if (intent === "inspect") {
+    return "Inspect";
+  }
+  if (intent === "create") {
+    return "Run";
+  }
+  return "Run";
+}
+
+function projectionCapabilityLabel(capability) {
+  if (capability === "observeOnly") {
+    return "observe-only";
+  }
+  if (capability === "requiresLogin") {
+    return "requires login";
+  }
+  if (capability === "readonly") {
+    return "readonly";
+  }
+  return "managed";
+}
+
+function ExternalAgentResourceCard({ agent, workspace, current, onInspect }) {
+  const activityLabel = agent.projection?.activityState || compactAgentActivityState(agent);
+  const lastEventLabel = compactText(agent.lastEventSummary || agent.lastEventType || "No recent event", 48);
+
   return (
-    <div className={`external-resource-agent-card ${current ? "is-current" : ""}`}>
+    <button
+      type="button"
+      className={`external-resource-agent-card ${current ? "is-current" : ""}`}
+      onClick={() => onInspect(agent.id)}
+      aria-label={`Inspect external Codex session for ${workspace?.name ?? "untracked workspace"}`}
+    >
       <div className="external-resource-agent-head">
         <div>
           <span className="section-eyebrow">External Codex</span>
           <strong>{workspace?.name ?? "Untracked workspace"}</strong>
         </div>
         <span className={`drawer-chip drawer-chip-${codexAgentTone(agent)}`}>
-          {codexAgentStateLabel(agent.state)}
+          {activityLabel}
         </span>
       </div>
       <div className="external-agent-meta">
         <span>observe-only</span>
         <span>{workspace ? "linked" : "untracked"}</span>
       </div>
-      {session ? (
-        <button
-          type="button"
-          className="ghost-button external-agent-action"
-          onClick={() => onFocusSession(session.id)}
-        >
-          Focus
-        </button>
-      ) : null}
-    </div>
+      <p>{lastEventLabel}</p>
+    </button>
   );
 }
 
@@ -1553,7 +1947,7 @@ function WorkstreamCard({ entry, active, onSelect, onDelete, deletingDisabled = 
         type="button"
         className={`session-main ${active ? "is-active" : ""}`}
         onClick={() => onSelect(entry.id)}
-        aria-label={`打开任务流 ${entry.title}`}
+        aria-label={`Open workstream ${entry.title}`}
       >
         <div className="session-row">
           <span className="session-title">{entry.title}</span>
@@ -1566,7 +1960,7 @@ function WorkstreamCard({ entry, active, onSelect, onDelete, deletingDisabled = 
         type="button"
         className="danger-button session-delete-button"
         onClick={() => onDelete(entry.id)}
-        aria-label={`删除任务流 ${entry.title}`}
+        aria-label={`Delete workstream ${entry.title}`}
         disabled={deletingDisabled}
       >
         Remove
@@ -1593,12 +1987,1070 @@ function ExceptionCard({ entry, active, onSelect }) {
   );
 }
 
+function TopStatusBar({
+  activeWorkspace,
+  providerNeedsCodexLogin,
+  managedProjection,
+  observedProjectionCount,
+  topbarResourceLabel,
+  hasCustomWindowChrome,
+  windowMaximized,
+  onOpenSettings,
+  onMinimize,
+  onToggleMaximize,
+  onClose,
+}) {
+  return (
+    <header className="topbar">
+      <div
+        className="topbar-dragzone"
+        data-tauri-drag-region={hasCustomWindowChrome ? true : undefined}
+        onDoubleClick={() => void onToggleMaximize()}
+      >
+        <div className="topbar-brand">
+          <div className="topbar-route">
+            <span className="topbar-logo" aria-hidden="true" />
+            <div className="topbar-trail" aria-label="current context">
+              <span className="topbar-app">solo</span>
+              <span className="topbar-separator">/</span>
+              <span className="topbar-context">control plane</span>
+            </div>
+            <span className="topbar-title-divider" aria-hidden="true" />
+            <div className="topbar-title-stack">
+              <h1>{activeWorkspace?.path ?? "~/workspace/solo"}</h1>
+              <span className="topbar-title-meta">branch: ui-ddd</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="topbar-status">
+        <button
+          type="button"
+          className="status-pill status-pill-button status-pill-compact"
+          onClick={onOpenSettings}
+        >
+          <strong className="status-pill-value">
+            {providerNeedsCodexLogin ? "Codex Login" : "Connection"}
+          </strong>
+        </button>
+        <span className="status-pill status-pill-compact status-pill-active">
+          <strong className="status-pill-value">
+            {managedProjection ? projectionCapabilityLabel(managedProjection.capability) : "managed"}
+          </strong>
+        </span>
+        <span
+          className={`status-pill status-pill-compact status-pill-${
+            observedProjectionCount ? "active" : "idle"
+          }`}
+          title={topbarResourceLabel}
+        >
+          <strong className="status-pill-value">
+            observe-only{observedProjectionCount ? ` ${observedProjectionCount}` : ""}
+          </strong>
+        </span>
+      </div>
+      {hasCustomWindowChrome ? (
+        <div className="window-controls">
+          <button
+            type="button"
+            className="window-control-button"
+            aria-label="最小化窗口"
+            onClick={() => void onMinimize()}
+          >
+            <WindowControlIcon kind="minimize" />
+          </button>
+          <button
+            type="button"
+            className="window-control-button"
+            aria-label={windowMaximized ? "还原窗口" : "最大化窗口"}
+            onClick={() => void onToggleMaximize()}
+          >
+            <WindowControlIcon kind="maximize" maximized={windowMaximized} />
+          </button>
+          <button
+            type="button"
+            className="window-control-button window-control-close"
+            aria-label="关闭窗口"
+            onClick={() => void onClose()}
+          >
+            <WindowControlIcon kind="close" />
+          </button>
+        </div>
+      ) : null}
+    </header>
+  );
+}
+
+function WorkstreamRail({
+  sessions,
+  activeWorkstreamEntries,
+  waitingWorkstreamEntries,
+  doneWorkstreamEntries,
+  activeSessionId,
+  chatSending,
+  onCreateSession,
+  onSelectSession,
+  onDeleteSession,
+  exceptionEntries,
+  resourceDisplayCount,
+  observedCodexState,
+  workspaces,
+  externalAgentsByWorkspaceId,
+  activeWorkspaceId,
+  activeSessionWorkspaceId,
+  onSelectWorkspace,
+  onRemoveWorkspace,
+  untrackedExternalAgents,
+  selectedObservedAgentId,
+  onInspectExternalAgent,
+  explorerOpen,
+  setExplorerOpen,
+  activeWorkspace,
+  workspaceTreeLoading,
+  workspaceTree,
+  selectedFilePath,
+  onOpenFile,
+  externalProjectionAgents,
+}) {
+  const externalAgentsForDisplay = externalProjectionAgents ?? [];
+  const renderWorkstreamGroup = (label, entries, emptyLabel, emptyTone) => (
+    <section className="workstream-group">
+      <div className="workstream-group-head">
+        <span className="section-eyebrow">{label}</span>
+        <span className="section-count">{entries.length}</span>
+      </div>
+      {entries.length ? (
+        <div className="session-list">
+          {entries.map((entry) => (
+            <WorkstreamCard
+              key={entry.id}
+              entry={entry}
+              active={entry.id === activeSessionId}
+              onSelect={onSelectSession}
+              onDelete={onDeleteSession}
+              deletingDisabled={chatSending && entry.id === activeSessionId}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="panel-collapsed-note">
+          <EmptyVisual label={emptyLabel} tone={emptyTone} />
+        </div>
+      )}
+    </section>
+  );
+
+  return (
+    <aside className="sidebar">
+      <section className="panel-block panel-sessions">
+        <div className="section-header">
+          <div>
+            <p className="section-eyebrow">Workstreams</p>
+            <div className="section-title-row">
+              <h2>Workstreams</h2>
+              <span className="section-count">{sessions.length}</span>
+            </div>
+          </div>
+          <button type="button" className="ghost-button" onClick={onCreateSession}>
+            New
+          </button>
+        </div>
+        <div className="workstream-groups">
+          {renderWorkstreamGroup("Active", activeWorkstreamEntries, "No active workstreams", "active")}
+          {renderWorkstreamGroup("Waiting", waitingWorkstreamEntries, "No waiting workstreams", "loading")}
+          {renderWorkstreamGroup("Done", doneWorkstreamEntries, "No completed workstreams", "ready")}
+        </div>
+      </section>
+
+      <section className="panel-block panel-exceptions">
+        <div className="section-header">
+          <div>
+            <p className="section-eyebrow">Exceptions</p>
+            <div className="section-title-row">
+              <h2>Exceptions</h2>
+              <span className="section-count">{exceptionEntries.length}</span>
+            </div>
+          </div>
+        </div>
+        {exceptionEntries.length ? (
+          <div className="exception-list">
+            {exceptionEntries.map((entry) => (
+              <ExceptionCard
+                key={entry.id}
+                entry={entry}
+                active={entry.id === activeSessionId}
+                onSelect={onSelectSession}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="panel-collapsed-note">
+            <EmptyVisual label="No exceptions" tone="ready" />
+          </div>
+        )}
+      </section>
+
+      <section className="panel-block panel-workspaces">
+        <div className="section-header">
+          <div>
+            <p className="section-eyebrow">Resources</p>
+            <div className="section-title-row">
+              <h2>Resources</h2>
+              <span className="section-count">{resourceDisplayCount}</span>
+              {observedCodexState.error ? (
+                <span className="list-badge list-badge-error">scan failed</span>
+              ) : null}
+              {externalAgentsForDisplay.length ? (
+                <span className="list-badge list-badge-accent">
+                  {externalAgentsForDisplay.length} external
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+        {workspaces.length || externalAgentsForDisplay.length ? (
+          <div className="workspace-list">
+            {observedCodexState.error ? (
+              <div className="resource-inline-error">
+                <strong>External Codex scan failed</strong>
+                <span>{observedCodexState.error}</span>
+              </div>
+            ) : null}
+            {workspaces.map((workspace) => {
+              const workspaceAgents = externalAgentsByWorkspaceId[workspace.id] ?? [];
+              return (
+                <div
+                  key={workspace.id}
+                  className={`workspace-card ${
+                    workspace.id === activeWorkspaceId ? "is-active" : ""
+                  } ${workspaceAgents.length ? "has-external-agent" : ""}`}
+                >
+                  <button
+                    type="button"
+                    className="workspace-main"
+                    onClick={() => void onSelectWorkspace(workspace.id)}
+                  >
+                    <div className="workspace-row">
+                      <span className="workspace-title">{workspace.name}</span>
+                      {workspace.id === activeSessionWorkspaceId ? (
+                        <span className="list-badge list-badge-accent">current</span>
+                      ) : null}
+                      {workspaceAgents.length ? (
+                        <span className="list-badge list-badge-loading">
+                          {workspaceAgents.length} external
+                        </span>
+                      ) : null}
+                    </div>
+                    <span className="workspace-path">{workspace.path}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={() => onRemoveWorkspace(workspace.id)}
+                  >
+                    Remove
+                  </button>
+	                  {workspaceAgents.length ? (
+	                    <div className="workspace-agent-stack">
+	                      {workspaceAgents.slice(0, 2).map((agent) => (
+	                        <ExternalAgentResourceCard
+	                          key={agent.id}
+	                          agent={agent}
+	                          workspace={workspace}
+	                          current={agent.id === selectedObservedAgentId}
+	                          onInspect={onInspectExternalAgent}
+	                        />
+	                      ))}
+	                    </div>
+	                  ) : null}
+                </div>
+              );
+            })}
+            {untrackedExternalAgents.length ? (
+              <div className="workspace-untracked-group">
+                <div className="workspace-untracked-head">
+                  <span className="section-eyebrow">Untracked</span>
+                  <span className="section-count">{untrackedExternalAgents.length}</span>
+                </div>
+	                {untrackedExternalAgents.slice(0, 1).map((agent) => (
+	                  <ExternalAgentResourceCard
+	                    key={agent.id}
+	                    agent={agent}
+	                    workspace={null}
+	                    current={agent.id === selectedObservedAgentId}
+	                    onInspect={onInspectExternalAgent}
+	                  />
+	                ))}
+	              </div>
+	            ) : null}
+          </div>
+        ) : (
+          <div className="panel-collapsed-note">
+            <EmptyVisual
+              label={
+                observedCodexState.error
+                  ? "External Codex scan failed"
+                  : observedCodexState.loading
+                    ? "Scanning external Codex"
+                    : "No resources"
+              }
+              tone={observedCodexState.error ? "error" : observedCodexState.loading ? "loading" : "idle"}
+            />
+          </div>
+        )}
+      </section>
+
+      <section className={`panel-block panel-explorer ${explorerOpen ? "is-grow" : "is-collapsed"}`}>
+        <div className="section-header">
+          <div>
+            <p className="section-eyebrow">Resource Lens</p>
+            <div className="section-title-row">
+              <h2>Resource lens</h2>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => setExplorerOpen((current) => !current)}
+            disabled={!activeWorkspace}
+          >
+            {explorerOpen ? "Collapse" : "Expand"}
+          </button>
+        </div>
+        {!explorerOpen ? (
+          <div className="panel-collapsed-note">
+            <EmptyVisual
+              label={activeWorkspace ? "File tree collapsed" : "No directory resource"}
+              tone={activeWorkspace ? "active" : "idle"}
+            />
+          </div>
+        ) : activeWorkspace ? (
+          workspaceTreeLoading ? (
+            <div className="empty-state compact">
+              <EmptyVisual label="Loading file tree" tone="loading" />
+            </div>
+          ) : workspaceTree ? (
+            <div className="tree-panel">
+              <WorkspaceTreeNode
+                node={workspaceTree}
+                level={0}
+                selectedPath={selectedFilePath}
+                onOpenFile={onOpenFile}
+              />
+            </div>
+          ) : (
+            <div className="empty-state compact">
+              <EmptyVisual label="No visible file tree" tone="idle" />
+            </div>
+          )
+        ) : (
+          <div className="empty-state compact">
+            <EmptyVisual label="No directory resource" tone="idle" />
+          </div>
+        )}
+      </section>
+    </aside>
+  );
+}
+
+function RuntimeHeader({
+  currentTaskTitle,
+  runtimeWorkstreamLabel,
+  currentTaskStateLabel,
+  runtimePanelTone,
+  currentRunStateLabel,
+  nextIntentLabel,
+  runtimeOutputCards,
+  outputCountLabel,
+}) {
+  return (
+    <div className="chat-head">
+      <div className="chat-head-shell runtime-head-shell">
+        <div className="chat-head-main">
+          <p className="section-eyebrow">Current task</p>
+          <h2>{currentTaskTitle}</h2>
+          <p className="runtime-task-subtitle">
+            Workstream: {runtimeWorkstreamLabel} · {currentTaskStateLabel}
+          </p>
+        </div>
+        <div className="runtime-state-strip" aria-label="task state">
+          <div className={`runtime-state-tile tone-${runtimePanelTone}`}>
+            <span>Run</span>
+            <strong>{currentRunStateLabel}</strong>
+          </div>
+          <div className={`runtime-state-tile tone-${nextIntentLabel === "approve" ? "approval" : "idle"}`}>
+            <span>Next</span>
+            <strong>{nextIntentLabel}</strong>
+          </div>
+          <div className={`runtime-state-tile tone-${runtimeOutputCards.length ? "active" : "idle"}`}>
+            <span>Outputs</span>
+            <strong>{outputCountLabel}</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RuntimeWorkbench({
+  showActiveRunCard,
+  activeRunTitle,
+  activeRunChipLabel,
+  runtimePanelTone,
+  activeRunSummary,
+  activeRunDetail,
+  activeRunSummaryTone,
+  nextIntentLabel,
+  hiddenRuntimeTimelineCount,
+  visibleRuntimeTimelineItems,
+  runtimePanelState,
+  visibleOutputCards,
+  runtimeOutputCards,
+  outputOverflowCount,
+  selectedDetailId,
+  onSelectDetail,
+  onSelectArtifacts,
+}) {
+  return (
+    <>
+      {showActiveRunCard ? (
+        <section className="shell-card active-run-card">
+          <div className="task-panel-head">
+            <div>
+              <p className="section-eyebrow">Active run</p>
+              <h3>{activeRunTitle}</h3>
+            </div>
+            <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{activeRunChipLabel}</span>
+          </div>
+          <button
+            type="button"
+            className={`active-run-summary tone-${activeRunSummaryTone} ${selectedDetailId === "active-run" ? "is-selected" : ""}`}
+            onClick={() => onSelectDetail("active-run")}
+          >
+            <div>
+              <strong>{activeRunSummary}</strong>
+              <p>{activeRunDetail || `next: ${nextIntentLabel}`}</p>
+            </div>
+          </button>
+        </section>
+      ) : null}
+
+      <section className="shell-card runtime-timeline-card">
+        <div className="task-panel-head">
+          <div>
+            <p className="section-eyebrow">Timeline</p>
+            <h3>Run events</h3>
+          </div>
+          <span className="drawer-chip drawer-chip-idle">
+            {hiddenRuntimeTimelineCount
+              ? `${visibleRuntimeTimelineItems.length} shown`
+              : `${visibleRuntimeTimelineItems.length} items`}
+          </span>
+        </div>
+        <div className="task-timeline-list runtime-timeline-list">
+          {runtimePanelState.error ? (
+            <div className="status-banner status-banner-error">
+              <strong>Runtime read failed</strong>
+              <span>{runtimePanelState.error}</span>
+            </div>
+          ) : (
+            visibleRuntimeTimelineItems.map((item) => {
+              const detailTarget = item.id === "runtime-older-events" ? "history" : `timeline:${item.id}`;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`task-timeline-item ${selectedDetailId === detailTarget ? "is-selected" : ""}`}
+                  onClick={() => onSelectDetail(detailTarget)}
+                >
+                  <div className="task-timeline-marker" aria-hidden="true" />
+                  <div className="task-timeline-body">
+                    <div className="task-timeline-head">
+                      <span className="task-timeline-time">
+                        {formatRuntimeTime(item.updatedAt ?? item.createdAt)}
+                      </span>
+                      <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
+                      <span
+                        className={`drawer-chip drawer-chip-${runtimeTone(
+                          item.status,
+                          item.approvalState
+                        )}`}
+                      >
+                        {runtimeItemStateLabel(item)}
+                      </span>
+                    </div>
+                    <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
+                    <p>{item.summary || truncateInline(item.content || "No summary.", 120)}</p>
+                  </div>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </section>
+
+      {visibleOutputCards.length ? (
+        <section className="shell-card runtime-outputs-card">
+          <div className="task-panel-head">
+            <div>
+              <p className="section-eyebrow">Outputs</p>
+              <h3>Artifacts</h3>
+            </div>
+            <span className="drawer-chip drawer-chip-active">
+              {`${runtimeOutputCards.length} visible`}
+            </span>
+          </div>
+          <div className="runtime-output-grid">
+            {visibleOutputCards.map((output) => (
+              <button
+                key={output.id}
+                type="button"
+                className={`runtime-output-tile tone-${output.tone}`}
+                onClick={() => {
+                  onSelectDetail(`output:${output.id}`);
+                  onSelectArtifacts();
+                }}
+              >
+                <strong>{output.title}</strong>
+                <span>{output.meta}</span>
+              </button>
+            ))}
+            {outputOverflowCount > 0 ? (
+              <button
+                type="button"
+                className="runtime-output-tile tone-idle is-overflow"
+                onClick={() => {
+                  onSelectDetail("outputs");
+                  onSelectArtifacts();
+                }}
+              >
+                <strong>{`+${outputOverflowCount}`}</strong>
+                <span>more</span>
+              </button>
+            ) : null}
+          </div>
+        </section>
+      ) : (
+        <section className="runtime-outputs-strip" aria-label="Outputs">
+          <div>
+            <p className="section-eyebrow">Outputs</p>
+            <h3>Artifacts</h3>
+          </div>
+          <span className="drawer-chip drawer-chip-active">
+            {`${runtimeOutputCards.length} visible`}
+          </span>
+        </section>
+      )}
+    </>
+  );
+}
+
+function CommandBar({
+  commandBarTitle,
+  commandActionCards,
+  activeSessionWorkspaceId,
+  activeWorkspace,
+  onOpenWorkspaceModal,
+  onDetachWorkspace,
+  composerInputRef,
+  draft,
+  setDraft,
+  loginBlocked,
+  chatSending,
+  hasStreamingAssistant,
+  onComposerKeyDown,
+  composerPlaceholder,
+  composerHint,
+  commandPrimaryDisabled,
+  commandPrimaryLabel,
+  supervisionState,
+  canControl,
+  canUseCommandInput,
+  onPrimaryAction,
+  composerContextButtonLabel,
+}) {
+  return (
+    <div className="composer">
+      <div className="composer-shell">
+        <div className="composer-bar-head">
+          <div>
+            <p className="section-eyebrow">Command Bar</p>
+            <strong>{commandBarTitle}</strong>
+          </div>
+        </div>
+        <div className="composer-control-strip" aria-label="command quick actions">
+          {commandActionCards.map((action) => (
+            <button
+              key={action.id}
+              type="button"
+              className={`composer-control-card tone-${action.tone}`}
+              disabled={action.disabled}
+              onClick={action.onClick}
+            >
+              <span className="section-eyebrow">{action.eyebrow}</span>
+              <strong>{action.title}</strong>
+            </button>
+          ))}
+        </div>
+        {activeSessionWorkspaceId ? (
+          <div className="composer-resource-strip">
+            <div className="composer-resource-main">
+              <span className="composer-resource-label">Resource</span>
+              <strong>{activeWorkspace?.name ?? "selected directory"}</strong>
+              <span className="composer-resource-path">
+                {activeWorkspace?.path ?? "path unavailable"}
+              </span>
+            </div>
+            <div className="composer-resource-actions">
+              <button type="button" className="ghost-button" onClick={onOpenWorkspaceModal}>
+                Change
+              </button>
+              <button type="button" className="ghost-button" onClick={onDetachWorkspace}>
+                Detach
+              </button>
+            </div>
+          </div>
+        ) : null}
+        <textarea
+          ref={composerInputRef}
+          className="composer-input"
+          value={draft}
+          disabled={loginBlocked || chatSending || hasStreamingAssistant || !canUseCommandInput}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={onComposerKeyDown}
+          placeholder={composerPlaceholder}
+        />
+        <div className="composer-actions">
+          <p className="composer-hint">{composerHint}</p>
+          <div className="composer-button-row">
+            <button
+              type="button"
+              className="primary-button"
+              disabled={commandPrimaryDisabled}
+              onClick={onPrimaryAction}
+            >
+              {commandPrimaryLabel}
+            </button>
+            {canControl && supervisionState === "waitingApproval" ? (
+              <>
+                <button type="button" className="ghost-button">
+                  Revise
+                </button>
+                <button type="button" className="ghost-button">
+                  Evidence
+                </button>
+              </>
+            ) : null}
+            {supervisionState === "idle" ? (
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={onOpenWorkspaceModal}
+                aria-label={composerContextButtonLabel}
+                title={composerContextButtonLabel}
+              >
+                More
+              </button>
+            ) : null}
+            {canControl && supervisionState === "blocked" ? (
+              <button type="button" className="danger-button">
+                Abort
+              </button>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InspectorPanel({
+  inspectorEyebrow,
+  inspectorTitle,
+  runtimePanelStatus,
+  inspectorStatus,
+  inspectorQuestion,
+  inspectorImpact,
+  hasPendingApproval,
+  isHistoryDetail,
+  canReturnToHistory,
+  historyItems,
+  historyPageLabel,
+  historyCanShowNewer,
+  historyCanShowOlder,
+  detailCanExpand,
+  detailExpanded,
+  onToggleDetailExpanded,
+  inspectorDetailHeading,
+  inspectorEvidence,
+  canControl,
+  onApprove,
+  onRevise,
+  onEvidence,
+  onSelectHistoryItem,
+  onBackToLatest,
+  onBackToHistory,
+  onHistoryNewer,
+  onHistoryOlder,
+}) {
+  return (
+    <aside className="inspector">
+      <div className="inspector-head">
+        <div>
+          <p className="section-eyebrow">{inspectorEyebrow}</p>
+          <h2>{inspectorTitle}</h2>
+        </div>
+        <span className="section-count">{runtimePanelStatus}</span>
+      </div>
+
+      <div className="inspector-cockpit">
+        <section className={`inspector-checkpoint-card ${hasPendingApproval ? "tone-decision" : "tone-detail"}`}>
+          <span className="section-eyebrow">{inspectorStatus}</span>
+          <h3>{inspectorQuestion}</h3>
+          <p>{inspectorImpact}</p>
+          {canControl && hasPendingApproval ? (
+            <div className="inspector-action-row">
+              <button type="button" className="primary-button" onClick={onApprove}>
+                Approve
+              </button>
+              <button type="button" className="ghost-button" onClick={onRevise}>
+                Revise
+              </button>
+              <button type="button" className="ghost-button" onClick={onEvidence}>
+                Evidence
+              </button>
+            </div>
+          ) : detailCanExpand ? (
+            <div className="inspector-action-row inspector-detail-action-row">
+              {canReturnToHistory ? (
+                <button type="button" className="ghost-button" onClick={onBackToHistory}>
+                  Back to history
+                </button>
+              ) : null}
+              <button type="button" className="ghost-button" onClick={onToggleDetailExpanded}>
+                {detailExpanded ? "Hide full" : "Show full"}
+              </button>
+            </div>
+          ) : canReturnToHistory ? (
+            <div className="inspector-action-row inspector-detail-action-row">
+              <button type="button" className="ghost-button" onClick={onBackToHistory}>
+                Back to history
+              </button>
+            </div>
+          ) : isHistoryDetail ? (
+            <div className="inspector-action-row inspector-detail-action-row">
+              <button type="button" className="ghost-button" onClick={onBackToLatest}>
+                Back to latest
+              </button>
+            </div>
+          ) : null}
+        </section>
+
+        {isHistoryDetail ? (
+          <section className="inspector-evidence-card inspector-history-card">
+            <div className="task-panel-head">
+              <h3>{inspectorDetailHeading}</h3>
+              <span className="drawer-chip drawer-chip-idle">{historyPageLabel}</span>
+            </div>
+            <div className="inspector-history-list">
+              {historyItems.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="inspector-history-item"
+                  onClick={() => onSelectHistoryItem(item)}
+                >
+                  <span>
+                    {formatRuntimeTime(item.updatedAt ?? item.createdAt)} · {turnItemKindLabel(item.kind)}
+                  </span>
+                  <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
+                  <small>{item.summary || truncateInline(item.content || "No summary.", 96)}</small>
+                </button>
+              ))}
+            </div>
+            <div className="inspector-history-nav">
+              <button type="button" className="ghost-button" disabled={!historyCanShowNewer} onClick={onHistoryNewer}>
+                Newer
+              </button>
+              <button type="button" className="ghost-button" disabled={!historyCanShowOlder} onClick={onHistoryOlder}>
+                Older
+              </button>
+            </div>
+          </section>
+        ) : (
+          <section className="inspector-evidence-card">
+            <h3>{inspectorDetailHeading}</h3>
+            <div className="inspector-evidence-list">
+              {inspectorEvidence.map((item, index) => (
+                <p key={`${index}-${item}`}>{item}</p>
+              ))}
+            </div>
+          </section>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function isActionableRuntimeFailure(item) {
+  const status = String(item?.status ?? "").toLowerCase();
+  const approvalState = String(item?.approvalState ?? "").toLowerCase();
+  const detailText = [
+    item?.title,
+    item?.summary,
+    item?.message,
+    item?.content,
+    item?.error,
+    runtimeItemVisibleText(item),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  const isInternalCodexRecordFailure =
+    detailText.includes("failed to record rollout items") ||
+    detailText.includes("codex_core::session");
+
+  if (isInternalCodexRecordFailure) {
+    return false;
+  }
+
+  return (
+    status === "failed" ||
+    status === "cancelled" ||
+    approvalState === "failed" ||
+    approvalState === "rejected"
+  );
+}
+
+function runtimeItemVisibleText(item) {
+  const message = item?.message;
+  const error = item?.error;
+  const messageContent =
+    typeof message === "string"
+      ? message
+      : typeof message?.content === "string"
+        ? message.content
+        : typeof message?.text === "string"
+          ? message.text
+          : "";
+  const errorContent =
+    typeof error === "string"
+      ? error
+      : typeof error?.message === "string"
+        ? error.message
+        : typeof error?.content === "string"
+          ? error.content
+          : "";
+
+  return [item?.content, messageContent, errorContent]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n")
+    .trim();
+}
+
+function isRuntimeStatusOnlyItem(item) {
+  const title = String(item?.title ?? "").trim().toLowerCase();
+  const summary = String(item?.summary ?? "").trim().toLowerCase();
+
+  if (!title && !summary) {
+    return true;
+  }
+
+  return [
+    "连接",
+    "准备",
+    "执行工具",
+    "生成回复",
+    "完成",
+    "cli",
+    "reply completed",
+    "turn completed",
+    "回复生成完成",
+  ].some((needle) => title.includes(needle) || summary.includes(needle));
+}
+
+function findRuntimeTurnAssistantMessage({ runtimeTurn, runtimeItems, sessionMessages }) {
+  const messages = Array.isArray(sessionMessages) ? sessionMessages : [];
+  if (!messages.length) {
+    return null;
+  }
+
+  const findAssistantAfterUserIndex = (userIndex) => {
+    if (userIndex < 0) {
+      return null;
+    }
+    return (
+      messages
+        .slice(userIndex + 1)
+        .find(
+          (message) =>
+            String(message?.role ?? "").toLowerCase() === "assistant" &&
+            compactText(message?.content ?? "", 1)
+        ) ?? null
+    );
+  };
+
+  const assistantMessageId = runtimeTurn?.assistantMessageId ?? "";
+  if (assistantMessageId) {
+    const matched = messages.find(
+      (message) =>
+        String(message?.id ?? "") === assistantMessageId &&
+        String(message?.role ?? "").toLowerCase() === "assistant" &&
+        compactText(message?.content ?? "", 1)
+    );
+    if (matched) {
+      return matched;
+    }
+  }
+
+  const userMessageId = runtimeTurn?.userMessageId ?? "";
+  if (userMessageId) {
+    const matchedById = findAssistantAfterUserIndex(
+      messages.findIndex((message) => String(message?.id ?? "") === userMessageId)
+    );
+    if (matchedById) {
+      return matchedById;
+    }
+  }
+
+  if (String(runtimeTurn?.id ?? "").startsWith("optimistic_")) {
+    const optimisticUserItem = (runtimeItems ?? []).find(
+      (item) =>
+        item?.turnId === runtimeTurn?.id &&
+        String(item?.kind ?? "").toLowerCase().includes("user")
+    );
+    const optimisticUserText = compactText(
+      optimisticUserItem?.content ?? optimisticUserItem?.summary ?? "",
+      512
+    );
+    if (optimisticUserText) {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (
+          String(message?.role ?? "").toLowerCase() === "user" &&
+          compactText(message?.content ?? "", 512) === optimisticUserText
+        ) {
+          return findAssistantAfterUserIndex(index);
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function buildRuntimeVisibleResult({ runtimeTurn, runtimeItems, outputCards, sessionMessages }) {
+  const turnStatus = String(runtimeTurn?.status ?? "").toLowerCase();
+  const hasOpenTurn = ["pending", "running", "waitinguser"].includes(turnStatus);
+  const visibleAssistantItem = [...(runtimeItems ?? [])]
+    .reverse()
+    .find((item) => {
+      const role = String(item?.role ?? item?.message?.role ?? item?.metadata?.role ?? "").toLowerCase();
+      const kind = String(item?.kind ?? item?.type ?? "").toLowerCase();
+      const text = runtimeItemVisibleText(item);
+      return (
+        text &&
+        (role === "assistant" ||
+          kind === "agentmessage" ||
+          kind.includes("assistant") ||
+          kind.includes("response"))
+      );
+    });
+
+  if (visibleAssistantItem) {
+    const detail = runtimeItemVisibleText(visibleAssistantItem);
+    return {
+      title: "Assistant response",
+      detail: truncateInline(detail, 220),
+      fullDetail: detail,
+      tone: "active",
+      source: "assistantItem",
+    };
+  }
+
+  const messages = Array.isArray(sessionMessages) ? sessionMessages : [];
+  const visibleAssistantMessage =
+    findRuntimeTurnAssistantMessage({ runtimeTurn, runtimeItems, sessionMessages }) ??
+    (hasOpenTurn
+      ? null
+      : [...messages]
+          .reverse()
+          .find(
+            (message) =>
+              String(message?.role ?? "").toLowerCase() === "assistant" &&
+              compactText(message?.content ?? "", 1)
+          ) ??
+        null);
+
+  if (visibleAssistantMessage) {
+    const detail = visibleAssistantMessage.content ?? "";
+    return {
+      title: "Assistant response",
+      detail: truncateInline(detail, 220),
+      fullDetail: detail,
+      tone: "active",
+      source: "assistantMessage",
+    };
+  }
+
+  const visibleOutputCount = outputCards?.length ?? 0;
+  if (visibleOutputCount > 0) {
+    return {
+      title: `${visibleOutputCount} output${visibleOutputCount === 1 ? "" : "s"} ready`,
+      detail: "Open Outputs to inspect generated artifacts.",
+      fullDetail: "Open Outputs to inspect generated artifacts.",
+      tone: "active",
+      source: "output",
+    };
+  }
+
+  const hasTerminalTurn = ["completed", "failed", "cancelled"].includes(
+    String(runtimeTurn?.status ?? "")
+  );
+  if (hasTerminalTurn) {
+    return {
+      title: "No visible output captured",
+      detail: "The turn finished, but Solo did not receive assistant text or artifacts.",
+      fullDetail: "The turn finished, but Solo did not receive assistant text or artifacts.",
+      tone: runtimeTurn?.status === "completed" ? "idle" : "error",
+      source: "missing",
+    };
+  }
+
+  const latestActionItem = [...(runtimeItems ?? [])]
+    .reverse()
+    .find((item) => !isRuntimeStatusOnlyItem(item));
+  if (latestActionItem) {
+    return {
+      title: truncateInline(latestActionItem.title || latestActionItem.summary || "Runtime event", 96),
+      detail: truncateInline(latestActionItem.summary || latestActionItem.content || "Waiting for result.", 140),
+      fullDetail: latestActionItem.summary || latestActionItem.content || "Waiting for result.",
+      tone: "active",
+      source: "event",
+    };
+  }
+
+  return {
+    title: hasOpenTurn ? "Codex is working" : "Waiting for visible result",
+    detail: hasOpenTurn
+      ? "Awaiting progress for the current turn."
+      : "Runtime events are being collected.",
+    fullDetail: hasOpenTurn
+      ? "Awaiting progress for the current turn."
+      : "Runtime events are being collected.",
+    tone: hasOpenTurn ? "loading" : "idle",
+    source: "waiting",
+  };
+}
+
 export default function App() {
   const [observedCodexState, setObservedCodexState] = useState({
     agents: [],
     loading: false,
     error: "",
   });
+  const [selectedObservedAgentId, setSelectedObservedAgentId] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -1642,6 +3094,8 @@ export default function App() {
 
   const mountedRef = useRef(true);
   const activeSessionIdRef = useRef("");
+  const runtimeRefreshLoopRef = useRef(new Set());
+  const startRuntimeSnapshotRefreshLoopRef = useRef(null);
   const composerInputRef = useRef(null);
 
   const [codexAuth, setCodexAuth] = useState({
@@ -1673,19 +3127,36 @@ export default function App() {
   const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false);
   const [selectedFilePath, setSelectedFilePath] = useState("");
   const [filePreview, setFilePreview] = useState(null);
-  const [previewState, setPreviewState] = useState({ loading: false, error: "" });
+  const [, setPreviewState] = useState({ loading: false, error: "" });
   const [proposalsBySession, setProposalsBySession] = useState({});
-  const [proposalPanelState, setProposalPanelState] = useState({ loading: false, error: "" });
+  const [, setProposalPanelState] = useState({ loading: false, error: "" });
   const [proposalActionId, setProposalActionId] = useState("");
   const [decisionPreviewBySession, setDecisionPreviewBySession] = useState({});
   const [turnIntentBySession, setTurnIntentBySession] = useState({});
   const [runtimeSnapshotBySession, setRuntimeSnapshotBySession] = useState({});
   const [runtimePanelState, setRuntimePanelState] = useState({ loading: false, error: "" });
+  const [selectedDetailId, setSelectedDetailId] = useState("active-run");
+  const [lastHistoryDetailId, setLastHistoryDetailId] = useState("");
+  const [detailExpanded, setDetailExpanded] = useState(false);
+  const [historyPageIndex, setHistoryPageIndex] = useState(0);
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
-  const [inspectorTab, setInspectorTab] = useState("trace");
+  const [, setInspectorTab] = useState("trace");
+
+  useEffect(() => {
+    setSelectedDetailId("active-run");
+    setLastHistoryDetailId("");
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    setDetailExpanded(false);
+  }, [activeSessionId, selectedDetailId]);
+
+  useEffect(() => {
+    setHistoryPageIndex(0);
+  }, [activeSessionId, selectedDetailId]);
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId) ?? null,
@@ -1769,30 +3240,38 @@ export default function App() {
           turns.find((item) => item.id === preferredTurnId) ??
           turns[0] ??
           null;
+        const turnItems = turn
+          ? (snapshot.turnItems ?? []).filter((item) => item.turnId === turn.id)
+          : [];
+        const hasReconciledAssistant = Boolean(
+          findRuntimeTurnAssistantMessage({
+            runtimeTurn: turn,
+            runtimeItems: turnItems,
+            sessionMessages: session.messages,
+          })
+        );
         const pendingApprovals = (snapshot.turnItems ?? []).filter(
           (item) => item.approvalState === "pending"
         ).length;
-        const failedItems = (snapshot.turnItems ?? []).filter(
-          (item) =>
-            item.status === "failed" ||
-            item.status === "cancelled" ||
-            item.approvalState === "failed" ||
-            item.approvalState === "rejected"
-        ).length;
+        const failedItems = (snapshot.turnItems ?? []).filter(isActionableRuntimeFailure).length;
         const tone = failedItems > 0
           ? "error"
-          : pendingApprovals > 0 || task?.status === "waitingUser"
+          : pendingApprovals > 0
             ? "loading"
-            : task?.status === "completed" || turn?.status === "completed"
+            : task?.status === "completed" || turn?.status === "completed" || hasReconciledAssistant
               ? "ready"
+              : task?.status === "waitingUser"
+                ? "loading"
               : task?.status === "active" || turn?.status === "running"
                 ? "active"
                 : "idle";
-        const statusLabel = task
-          ? taskStatusLabel(task.status)
-          : turn
-            ? turnStatusLabel(turn.status)
-            : sessionModeTrailLabel(session.interactionMode);
+        const statusLabel = turn?.status === "completed" || hasReconciledAssistant
+          ? turnStatusLabel("completed")
+          : task
+            ? taskStatusLabel(task.status)
+            : turn
+              ? turnStatusLabel(turn.status)
+              : sessionModeTrailLabel(session.interactionMode);
         const summary =
           task?.summary?.trim() ||
           turn?.summary?.trim() ||
@@ -1803,10 +3282,12 @@ export default function App() {
           : `${sessionModeTrailLabel(session.interactionMode)} · ${formatRuntimeTime(session.updatedAt)}`;
         const bucket = failedItems > 0
           ? "blocked"
-          : pendingApprovals > 0 || task?.status === "waitingUser"
+          : pendingApprovals > 0
             ? "waiting"
-            : task?.status === "completed" || task?.status === "cancelled" || turn?.status === "completed"
+            : task?.status === "completed" || task?.status === "cancelled" || turn?.status === "completed" || hasReconciledAssistant
               ? "done"
+              : task?.status === "waitingUser"
+                ? "waiting"
               : "active";
         let exceptionLabel = "";
         let exceptionSummary = "";
@@ -1816,7 +3297,7 @@ export default function App() {
         } else if (pendingApprovals > 0) {
           exceptionLabel = "待确认";
           exceptionSummary = `${pendingApprovals} 个检查点等待你介入`;
-        } else if (task?.status === "waitingUser") {
+        } else if (task?.status === "waitingUser" && !hasReconciledAssistant) {
           exceptionLabel = "待决策";
           exceptionSummary = "当前任务停在等待用户决策状态。";
         }
@@ -1851,11 +3332,6 @@ export default function App() {
     () => sessionRuntimeSummaries.filter((entry) => entry.hasException),
     [sessionRuntimeSummaries]
   );
-  const activeSessionSummary = useMemo(
-    () => sessionRuntimeSummaries.find((entry) => entry.id === activeSessionId) ?? null,
-    [sessionRuntimeSummaries, activeSessionId]
-  );
-
   const fetchCodexStatus = async ({ showNotice = false } = {}) => {
     const status = normalizeLoginStatus(await desktop.codexLoginStatus());
     if (mountedRef.current) {
@@ -1918,10 +3394,13 @@ export default function App() {
     }
 
     try {
-      const snapshot = normalizeRuntimeSnapshot(
-        await desktop.sessionRuntimeSnapshot(sessionId),
-        sessionId
-      );
+      const snapshotPayload = await Promise.race([
+        desktop.sessionRuntimeSnapshot(sessionId),
+        new Promise((resolve) => {
+          window.setTimeout(() => resolve(null), 2500);
+        }),
+      ]);
+      const snapshot = normalizeRuntimeSnapshot(snapshotPayload, sessionId);
       if (mountedRef.current) {
         setRuntimeSnapshotBySession((current) => ({
           ...current,
@@ -1940,9 +3419,79 @@ export default function App() {
     }
   };
 
+  const startRuntimeSnapshotRefreshLoop = (sessionId) => {
+    if (!sessionId) {
+      return;
+    }
+    if (runtimeRefreshLoopRef.current.has(sessionId)) {
+      return;
+    }
+
+    runtimeRefreshLoopRef.current.add(sessionId);
+    const startedAt = Date.now();
+    const maxRuntimeRefreshMs = 10 * 60 * 1000;
+    const finish = () => {
+      runtimeRefreshLoopRef.current.delete(sessionId);
+    };
+    const refresh = async () => {
+      if (!mountedRef.current) {
+        finish();
+        return;
+      }
+      try {
+        const snapshot = await loadSessionRuntimeSnapshot(sessionId, { silent: true });
+        const hasRunningTurn = (snapshot.turns ?? []).some((turn) =>
+          ["pending", "running"].includes(String(turn.status ?? ""))
+        );
+        const hasOptimisticTurn = (snapshot.turns ?? []).some((turn) =>
+          String(turn.id ?? "").startsWith("optimistic_")
+        );
+
+        if (!hasRunningTurn && activeSessionIdRef.current === sessionId) {
+          setChatSending(false);
+        }
+
+        if ((hasRunningTurn || hasOptimisticTurn) && Date.now() - startedAt < maxRuntimeRefreshMs) {
+          window.setTimeout(refresh, 1200);
+          return;
+        }
+        finish();
+      } catch {
+        if (Date.now() - startedAt < maxRuntimeRefreshMs) {
+          window.setTimeout(refresh, 2000);
+          return;
+        }
+        finish();
+      }
+    };
+
+    window.setTimeout(refresh, 400);
+  };
+  startRuntimeSnapshotRefreshLoopRef.current = startRuntimeSnapshotRefreshLoop;
+
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+
+    const snapshot = runtimeSnapshotBySession[activeSessionId];
+    const shouldRefreshRuntime = (snapshot?.turns ?? []).some((turn) => {
+      const turnStatus = String(turn.status ?? "");
+      return (
+        turnStatus === "pending" ||
+        turnStatus === "running" ||
+        String(turn.id ?? "").startsWith("optimistic_")
+      );
+    });
+
+    if (shouldRefreshRuntime) {
+      startRuntimeSnapshotRefreshLoopRef.current?.(activeSessionId);
+    }
+  }, [activeSessionId, runtimeSnapshotBySession]);
 
   useEffect(() => {
     streamProgressRef.current = streamProgressBySession;
@@ -2209,6 +3758,7 @@ export default function App() {
             },
           };
         });
+        void loadSessionRuntimeSnapshot(payload.sessionId, { silent: true }).catch(() => {});
       });
 
       unlistenToken = await desktop.listen("chat-stream-token", (event) => {
@@ -2618,6 +4168,7 @@ export default function App() {
       }
       setSessions((current) => upsertSession(current, session));
       void loadSessionRuntimeSnapshot(session.id, { silent: true }).catch(() => {});
+      setSelectedObservedAgentId("");
       setActiveSessionId(session.id);
       setDraft("");
       setNotice({ kind: "success", text: "已创建新会话。" });
@@ -2628,8 +4179,14 @@ export default function App() {
 
   const handleSelectSession = (sessionId) => {
     const session = sessions.find((entry) => entry.id === sessionId);
+    setSelectedObservedAgentId("");
     setActiveSessionId(sessionId);
     setActiveWorkspaceId(session?.workspaceId ?? "");
+  };
+
+  const handleInspectExternalAgent = (agentId) => {
+    setSelectedObservedAgentId(agentId);
+    setInspectorTab("trace");
   };
 
   const handleDeleteSession = async (sessionId) => {
@@ -2712,48 +4269,9 @@ export default function App() {
     }
   };
 
-  const handleSetSessionMode = async (nextMode) => {
-    if (!activeSessionId) {
-      return;
-    }
-    const normalizedNextMode = normalizeSessionMode(nextMode);
-    if (normalizedNextMode === activeSessionMode) {
-      return;
-    }
-    if (
-      normalizedNextMode === SESSION_MODE_WORKSPACE &&
-      !activeSessionWorkspaceId
-    ) {
-      setNotice({
-        kind: "info",
-        text: "当前没有待授权的资源请求。",
-      });
-      return;
-    }
-
-    try {
-      const updated = await desktop.sessionModeSet(activeSessionId, normalizedNextMode);
-      setSessions((current) => upsertSession(current, updated));
-      if (normalizedNextMode === SESSION_MODE_WORKSPACE) {
-        setTurnIntentBySession((current) => ({
-          ...current,
-          [activeSessionId]: current[activeSessionId] ?? TURN_INTENT_CHOICE,
-        }));
-      }
-      setNotice({
-        kind: "info",
-        text:
-          normalizedNextMode === SESSION_MODE_WORKSPACE
-            ? "当前 run 已启用附加资源，默认先给方向建议。"
-            : "当前 run 已切回纯对话，不会读取附加资源。",
-      });
-    } catch (error) {
-      setNotice({ kind: "error", text: normalizeError(error) });
-    }
-  };
-
-  const handleSend = async () => {
-    if (!activeSessionId) {
+  const handleSend = async (options = {}) => {
+    const targetSessionId = options.sessionId ?? activeSessionId;
+    if (!targetSessionId) {
       return;
     }
     const input = draft.trim();
@@ -2761,34 +4279,37 @@ export default function App() {
       return;
     }
 
+    const requestedInteractionMode = options.interactionMode ?? activeSessionMode;
+    const requestedTurnIntent = options.turnIntent ?? activeTurnIntent;
+
     setDraft("");
     setChatSending(true);
     setStreamProgressBySession((current) => {
-      if (!current[activeSessionId]) {
+      if (!current[targetSessionId]) {
         return current;
       }
       const next = { ...current };
-      delete next[activeSessionId];
+      delete next[targetSessionId];
       return next;
     });
     setStreamMonitorBySession((current) => {
-      if (!current[activeSessionId]) {
+      if (!current[targetSessionId]) {
         return current;
       }
       const next = { ...current };
-      delete next[activeSessionId];
+      delete next[targetSessionId];
       return next;
     });
     setDecisionPreviewBySession((current) => {
-      if (!current[activeSessionId]) {
+      if (!current[targetSessionId]) {
         return current;
       }
       const next = { ...current };
-      delete next[activeSessionId];
+      delete next[targetSessionId];
       return next;
     });
     setProposalsBySession((current) => {
-      const previous = current[activeSessionId];
+      const previous = current[targetSessionId];
       if (!previous?.length) {
         return current;
       }
@@ -2804,22 +4325,122 @@ export default function App() {
       });
       return {
         ...current,
-        [activeSessionId]: sortProposals(nextProposals),
+        [targetSessionId]: sortProposals(nextProposals),
+      };
+    });
+    const optimisticTimestamp = Date.now();
+    const optimisticTurnId = `optimistic_turn_${optimisticTimestamp}`;
+    const optimisticItemId = `optimistic_item_${optimisticTimestamp}`;
+    const optimisticStatusItemId = `optimistic_status_${optimisticTimestamp}`;
+    setRuntimeSnapshotBySession((current) => {
+      const previous = normalizeRuntimeSnapshot(current[targetSessionId], targetSessionId);
+      const existingTask =
+        previous.tasks.find((task) =>
+          ["active", "blocked", "waitingUser", "pending"].includes(task.status)
+        ) ??
+        previous.tasks[0] ??
+        null;
+      const taskId = existingTask?.id ?? `optimistic_task_${optimisticTimestamp}`;
+      const taskTitle =
+        existingTask?.title?.trim() && existingTask.title !== "新会话"
+          ? existingTask.title
+          : truncateInline(input, 42);
+      const nextTask = {
+        ...(existingTask ?? {}),
+        id: taskId,
+        sessionId: targetSessionId,
+        title: taskTitle,
+        summary: truncateInline(input, 84),
+        createdAt: existingTask?.createdAt ?? optimisticTimestamp,
+        updatedAt: optimisticTimestamp,
+        status: "active",
+        currentTurnId: optimisticTurnId,
+        latestTurnId: optimisticTurnId,
+      };
+      const nextTurn = {
+        id: optimisticTurnId,
+        sessionId: targetSessionId,
+        taskId,
+        createdAt: optimisticTimestamp,
+        updatedAt: optimisticTimestamp,
+        status: "running",
+        intent: requestedTurnIntent,
+        userMessageId: optimisticItemId,
+        assistantMessageId: null,
+        summary: truncateInline(input, 120),
+        itemIds: [optimisticItemId, optimisticStatusItemId],
+      };
+      const optimisticItems = [
+        {
+          id: optimisticItemId,
+          sessionId: targetSessionId,
+          taskId,
+          turnId: optimisticTurnId,
+          createdAt: optimisticTimestamp,
+          updatedAt: optimisticTimestamp,
+          kind: "userMessage",
+          status: "completed",
+          approvalState: "notRequired",
+          title: "User request",
+          summary: truncateInline(input, 84),
+          sourceMessageId: optimisticItemId,
+          sourceProposalId: null,
+          content: input,
+          metadata: { optimistic: true },
+        },
+        {
+          id: optimisticStatusItemId,
+          sessionId: targetSessionId,
+          taskId,
+          turnId: optimisticTurnId,
+          createdAt: optimisticTimestamp,
+          updatedAt: optimisticTimestamp,
+          kind: "statusUpdate",
+          status: "running",
+          approvalState: "notRequired",
+          title: "Run queued",
+          summary: "Waiting for Codex stream events.",
+          sourceMessageId: null,
+          sourceProposalId: null,
+          content: null,
+          metadata: {
+            optimistic: true,
+            interactionMode: requestedInteractionMode,
+            intent: requestedTurnIntent,
+          },
+        },
+      ];
+      return {
+        ...current,
+        [targetSessionId]: normalizeRuntimeSnapshot(
+          {
+            sessionId: targetSessionId,
+            tasks: [nextTask, ...previous.tasks.filter((task) => task.id !== taskId)],
+            turns: [nextTurn, ...previous.turns],
+            turnItems: [
+              ...previous.turnItems.filter((item) => item.turnId !== optimisticTurnId),
+              ...optimisticItems,
+            ],
+          },
+          targetSessionId
+        ),
       };
     });
     try {
       const updatedSession = await desktop.chatSend(
-        activeSessionId,
+        targetSessionId,
         input,
         [],
-        activeSessionMode,
-        activeTurnIntent
+        requestedInteractionMode,
+        requestedTurnIntent
       );
       setSessions((current) => upsertSession(current, updatedSession));
-      void loadSessionRuntimeSnapshot(activeSessionId, { silent: true }).catch(() => {});
+      void loadSessionRuntimeSnapshot(targetSessionId, { silent: true }).catch(() => {});
+      startRuntimeSnapshotRefreshLoop(targetSessionId);
     } catch (error) {
       setChatSending(false);
       setDraft(input);
+      void loadSessionRuntimeSnapshot(targetSessionId, { silent: true }).catch(() => {});
       setNotice({ kind: "error", text: normalizeError(error) });
     }
   };
@@ -3087,11 +4708,18 @@ export default function App() {
   };
 
   const handleComposerKeyDown = (event) => {
+    if (!canUseCommandInput) {
+      return;
+    }
     if (event.nativeEvent?.isComposing) {
       return;
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
+      if (!hasManagedControl || supervisionState === "idle") {
+        void handleRunCodexTask();
+        return;
+      }
       void handleSend();
     }
   };
@@ -3149,6 +4777,12 @@ export default function App() {
       !chatSending &&
       !hasStreamingAssistant
   );
+  const canStartManagedRunInput = Boolean(
+    draft.trim() &&
+      !loginBlocked &&
+      !chatSending &&
+      !hasStreamingAssistant
+  );
   const showPendingAssistant = Boolean(chatSending && activeSessionId && !hasStreamingAssistant);
   const activeStreamInfo = activeSessionId ? streamProgressBySession[activeSessionId] ?? null : null;
   const activeStreamMessageId = activeStreamInfo?.messageId ?? "";
@@ -3158,81 +4792,219 @@ export default function App() {
     activeSessionMode,
     activeTurnIntent
   );
-  const composerHint = providerNeedsCodexLogin && !codexAuth.loggedIn
-    ? "Log in to Codex before sending."
-    : activeProvider === "manual"
-      ? "Manual provider: sending only records the request."
-      : "Enter to send, Shift+Enter for newline.";
-  const modeLabel = sessionModeLabel(activeSessionMode);
-  const inspectorWorkspaceState = activeSessionWorkspaceId ? "linked" : "detached";
   const previewTitle = selectedFilePath || "暂无文件";
-  const previewStateLabel = previewState.loading
-    ? "loading"
-    : previewState.error
-      ? "error"
-      : filePreview
-        ? "ready"
-        : "empty";
-  const inspectorWorkspaceStateText = activeSessionWorkspaceId ? "linked" : "detached";
-  const previewStateText = previewState.loading
-    ? "读取中"
-    : previewState.error
-      ? "错误"
-      : filePreview
-        ? "ready"
-        : "empty";
-  const collaborationEnabled = activeSessionMode === SESSION_MODE_WORKSPACE;
-  const collaborationAvailable = Boolean(activeSessionWorkspaceId);
   const selectedChoiceLabel = selectedDecisionOption?.optionKey ?? selectedDecisionOption?.title ?? "";
   const previewDeckActive = showPreviewCards;
-  const suggestionInspectorTone = proposalPanelState.error
-    ? "error"
-    : decisionOptions.length > 0 || previewDeckActive || proposalPanelState.loading
-      ? "loading"
-      : selectedDecisionOption
-        ? "active"
-        : "idle";
-  const suggestionInspectorStatus = proposalPanelState.error
-    ? "error"
-    : showDecisionDeck
-      ? `${decisionOptions.length} directions`
-      : previewDeckActive
-        ? `${previewProposals.length} previews`
-        : proposalPanelState.loading
-          ? "loading"
-          : selectedDecisionOption
-            ? "selected"
-            : "clear";
-  const showSuggestionPanel =
-    proposalPanelState.loading ||
-    Boolean(proposalPanelState.error) ||
-    showDecisionDeck ||
-    previewDeckActive ||
-    Boolean(selectedDecisionOption);
+  const runtimePendingApprovalCount = activeRuntimeItems.filter((item) => item.approvalState === "pending")
+    .length;
+  const runtimeFailedCount = activeRuntimeItems.filter(isActionableRuntimeFailure).length;
+  const runtimeExceptionCount = runtimePendingApprovalCount + runtimeFailedCount;
+  const managedRuntimeProjection = useMemo(
+    () =>
+      buildManagedRuntimeProjection({
+        activeSession,
+        runtimeTask: activeRuntimeTask,
+        runtimeTurn: activeRuntimeTurn,
+        runtimeFailedCount,
+        pendingApprovalCount: runtimePendingApprovalCount,
+        providerNeedsCodexLogin,
+        codexAuth,
+        chatSending,
+      }),
+    [
+      activeSession,
+      activeRuntimeTask,
+      activeRuntimeTurn,
+      runtimeFailedCount,
+      runtimePendingApprovalCount,
+      providerNeedsCodexLogin,
+      codexAuth,
+      chatSending,
+    ]
+  );
+  const soloProjection = useMemo(
+    () =>
+      buildSoloProjection({
+        managedProjection: managedRuntimeProjection,
+        observedAgents: observedCodexState.agents,
+      }),
+    [managedRuntimeProjection, observedCodexState.agents]
+  );
+  const externalProjectionAgents = soloProjection.external;
+  const selectedObservedAgent = selectedObservedAgentId
+    ? externalProjectionAgents.find((agent) => agent.id === selectedObservedAgentId) ?? null
+    : null;
+  const hasManagedRuntimeSignal = Boolean(
+    activeRuntimeTurn ||
+      activeRuntimeItems.length ||
+      showDecisionDeck ||
+      showPreviewCards ||
+      chatSending ||
+      runtimePendingApprovalCount ||
+      runtimeFailedCount
+  );
+  const hasManagedWorkstream = sessions.length > 0;
+  const shouldShowExternalAsPrimary = !hasManagedWorkstream && !hasManagedRuntimeSignal;
+  const activeObservedAgent = shouldShowExternalAsPrimary
+    ? selectedObservedAgent ?? soloProjection.primaryExternal
+    : null;
+  const activeObservedProjection = activeObservedAgent?.projection ?? null;
+  const isObservingExternal = Boolean(activeObservedProjection);
+  const inspectedObservedAgent = selectedObservedAgent ?? activeObservedAgent;
+  const inspectedObservedProjection = inspectedObservedAgent?.projection ?? null;
+  const isInspectingExternal = Boolean(inspectedObservedProjection);
+  const activeObservedAgentId = inspectedObservedAgent?.id ?? "";
+  const hasPendingApproval = !isObservingExternal &&
+    managedRuntimeProjection.capability === "managed" &&
+    managedRuntimeProjection.owner === "solo" &&
+    (showDecisionDeck || showPreviewCards || runtimePendingApprovalCount > 0);
+  const activeRuntimeAssistantMessage = findRuntimeTurnAssistantMessage({
+    runtimeTurn: activeRuntimeTurn,
+    runtimeItems: activeRuntimeItems,
+    sessionMessages: activeSession?.messages,
+  });
+  const hasCurrentTurnAssistantResult = Boolean(activeRuntimeAssistantMessage);
+  useEffect(() => {
+    if (hasCurrentTurnAssistantResult && chatSending) {
+      setChatSending(false);
+    }
+  }, [hasCurrentTurnAssistantResult, chatSending]);
+  const hasSessionAssistantFallback =
+    !chatSending &&
+    (activeSession?.messages ?? []).some(
+      (message) =>
+        String(message?.role ?? "").toLowerCase() === "assistant" &&
+        compactText(message?.content ?? "", 1)
+    );
+  const runtimePanelLoading = runtimePanelState.loading && !hasSessionAssistantFallback;
   const runtimePanelTone = runtimePanelState.error
     ? "error"
-    : runtimePanelState.loading
+    : runtimePanelLoading
       ? "loading"
-      : activeRuntimeTurn
-        ? runtimeTone(activeRuntimeTurn.status)
-        : activeRuntimeTask
-          ? runtimeTone(activeRuntimeTask.status)
-          : "idle";
+      : hasCurrentTurnAssistantResult
+        ? "idle"
+      : isObservingExternal
+        ? projectionToTone(activeObservedProjection.activityState)
+        : projectionToTone(managedRuntimeProjection.activityState);
   const runtimePanelStatus = runtimePanelState.error
     ? "error"
-    : runtimePanelState.loading
+    : runtimePanelLoading
       ? "loading"
-      : activeRuntimeTurn
-        ? turnStatusLabel(activeRuntimeTurn.status)
-        : activeRuntimeTask
-          ? taskStatusLabel(activeRuntimeTask.status)
-          : "idle";
-  const runtimeItemList = activeRuntimeItems.slice(-6);
-  const runtimeTimelineItems = activeRuntimeItems.slice(-8).reverse();
-  const primaryObservedCodexAgent = observedCodexState.agents[0] ?? null;
-  const runtimeTimelineDisplayItems = runtimeTimelineItems.length
-    ? runtimeTimelineItems
+      : hasCurrentTurnAssistantResult
+        ? "idle"
+      : isObservingExternal
+        ? projectionToStatus(activeObservedProjection.activityState, activeObservedProjection.currentIntent)
+        : projectionToStatus(managedRuntimeProjection.activityState, managedRuntimeProjection.currentIntent);
+  const resolvedManagedIntent = hasCurrentTurnAssistantResult
+    ? "create"
+    : managedRuntimeProjection.currentIntent;
+  const runtimeTimelineItems = activeRuntimeItems.slice().reverse();
+  const observedTimelineItems = activeObservedAgent
+    ? [
+        {
+          id: `${activeObservedAgent.id}-latest-event`,
+          kind: "summary",
+          status: "pending",
+          approvalState: "notRequired",
+          title: activeObservedAgent.lastEventSummary || activeObservedAgent.lastEventType || "External session observed",
+          summary: `visibility: ${compactAgentVisibilityLabel(activeObservedAgent)} · control: observe-only`,
+          createdAt: activeObservedAgent.lastActivityAt ?? activeObservedAgent.lastSeenAt,
+          updatedAt: activeObservedAgent.lastActivityAt ?? activeObservedAgent.lastSeenAt,
+        },
+        {
+          id: `${activeObservedAgent.id}-control-boundary`,
+          kind: "statusUpdate",
+          status: "pending",
+          approvalState: "notRequired",
+          title: "Read-only boundary",
+          summary: "External Codex sessions can be observed, not controlled.",
+          createdAt: activeObservedAgent.lastSeenAt,
+          updatedAt: activeObservedAgent.lastSeenAt,
+        },
+      ]
+    : [];
+  const sessionMessagesForTimeline = activeSession?.messages ?? [];
+  const latestUserMessageIndex = [...sessionMessagesForTimeline]
+    .reverse()
+    .findIndex((message) => String(message?.role ?? "").toLowerCase() === "user");
+  const latestUserForwardIndex =
+    latestUserMessageIndex >= 0
+      ? sessionMessagesForTimeline.length - 1 - latestUserMessageIndex
+      : -1;
+  const hasAssistantAfterLatestUser =
+    latestUserForwardIndex >= 0 &&
+    sessionMessagesForTimeline
+      .slice(latestUserForwardIndex + 1)
+      .some(
+        (message) =>
+          String(message?.role ?? "").toLowerCase() === "assistant" &&
+          compactText(message?.content ?? "", 1)
+      );
+  const shouldShowRuntimeMonitor =
+    !isObservingExternal &&
+    managedRuntimeProjection.activityState === "running" &&
+    !hasCurrentTurnAssistantResult &&
+    !hasAssistantAfterLatestUser;
+  const hasRuntimeAssistantItem = activeRuntimeItems.some((item) => {
+    const role = String(item?.role ?? item?.message?.role ?? item?.metadata?.role ?? "").toLowerCase();
+    const kind = String(item?.kind ?? item?.type ?? "").toLowerCase();
+    return role === "assistant" || kind === "agentmessage" || kind.includes("assistant") || kind.includes("response");
+  });
+  const runtimeAssistantTimelineItem =
+    activeRuntimeAssistantMessage && !hasRuntimeAssistantItem
+      ? {
+          id: `runtime-assistant-${activeRuntimeAssistantMessage.id ?? "matched"}`,
+          kind: "agentMessage",
+          status: "completed",
+          approvalState: "notRequired",
+          title: "Assistant response",
+          summary: truncateInline(activeRuntimeAssistantMessage.content ?? "", 160),
+          content: activeRuntimeAssistantMessage.content ?? "",
+          createdAt: activeRuntimeAssistantMessage.createdAt ?? null,
+          updatedAt:
+            activeRuntimeAssistantMessage.updatedAt ??
+            activeRuntimeAssistantMessage.createdAt ??
+            null,
+        }
+      : null;
+  const runtimeMonitorTimelineItem = shouldShowRuntimeMonitor
+    ? {
+        id: "runtime-monitor-waiting-assistant",
+        kind: "statusUpdate",
+        status: "running",
+        approvalState: "notRequired",
+        title: "Codex is working",
+        summary: "Awaiting progress for the current turn.",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }
+    : null;
+  const sessionMessageTimelineItems = [...(activeSession?.messages ?? [])]
+    .reverse()
+    .filter((message) => compactText(message?.content ?? "", 1))
+    .map((message, index) => {
+      const role = String(message?.role ?? "").toLowerCase();
+      const failed = String(message?.status ?? "").toLowerCase() === "failed";
+      return {
+        id: `session-message-${message?.id ?? index}`,
+        kind: role === "assistant" ? "agentMessage" : "userMessage",
+        status: failed ? "failed" : "completed",
+        approvalState: "notRequired",
+        title: role === "assistant" ? "Assistant response" : "User request",
+        summary: truncateInline(message?.content ?? "", 160),
+        content: message?.content ?? "",
+        createdAt: message?.createdAt ?? null,
+        updatedAt: message?.updatedAt ?? message?.createdAt ?? null,
+      };
+    });
+  const runtimeTimelineDisplayItems = isObservingExternal
+    ? observedTimelineItems
+    : runtimeTimelineItems.length
+    ? [runtimeAssistantTimelineItem, runtimeMonitorTimelineItem, ...runtimeTimelineItems].filter(Boolean)
+    : sessionMessageTimelineItems.length
+      ? [runtimeMonitorTimelineItem, ...sessionMessageTimelineItems].filter(Boolean)
     : [
+        runtimeMonitorTimelineItem,
         {
           id: "fallback-task-target",
           kind: "summary",
@@ -3253,72 +5025,132 @@ export default function App() {
           createdAt: null,
           updatedAt: null,
         },
-        primaryObservedCodexAgent
-          ? {
-              id: "fallback-external-codex",
-              kind: "statusUpdate",
-              status: primaryObservedCodexAgent.state === "running" ? "running" : "pending",
-              approvalState: "notRequired",
-              title: "External Codex observed",
-              summary: "observe-only resource; controls disabled.",
-              createdAt: primaryObservedCodexAgent.lastSeenAt,
-              updatedAt: primaryObservedCodexAgent.lastSeenAt,
-            }
-          : null,
       ].filter(Boolean);
-  const runtimePendingApprovalCount = activeRuntimeItems.filter(
-    (item) => item.approvalState === "pending"
-  ).length;
-  const runtimeFailedCount = activeRuntimeItems.filter(
-    (item) =>
-      item.status === "failed" ||
-      item.status === "cancelled" ||
-      item.approvalState === "failed" ||
-      item.approvalState === "rejected"
-  ).length;
-  const runtimeResourceCount =
-    (activeSessionWorkspaceId ? 1 : 0) +
-    (activeSessionMode === SESSION_MODE_WORKSPACE ? 1 : 0);
+  const runtimePriorityTimelineItems = [
+    ...runtimeTimelineDisplayItems.filter(isActionableRuntimeFailure),
+    ...runtimeTimelineDisplayItems.filter(
+      (item) =>
+        !isActionableRuntimeFailure(item) &&
+        (String(item?.approvalState ?? "") === "pending" ||
+          String(item?.status ?? "") === "waitingUser")
+    ),
+    ...runtimeTimelineDisplayItems.filter(
+      (item) =>
+        !isActionableRuntimeFailure(item) &&
+        String(item?.approvalState ?? "") !== "pending" &&
+        String(item?.status ?? "") !== "waitingUser" &&
+        !isRuntimeStatusOnlyItem(item)
+    ),
+    ...runtimeTimelineDisplayItems.filter(
+      (item) =>
+        !isActionableRuntimeFailure(item) &&
+        String(item?.approvalState ?? "") !== "pending" &&
+        String(item?.status ?? "") !== "waitingUser" &&
+        isRuntimeStatusOnlyItem(item)
+    ),
+  ];
   const runtimeWorkstreamLabel =
-    activeRuntimeTask?.title || activeSession?.title || "Untitled workstream";
-  const runtimeTaskCount = activeRuntimeSnapshot.tasks.length;
-  const runtimeTurnCount = activeRuntimeSnapshot.turns.length;
-  const runtimeArtifactCount = previewProposals.length + (filePreview ? 1 : 0);
-  const runtimeExceptionCount = runtimePendingApprovalCount + runtimeFailedCount;
-  const hasPendingApproval =
-    showDecisionDeck || showPreviewCards || runtimePendingApprovalCount > 0;
-  const supervisionState = runtimeExceptionCount > 0
-    ? "blocked"
-    : hasPendingApproval
-      ? "waitingApproval"
-      : activeRuntimeTurn
-        ? "running"
-        : "idle";
-  const currentTaskTitle =
-    activeRuntimeTask?.title || (supervisionState === "idle" ? "No task target yet" : "Waiting task");
-  const currentTaskStateLabel =
-    supervisionState === "blocked"
+    isObservingExternal
+      ? `${compactAgentVisibilityLabel(activeObservedAgent)} · observe-only`
+      : managedRuntimeProjection.debug.runtimeTaskTitle || activeSession?.title || "Untitled workstream";
+  const hasManagedControl =
+    !isObservingExternal &&
+    managedRuntimeProjection.owner === "solo" &&
+    managedRuntimeProjection.capability === "managed";
+  const canStartManagedRunFromObserve = Boolean(
+    !hasManagedControl &&
+      !loginBlocked &&
+      !chatSending &&
+      !hasStreamingAssistant
+  );
+  const canUseCommandInput = hasManagedControl || canStartManagedRunFromObserve;
+  const composerHint = hasManagedControl
+    ? providerNeedsCodexLogin && !codexAuth.loggedIn
+      ? "Log in to Codex before sending."
+      : activeProvider === "manual"
+        ? "Manual provider: sending only records the request."
+        : activeSessionWorkspaceId
+          ? "Codex will run in the selected workspace."
+          : "Enter to run with Codex, Shift+Enter for newline."
+    : isObservingExternal
+      ? "Observe-only target selected. Enter a task to start a new managed run."
+      : "Enter a task to create a managed run.";
+  const supervisionState = hasManagedControl
+    ? hasCurrentTurnAssistantResult
+      ? "idle"
+      : runtimeExceptionCount > 0
       ? "blocked"
-      : supervisionState === "waitingApproval"
-        ? "waiting approval"
-        : supervisionState === "running"
+      : hasPendingApproval
+        ? "waitingApproval"
+        : managedRuntimeProjection.activityState === "running"
           ? "running"
-          : "idle";
-  const currentRunStateLabel = activeRuntimeTurn
-    ? turnStatusLabel(activeRuntimeTurn.status)
-    : chatSending
-      ? "running"
-      : "idle";
-  const nextIntentLabel =
-    supervisionState === "waitingApproval"
-      ? "approve"
-      : supervisionState === "running"
-        ? "observe"
-        : supervisionState === "blocked"
-          ? "inspect"
-          : "create";
-  const visibleRuntimeTimelineItems = runtimeTimelineDisplayItems.slice(0, 2);
-  const hiddenRuntimeTimelineCount = Math.max(0, runtimeTimelineDisplayItems.length - visibleRuntimeTimelineItems.length);
+          : "idle"
+    : "idle";
+  const shouldInspectExternal =
+    isInspectingExternal && !hasPendingApproval && supervisionState !== "blocked";
+  const currentTaskTitle = hasManagedControl
+    ? managedRuntimeProjection.debug.runtimeTaskTitle || (supervisionState === "idle" ? "No task target yet" : "Waiting task")
+    : isObservingExternal
+      ? compactAgentWorkspaceLabel(activeObservedAgent)
+      : "No managed task target yet";
+  const currentTaskStateLabel = isObservingExternal
+    ? projectionRuntimeStatusLabel(activeObservedProjection.activityState)
+    : supervisionState === "blocked"
+    ? "blocked"
+    : supervisionState === "waitingApproval"
+      ? "waiting approval"
+      : projectionRuntimeStatusLabel(managedRuntimeProjection.activityState);
+  const currentRunStateLabel = runtimePanelState.error
+    ? "error"
+    : runtimePanelLoading
+      ? "loading"
+      : hasCurrentTurnAssistantResult
+        ? "idle"
+      : isObservingExternal
+        ? projectionRuntimeStatusLabel(activeObservedProjection.activityState)
+        : projectionRuntimeStatusLabel(managedRuntimeProjection.activityState);
+  const nextIntentLabel = hasManagedControl
+    ? projectionNextIntentChipLabel(resolvedManagedIntent)
+    : "inspect";
+  const runtimeTimelineBudget = isObservingExternal ? 2 : 6;
+  const shouldFoldRuntimeTimeline = runtimePriorityTimelineItems.length > runtimeTimelineBudget;
+  const primaryRuntimeTimelineItems = runtimePriorityTimelineItems.slice(
+    0,
+    shouldFoldRuntimeTimeline ? Math.max(1, runtimeTimelineBudget - 1) : runtimeTimelineBudget
+  );
+  const hiddenRuntimeTimelineCount = Math.max(0, runtimePriorityTimelineItems.length - primaryRuntimeTimelineItems.length);
+  const visibleRuntimeTimelineItems = hiddenRuntimeTimelineCount
+    ? [
+        ...primaryRuntimeTimelineItems,
+        {
+          id: "runtime-older-events",
+          kind: "statusUpdate",
+          status: "completed",
+          approvalState: "notRequired",
+          title: `${hiddenRuntimeTimelineCount} older events`,
+          summary: "Older history is folded to keep the cockpit readable.",
+          createdAt: runtimePriorityTimelineItems.at(-1)?.createdAt ?? null,
+          updatedAt: runtimePriorityTimelineItems.at(-1)?.updatedAt ?? null,
+        },
+      ]
+    : primaryRuntimeTimelineItems;
+  const foldedRuntimeTimelineItems = hiddenRuntimeTimelineCount
+    ? runtimePriorityTimelineItems.slice(primaryRuntimeTimelineItems.length)
+    : [];
+  const historyPageSize = 6;
+  const historyPageCount = Math.max(1, Math.ceil(foldedRuntimeTimelineItems.length / historyPageSize));
+  const safeHistoryPageIndex = Math.min(historyPageIndex, historyPageCount - 1);
+  const historyPageItems = foldedRuntimeTimelineItems.slice(
+    safeHistoryPageIndex * historyPageSize,
+    safeHistoryPageIndex * historyPageSize + historyPageSize
+  );
+  const historyPageStart = foldedRuntimeTimelineItems.length
+    ? safeHistoryPageIndex * historyPageSize + 1
+    : 0;
+  const historyPageEnd = Math.min(
+    foldedRuntimeTimelineItems.length,
+    safeHistoryPageIndex * historyPageSize + historyPageItems.length
+  );
   
   const runtimeOutputCards = [
     ...previewProposals.map((card) => ({
@@ -3352,197 +5184,225 @@ export default function App() {
   const outputOverflowCount = Math.max(0, runtimeOutputCards.length - visibleOutputCards.length);
   const outputCountLabel =
     runtimeOutputCards.length > 3 ? `3 +${outputOverflowCount}` : String(runtimeOutputCards.length);
-  const activeRunLabel = activeRuntimeTurn
-    ? `${turnIntentLabel(activeRuntimeTurn.intent)} · ${turnStatusLabel(activeRuntimeTurn.status)}`
-    : "no active run";
-  const activeRunTimeLabel = activeRuntimeTurn
-    ? formatRuntimeTime(activeRuntimeTurn.updatedAt ?? activeRuntimeTurn.createdAt)
-    : "not started";
-  const activeRunSummary = activeRuntimeItems.length
+  const activeRuntimeVisibleResult = buildRuntimeVisibleResult({
+    runtimeTurn: activeRuntimeTurn,
+    runtimeItems: activeRuntimeItems,
+    outputCards: runtimeOutputCards,
+    sessionMessages: activeSession?.messages,
+  });
+  const hasVisibleRuntimeResult = ["assistantItem", "assistantMessage", "output"].includes(
+    activeRuntimeVisibleResult.source
+  );
+  const activeRunSummary = isObservingExternal
     ? truncateInline(
-        activeRuntimeItems.at(-1)?.summary || activeRuntimeItems.at(-1)?.content || "Waiting for runtime events.",
+        activeObservedAgent.lastEventSummary || activeObservedAgent.lastEventType || "No recent session event.",
         96
       )
-    : "Waiting for a task target.";
-  const runtimeFocusTitle = runtimeExceptionCount > 0
-    ? "Needs review"
-    : showPreviewCards || showDecisionDeck || runtimePendingApprovalCount > 0
-      ? "Waiting approval"
-      : activeRuntimeTurn
-        ? "Run healthy"
-        : "Waiting task";
-  const runtimeFocusDetail = runtimeExceptionCount > 0
-    ? `${runtimeExceptionCount} exception or approval item needs review`
-    : showDecisionDeck
-      ? `${decisionOptions.length} directions waiting`
-      : showPreviewCards
-        ? `${previewProposals.length} previews waiting`
-        : activeRuntimeTurn
-          ? "Run is moving; inspect the timeline for detail"
-          : "Create a task or send a goal to start the first run";
-  const showPreviewPanel = previewState.loading || Boolean(previewState.error) || Boolean(filePreview);
+    : activeRuntimeVisibleResult.title;
+  const activeRunDetail = isObservingExternal
+    ? `visibility: ${compactAgentVisibilityLabel(activeObservedAgent)} · control: observe-only`
+    : activeRuntimeVisibleResult.detail;
+  const activeRunFullDetail = isObservingExternal
+    ? activeRunDetail
+    : activeRuntimeVisibleResult.fullDetail || activeRunDetail;
+  const activeRunTitle = isObservingExternal
+    ? "Observed Codex session"
+    : activeRuntimeTurn
+      ? "Managed Codex run"
+      : hasVisibleRuntimeResult
+        ? "Latest Codex result"
+      : "No active run";
+  const activeRunChipLabel = isObservingExternal ? "observe-only" : "managed";
+  const activeRunSummaryTone = isObservingExternal
+    ? projectionToTone(activeObservedProjection.activityState)
+    : activeRuntimeTurn
+      ? runtimeExceptionCount > 0
+        ? "error"
+        : activeRuntimeVisibleResult.tone
+      : hasVisibleRuntimeResult
+        ? activeRuntimeVisibleResult.tone
+      : "idle";
+  const showActiveRunCard =
+    runtimePanelState.error ||
+    runtimePanelLoading ||
+    supervisionState === "running" ||
+    supervisionState === "waitingApproval" ||
+    supervisionState === "blocked";
+  const effectiveSelectedDetailId =
+    !showActiveRunCard && selectedDetailId === "active-run" && visibleRuntimeTimelineItems[0]
+      ? `timeline:${visibleRuntimeTimelineItems[0].id}`
+      : selectedDetailId;
+  const isHistoryDetail = effectiveSelectedDetailId === "history";
+  const selectedTimelineItem = !isHistoryDetail && effectiveSelectedDetailId.startsWith("timeline:")
+    ? runtimeTimelineDisplayItems.find((item) => `timeline:${item.id}` === effectiveSelectedDetailId) ?? null
+    : null;
+  const selectedOutputCard = effectiveSelectedDetailId.startsWith("output:")
+    ? runtimeOutputCards.find((output) => `output:${output.id}` === effectiveSelectedDetailId) ?? null
+    : null;
+  const activeRunDetailText = activeRunFullDetail || "No run detail available.";
+  const selectedRawDetailText = selectedTimelineItem
+    ? runtimeItemVisibleText(selectedTimelineItem) ||
+      selectedTimelineItem.summary ||
+      "Event detail is captured in the runtime timeline."
+    : selectedOutputCard
+      ? "Output is available from the current managed run."
+      : activeRunDetailText;
+  const selectedPreviewDetailText = selectedTimelineItem
+    ? truncateInline(selectedRawDetailText, 260)
+    : selectedOutputCard
+      ? selectedRawDetailText
+      : activeRuntimeVisibleResult.detail || truncateInline(activeRunDetailText, 260);
+  const detailCanExpand =
+    !hasPendingApproval &&
+    !isHistoryDetail &&
+    !selectedOutputCard &&
+    compactText(selectedRawDetailText, 1) &&
+    selectedRawDetailText.length > selectedPreviewDetailText.length + 12;
+  const detailBodyText = detailCanExpand && detailExpanded
+    ? selectedRawDetailText
+    : selectedPreviewDetailText;
+  const detailPanelTitle = selectedTimelineItem
+    ? selectedTimelineItem.title || turnItemKindLabel(selectedTimelineItem.kind)
+    : selectedOutputCard
+      ? selectedOutputCard.title
+      : isHistoryDetail
+        ? "History"
+      : selectedDetailId === "outputs"
+        ? "Outputs"
+        : activeRunTitle;
+  const detailPanelStatus = selectedTimelineItem
+    ? runtimeItemStateLabel(selectedTimelineItem)
+    : selectedOutputCard
+      ? selectedOutputCard.meta
+      : isHistoryDetail
+        ? `${foldedRuntimeTimelineItems.length} older`
+      : activeRunChipLabel;
+  const detailPanelSummary = selectedTimelineItem
+    ? selectedTimelineItem.title || turnItemKindLabel(selectedTimelineItem.kind)
+    : selectedOutputCard
+      ? selectedOutputCard.meta
+      : isHistoryDetail
+        ? "Folded run history"
+      : activeRunSummary;
+  const detailPanelImpact = selectedTimelineItem
+    ? detailBodyText || selectedTimelineItem.summary || selectedTimelineItem.content || "No event detail."
+    : selectedOutputCard
+      ? "Output is available from the current managed run."
+      : isHistoryDetail
+        ? foldedRuntimeTimelineItems.length
+          ? `Showing ${historyPageStart}-${historyPageEnd} of ${foldedRuntimeTimelineItems.length} older events.`
+          : "No folded history for this run."
+      : detailBodyText;
+  const detailPanelEvidence = selectedTimelineItem
+    ? [
+        `kind: ${turnItemKindLabel(selectedTimelineItem.kind)}`,
+        `state: ${runtimeItemStateLabel(selectedTimelineItem)}`,
+        `time: ${formatRuntimeTime(selectedTimelineItem.updatedAt ?? selectedTimelineItem.createdAt)}`,
+        ...(detailCanExpand
+          ? [`full text: ${detailExpanded ? "expanded" : `folded · ${selectedRawDetailText.length} chars`}`]
+          : []),
+      ]
+    : selectedOutputCard
+      ? [
+          `output: ${selectedOutputCard.title}`,
+          `meta: ${selectedOutputCard.meta}`,
+          "Open Outputs from the center panel for artifact-specific actions.",
+        ]
+      : isHistoryDetail
+        ? []
+      : [
+          `run: ${activeRunTitle}`,
+          `state: ${currentRunStateLabel}`,
+          `next: ${nextIntentLabel}`,
+          ...(detailCanExpand
+            ? [`full text: ${detailExpanded ? "expanded" : `folded · ${selectedRawDetailText.length} chars`}`]
+            : []),
+        ];
   const inspectorTitle = hasPendingApproval
     ? "Checkpoint · direction approval"
-    : supervisionState === "running"
-      ? "Active run"
-      : primaryObservedCodexAgent
-        ? "External Codex"
-        : "No checkpoint selected";
+    : shouldInspectExternal
+      ? "External Codex"
+      : hasManagedControl
+      ? detailPanelTitle
+      : "No checkpoint selected";
   const inspectorStatus = hasPendingApproval
     ? "Needs approval"
-    : supervisionState === "blocked"
-      ? "Blocked"
-      : supervisionState === "running"
-        ? "Running"
-        : "Idle";
+    : shouldInspectExternal
+      ? "Read-only"
+      : hasManagedControl
+      ? detailPanelStatus
+      : "Idle";
   const inspectorQuestion = hasPendingApproval
     ? "Accept current direction?"
-    : supervisionState === "running"
-      ? "Inspect current run?"
-      : primaryObservedCodexAgent
-        ? "Review observed external run?"
-        : "Describe the next task target.";
+    : shouldInspectExternal
+      ? "Review observed external run?"
+      : hasManagedControl
+      ? detailPanelSummary
+      : "Describe the next task target.";
   const inspectorImpact = hasPendingApproval
     ? "Impact: next phase can continue after approval"
-    : supervisionState === "running"
-      ? "Impact: runtime remains managed"
-      : primaryObservedCodexAgent
-        ? "Impact: observe-only, controls disabled"
-        : "Impact: no runtime changes until a task is created";
+    : shouldInspectExternal
+      ? "Impact: observe-only, controls disabled"
+      : hasManagedControl
+      ? detailPanelImpact
+      : "Impact: no managed runtime changes until a task is created.";
   const inspectorEvidence = hasPendingApproval
     ? ["Decision pending", "Preview available", "Runtime unchanged"]
-    : supervisionState === "running"
-      ? ["Active run present", "Timeline is authoritative", "Outputs remain evidence-only"]
-      : primaryObservedCodexAgent
-        ? ["External Codex observed", "observe-only", "Can convert later"]
-        : ["No active run", "No pending checkpoint", "Task target missing"];
-  const inspectorTabs = [
-    {
-      id: "trace",
-      label: "Trace",
-      description: `${runtimeTaskCount} task / ${runtimeTurnCount} turn`,
-      badgeTone: runtimePanelTone,
-      badgeText: runtimePanelStatus,
-    },
-    {
-      id: "artifacts",
-      label: "Artifacts",
-      description: runtimeArtifactCount > 0 ? `${runtimeArtifactCount} outputs` : "no outputs",
-      badgeTone: previewStateLabel === "empty" ? "idle" : previewStateLabel,
-      badgeText: runtimeArtifactCount > 0 ? String(runtimeArtifactCount) : "0",
-    },
-    {
-      id: "resources",
-      label: "Resources",
-      description: activeWorkspace?.name ?? "no resource",
-      badgeTone: inspectorWorkspaceState,
-      badgeText: String(runtimeResourceCount),
-    },
-    {
-      id: "controls",
-      label: "Controls",
-      description: runtimeFocusTitle,
-      badgeTone: runtimeExceptionCount > 0 ? "error" : showSuggestionPanel ? suggestionInspectorTone : "idle",
-      badgeText: runtimeExceptionCount > 0 ? String(runtimeExceptionCount) : showSuggestionPanel ? suggestionInspectorStatus : "clear",
-    },
-  ];
-  const inspectorSummaryCards = [
-    {
-      label: "Focus",
-      value: runtimeFocusTitle,
-      detail: runtimeFocusDetail,
-      tone: runtimeExceptionCount > 0 ? "error" : runtimePanelTone,
-    },
-    {
-      label: "Run",
-      value: activeRunLabel,
-      detail: `${activeRunTimeLabel} · ${runtimeWorkstreamLabel}`,
-      tone: runtimePanelTone,
-    },
-    {
-      label: "Items",
-      value: `${activeRuntimeSnapshot.turnItems.length} events`,
-      detail: `${runtimeTaskCount} task / ${runtimeTurnCount} turn / ${runtimeArtifactCount} artifact`,
-      tone: activeRuntimeSnapshot.turnItems.length > 0 ? "active" : "idle",
-    },
-    {
-      label: "Exceptions",
-      value: runtimeExceptionCount > 0 ? `${runtimeExceptionCount} pending` : "clear",
-      detail:
-        runtimePendingApprovalCount > 0
-          ? `${runtimePendingApprovalCount} approvals waiting`
-          : runtimeFailedCount > 0
-            ? `${runtimeFailedCount} failed or rejected`
-            : "No exceptions",
-      tone: runtimeExceptionCount > 0 ? "error" : "ready",
-    },
-  ];
-  const composerPlaceholder = collaborationEnabled
-    ? activeTurnIntent === TURN_INTENT_CHOICE
-      ? "Describe the goal; Solo will propose directions first."
-      : activeTurnIntent === TURN_INTENT_PREVIEW
-        ? "Describe the preview you want expanded."
-        : "Describe the task target..."
-    : supervisionState === "waitingApproval"
-      ? "Add approval condition..."
+    : shouldInspectExternal
+      ? inspectedObservedProjection.evidence
+      : hasManagedControl
+      ? detailPanelEvidence
+      : ["No active run", "No pending checkpoint", "Task target missing"];
+  const inspectorEyebrow = hasPendingApproval ? "Decision required" : "Detail";
+  const inspectorDetailHeading = hasPendingApproval
+    ? "Evidence"
+    : isHistoryDetail
+      ? "Older events"
+      : "Selected context";
+  const composerPlaceholder = hasManagedControl
+    ? supervisionState === "waitingApproval"
+      ? "Add approval criteria or ask for changes..."
       : supervisionState === "running"
         ? "Steer the current run..."
         : supervisionState === "blocked"
-          ? "Add recovery detail..."
-          : "Describe the task target...";
-  const commandBarTitle = supervisionState === "waitingApproval"
-    ? "Waiting approval"
-    : supervisionState === "running"
-      ? "Running"
-      : supervisionState === "blocked"
-        ? "Blocked"
-        : "Waiting task";
-  const commandPrimaryLabel = supervisionState === "waitingApproval"
-    ? "Approve"
-    : supervisionState === "running"
-      ? "Pause"
-      : supervisionState === "blocked"
-        ? "Inspect"
-        : "Create";
-  const commandPrimaryDisabled = supervisionState === "waitingApproval"
-    ? !hasPendingApproval
-    : supervisionState === "running"
-      ? !activeRuntimeTurn && !chatSending
-      : supervisionState === "blocked"
-        ? false
-        : !canSend;
-  const modeIntentText = collaborationEnabled
-    ? `这一轮会读取附加资源，当前阶段：${turnIntentLabel(activeTurnIntent)}`
-    : collaborationAvailable
-      ? "这一轮不读取附加资源"
-      : "当前没有附加资源";
-  const modeGuidanceText = collaborationEnabled
-    ? activeTurnIntent === TURN_INTENT_CHOICE
-      ? "Solo 会先查看相关文件，再把多个方向整理成可点开的方向卡。"
-      : activeTurnIntent === TURN_INTENT_PREVIEW
-        ? "Solo 会直接展开更具体的改动预览，但仍然不会自动应用。"
-        : "Solo 会先查看相关文件，再给结论、依据和下一步建议。"
-    : collaborationAvailable
-      ? "目录只是附加资源。只有启用资源参与后，它才会真正进入回答。"
-      : "先直接提问；只有需要代码依据时再补充目录。";
+          ? "Describe what to inspect or recover..."
+          : activeSessionWorkspaceId
+            ? "Tell Codex what to do in this workspace..."
+            : "Tell Codex what to do..."
+    : isObservingExternal
+      ? "Start a managed task from this context..."
+      : "Describe the managed task target...";
+  const commandBarTitle = hasManagedControl
+    ? supervisionState === "waitingApproval"
+      ? "Waiting approval"
+      : supervisionState === "running"
+        ? "Running"
+        : supervisionState === "blocked"
+          ? "Blocked"
+          : "Codex task"
+    : isObservingExternal
+      ? "Observing"
+      : "Observe-only";
+  const commandPrimaryLabel = hasManagedControl
+    ? supervisionState === "waitingApproval"
+      ? projectionPrimaryActionLabel("approve")
+      : projectionPrimaryActionLabel(resolvedManagedIntent)
+    : isObservingExternal
+      ? "Start run"
+      : "Start run";
+  const commandPrimaryDisabled = hasManagedControl
+    ? supervisionState === "waitingApproval"
+      ? !hasPendingApproval
+      : supervisionState === "running"
+        ? !activeRuntimeTurn && !chatSending
+        : supervisionState === "blocked"
+          ? !canSend
+          : !canSend
+    : !canStartManagedRunInput;
   const composerContextButtonLabel = activeSessionWorkspaceId
     ? `Change resource, current: ${activeWorkspace?.name ?? "selected directory"}`
     : "Attach resource";
-  const connectionStatusLabel = providerNeedsCodexLogin
-    ? (!codexAuth.available
-        ? "unavailable"
-        : codexAuth.loggedIn
-          ? "logged in"
-          : "logged out")
-    : activeProvider === "manual"
-      ? "manual"
-      : settings.modelId
-        ? "configured"
-        : "not configured";
-  const topbarWorkstreamState = activeSessionSummary?.statusLabel ?? "waiting";
-  const topbarExceptionLabel = exceptionEntries.length > 0 ? `${exceptionEntries.length} pending` : "clear";
-  const topbarExceptionTone = exceptionEntries.length > 0 ? "error" : "ready";
-  const externalAgentsByWorkspaceId = observedCodexState.agents.reduce((groups, agent) => {
+  const externalAgentsByWorkspaceId = externalProjectionAgents.reduce((groups, agent) => {
     if (!agent.matchedWorkspaceId) {
       return groups;
     }
@@ -3551,12 +5411,11 @@ export default function App() {
       [agent.matchedWorkspaceId]: [...(groups[agent.matchedWorkspaceId] ?? []), agent],
     };
   }, {});
-  const untrackedExternalAgents = observedCodexState.agents.filter((agent) => !agent.matchedWorkspaceId);
+  const untrackedExternalAgents = externalProjectionAgents.filter((agent) => !agent.matchedWorkspaceId);
   const resourceDisplayCount = workspaces.length + untrackedExternalAgents.length;
-  const topbarResourceLabel = observedCodexState.agents.length
-    ? `${workspaces.length} resources / ${observedCodexState.agents.length} external`
+  const topbarResourceLabel = soloProjection.externalCount
+    ? `${workspaces.length} resources / ${soloProjection.externalCount} external`
     : `${workspaces.length} resources`;
-  const topbarRunLabel = `${activeWorkstreamEntries.length} active / ${waitingWorkstreamEntries.length} waiting`;
   const primaryExceptionEntry = exceptionEntries[0] ?? null;
   const commandActionCards = [
     {
@@ -3583,6 +5442,109 @@ export default function App() {
       },
     },
   ];
+  const handleSelectRuntimeDetail = (detailId) => {
+    setLastHistoryDetailId("");
+    setSelectedDetailId(detailId);
+  };
+  const handleInspectorApprove = () => {
+    if (showPreviewCards && previewProposals[0]) {
+      void handleAcceptPreviewCard(previewProposals[0]);
+      return;
+    }
+
+    if (showDecisionDeck) {
+      const option = activeDecisionPreviewOption ?? decisionOptions[0];
+      if (option) {
+        void handleChooseDecisionOption(option);
+        return;
+      }
+    }
+
+    setNotice({ kind: "info", text: "当前没有可直接批准的预览。" });
+  };
+
+  const handleRunCodexTask = async () => {
+    if (!draft.trim()) {
+      composerInputRef.current?.focus();
+      return;
+    }
+
+    let targetSessionId = activeSessionId;
+    let targetWorkspaceId = activeSessionWorkspaceId;
+    let targetSessionMode = activeSessionMode;
+
+    if (!targetSessionId) {
+      try {
+        let session = await desktop.sessionCreate();
+        if (activeWorkspaceId) {
+          session = await desktop.workspaceSelect(session.id, activeWorkspaceId);
+        }
+        setSessions((current) => upsertSession(current, session));
+        targetSessionId = session.id;
+        targetWorkspaceId = session.workspaceId ?? "";
+        targetSessionMode = normalizeSessionMode(session.interactionMode);
+        setActiveSessionId(session.id);
+        setActiveWorkspaceId(session.workspaceId ?? "");
+      } catch (error) {
+        setNotice({ kind: "error", text: normalizeError(error) });
+        return;
+      }
+    }
+
+    setSelectedObservedAgentId("");
+
+    if (targetWorkspaceId) {
+      if (targetSessionMode !== SESSION_MODE_WORKSPACE) {
+        try {
+          const updated = await desktop.sessionModeSet(targetSessionId, SESSION_MODE_WORKSPACE);
+          setSessions((current) => upsertSession(current, updated));
+        } catch (error) {
+          setNotice({ kind: "error", text: normalizeError(error) });
+          return;
+        }
+      }
+      void handleSend({
+        sessionId: targetSessionId,
+        interactionMode: SESSION_MODE_WORKSPACE,
+        turnIntent: TURN_INTENT_AUTO,
+      });
+      return;
+    }
+
+    void handleSend({
+      sessionId: targetSessionId,
+      interactionMode: SESSION_MODE_CONVERSATION,
+      turnIntent: TURN_INTENT_AUTO,
+    });
+  };
+
+  const handleCommandPrimaryAction = () => {
+    if (!hasManagedControl) {
+      void handleRunCodexTask();
+      return;
+    }
+    if (supervisionState === "idle") {
+      void handleRunCodexTask();
+      return;
+    }
+    if (supervisionState === "waitingApproval") {
+      handleInspectorApprove();
+      return;
+    }
+    if (supervisionState === "blocked") {
+      if (draft.trim()) {
+        void handleRunCodexTask();
+        return;
+      }
+      setInspectorTab("controls");
+      composerInputRef.current?.focus();
+      return;
+    }
+    if (supervisionState === "running") {
+      setNotice({ kind: "info", text: "暂停控制还未接入当前运行。" });
+    }
+  };
+
   const handleWindowMinimize = async () => {
     if (!hasCustomWindowChrome) {
       return;
@@ -3620,82 +5582,22 @@ export default function App() {
 
   return (
     <div className={`app-shell mode-${layoutMode}`}>
-      <header className="topbar">
-        <div
-          className="topbar-dragzone"
-          data-tauri-drag-region={hasCustomWindowChrome ? true : undefined}
-          onDoubleClick={() => void handleWindowToggleMaximize()}
-        >
-          <div className="topbar-brand">
-            <div className="topbar-route">
-              <span className="topbar-logo" aria-hidden="true" />
-              <div className="topbar-trail" aria-label="current context">
-                <span className="topbar-app">solo</span>
-                <span className="topbar-separator">/</span>
-                <span className="topbar-context">control plane</span>
-              </div>
-              <span className="topbar-title-divider" aria-hidden="true" />
-              <div className="topbar-title-stack">
-                <h1>{activeWorkspace?.path ?? "~/workspace/solo"}</h1>
-                <span className="topbar-title-meta">branch: ui-ddd</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div className="topbar-status">
-          <button
-            type="button"
-            className="status-pill status-pill-button status-pill-compact"
-            onClick={() => {
-              setConnectionState({ status: "idle", message: "" });
-              setSettingsModalOpen(true);
-            }}
-          >
-            <strong className="status-pill-value">
-              {providerNeedsCodexLogin ? "Codex Login" : "Connection"}
-            </strong>
-          </button>
-          <span className="status-pill status-pill-compact status-pill-active">
-            <strong className="status-pill-value">managed</strong>
-          </span>
-          <span
-            className={`status-pill status-pill-compact status-pill-${
-              observedCodexState.agents.length ? "active" : "idle"
-            }`}
-            title={topbarResourceLabel}
-          >
-            <strong className="status-pill-value">observe-only</strong>
-          </span>
-        </div>
-        {hasCustomWindowChrome ? (
-          <div className="window-controls">
-            <button
-              type="button"
-              className="window-control-button"
-              aria-label="最小化窗口"
-              onClick={() => void handleWindowMinimize()}
-            >
-              <WindowControlIcon kind="minimize" />
-            </button>
-            <button
-              type="button"
-              className="window-control-button"
-              aria-label={windowMaximized ? "还原窗口" : "最大化窗口"}
-              onClick={() => void handleWindowToggleMaximize()}
-            >
-              <WindowControlIcon kind="maximize" maximized={windowMaximized} />
-            </button>
-            <button
-              type="button"
-              className="window-control-button window-control-close"
-              aria-label="关闭窗口"
-              onClick={() => void handleWindowClose()}
-            >
-              <WindowControlIcon kind="close" />
-            </button>
-          </div>
-        ) : null}
-      </header>
+      <TopStatusBar
+        activeWorkspace={activeWorkspace}
+        providerNeedsCodexLogin={providerNeedsCodexLogin}
+        managedProjection={managedRuntimeProjection}
+        observedProjectionCount={soloProjection.externalCount}
+        topbarResourceLabel={topbarResourceLabel}
+        hasCustomWindowChrome={hasCustomWindowChrome}
+        windowMaximized={windowMaximized}
+        onOpenSettings={() => {
+          setConnectionState({ status: "idle", message: "" });
+          setSettingsModalOpen(true);
+        }}
+        onMinimize={handleWindowMinimize}
+        onToggleMaximize={handleWindowToggleMaximize}
+        onClose={handleWindowClose}
+      />
 
       <SettingsModal
         open={settingsModalOpen}
@@ -3720,444 +5622,71 @@ export default function App() {
       ) : null}
 
       <main className="workspace-shell">
-        <aside className="sidebar">
-          <section className="panel-block panel-sessions">
-            <div className="section-header">
-              <div>
-                  <p className="section-eyebrow">Workstreams</p>
-                  <div className="section-title-row">
-                    <h2>Workstreams</h2>
-                    <span className="section-count">{sessions.length}</span>
-                  </div>
-              </div>
-              <button type="button" className="ghost-button" onClick={handleCreateSession}>
-                New
-              </button>
-            </div>
-            <div className="workstream-groups">
-              <section className="workstream-group">
-                <div className="workstream-group-head">
-                  <span className="section-eyebrow">Active</span>
-                  <span className="section-count">{activeWorkstreamEntries.length}</span>
-                </div>
-                {activeWorkstreamEntries.length ? (
-                  <div className="session-list">
-                    {activeWorkstreamEntries.map((entry) => (
-                      <WorkstreamCard
-                        key={entry.id}
-                        entry={entry}
-                        active={entry.id === activeSessionId}
-                        onSelect={handleSelectSession}
-                        onDelete={handleDeleteSession}
-                        deletingDisabled={chatSending && entry.id === activeSessionId}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="panel-collapsed-note">
-                    <EmptyVisual label="No active workstreams" tone="active" />
-                  </div>
-                )}
-              </section>
-
-              <section className="workstream-group">
-                <div className="workstream-group-head">
-                  <span className="section-eyebrow">Waiting</span>
-                  <span className="section-count">{waitingWorkstreamEntries.length}</span>
-                </div>
-                {waitingWorkstreamEntries.length ? (
-                  <div className="session-list">
-                    {waitingWorkstreamEntries.map((entry) => (
-                      <WorkstreamCard
-                        key={entry.id}
-                        entry={entry}
-                        active={entry.id === activeSessionId}
-                        onSelect={handleSelectSession}
-                        onDelete={handleDeleteSession}
-                        deletingDisabled={chatSending && entry.id === activeSessionId}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="panel-collapsed-note">
-                    <EmptyVisual label="No waiting workstreams" tone="loading" />
-                  </div>
-                )}
-              </section>
-
-              <section className="workstream-group">
-                <div className="workstream-group-head">
-                  <span className="section-eyebrow">Done</span>
-                  <span className="section-count">{doneWorkstreamEntries.length}</span>
-                </div>
-                {doneWorkstreamEntries.length ? (
-                  <div className="session-list">
-                    {doneWorkstreamEntries.map((entry) => (
-                      <WorkstreamCard
-                        key={entry.id}
-                        entry={entry}
-                        active={entry.id === activeSessionId}
-                        onSelect={handleSelectSession}
-                        onDelete={handleDeleteSession}
-                        deletingDisabled={chatSending && entry.id === activeSessionId}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="panel-collapsed-note">
-                    <EmptyVisual label="No completed workstreams" tone="ready" />
-                  </div>
-                )}
-              </section>
-            </div>
-          </section>
-
-          <section className="panel-block panel-exceptions">
-            <div className="section-header">
-              <div>
-                <p className="section-eyebrow">Exceptions</p>
-                <div className="section-title-row">
-                  <h2>Exceptions</h2>
-                  <span className="section-count">{exceptionEntries.length}</span>
-                </div>
-              </div>
-            </div>
-            {exceptionEntries.length ? (
-              <div className="exception-list">
-                {exceptionEntries.map((entry) => (
-                  <ExceptionCard
-                    key={entry.id}
-                    entry={entry}
-                    active={entry.id === activeSessionId}
-                    onSelect={handleSelectSession}
-                  />
-                ))}
-              </div>
-            ) : (
-              <div className="panel-collapsed-note">
-                <EmptyVisual label="No exceptions" tone="ready" />
-              </div>
-            )}
-          </section>
-
-          <section className="panel-block panel-workspaces">
-            <div className="section-header">
-              <div>
-                  <p className="section-eyebrow">Resources</p>
-                  <div className="section-title-row">
-                    <h2>Resources</h2>
-                    <span className="section-count">{resourceDisplayCount}</span>
-                    {observedCodexState.error ? (
-                      <span className="list-badge list-badge-error">scan failed</span>
-                    ) : null}
-                    {observedCodexState.agents.length ? (
-                      <span className="list-badge list-badge-accent">
-                        {observedCodexState.agents.length} external
-                      </span>
-                    ) : null}
-                  </div>
-              </div>
-            </div>
-            {workspaces.length || observedCodexState.agents.length ? (
-              <div className="workspace-list">
-                {observedCodexState.error ? (
-                  <div className="resource-inline-error">
-                    <strong>External Codex scan failed</strong>
-                    <span>{observedCodexState.error}</span>
-                  </div>
-                ) : null}
-                {workspaces.map((workspace) => {
-                  const workspaceAgents = externalAgentsByWorkspaceId[workspace.id] ?? [];
-                  return (
-                    <div
-                      key={workspace.id}
-                      className={`workspace-card ${
-                        workspace.id === activeWorkspaceId ? "is-active" : ""
-                      } ${workspaceAgents.length ? "has-external-agent" : ""}`}
-                    >
-                      <button
-                        type="button"
-                        className="workspace-main"
-                        onClick={() => void handleSelectWorkspace(workspace.id)}
-                      >
-                        <div className="workspace-row">
-                          <span className="workspace-title">{workspace.name}</span>
-                          {workspace.id === activeSessionWorkspaceId ? (
-                            <span className="list-badge list-badge-accent">current</span>
-                          ) : null}
-                          {workspaceAgents.length ? (
-                            <span className="list-badge list-badge-loading">
-                              {workspaceAgents.length} external
-                            </span>
-                          ) : null}
-                        </div>
-                        <span className="workspace-path">{workspace.path}</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="danger-button"
-                        onClick={() => handleRemoveWorkspace(workspace.id)}
-                      >
-                        Remove
-                      </button>
-                      {workspaceAgents.length ? (
-                        <div className="workspace-agent-stack">
-                          {workspaceAgents.slice(0, 2).map((agent) => {
-                            const matchedSession = sessions.find(
-                              (session) => session.id === agent.matchedSessionId
-                            );
-                            return (
-                              <ExternalAgentResourceCard
-                                key={agent.id}
-                                agent={agent}
-                                workspace={workspace}
-                                session={matchedSession}
-                                current={workspace.id === activeWorkspaceId}
-                                onFocusSession={setActiveSessionId}
-                              />
-                            );
-                          })}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })}
-                {untrackedExternalAgents.length ? (
-                  <div className="workspace-untracked-group">
-                    <div className="workspace-untracked-head">
-                      <span className="section-eyebrow">Untracked</span>
-                      <span className="section-count">{untrackedExternalAgents.length}</span>
-                    </div>
-                    {untrackedExternalAgents.slice(0, 1).map((agent) => {
-                      const matchedSession = sessions.find(
-                        (session) => session.id === agent.matchedSessionId
-                      );
-                      return (
-                        <ExternalAgentResourceCard
-                          key={agent.id}
-                          agent={agent}
-                          workspace={null}
-                          session={matchedSession}
-                          current={false}
-                          onFocusSession={setActiveSessionId}
-                        />
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="panel-collapsed-note">
-                <EmptyVisual
-                  label={
-                    observedCodexState.error
-                      ? "External Codex scan failed"
-                      : observedCodexState.loading
-                        ? "Scanning external Codex"
-                        : "No resources"
-                  }
-                  tone={observedCodexState.error ? "error" : observedCodexState.loading ? "loading" : "idle"}
-                />
-              </div>
-            )}
-          </section>
-
-          <section
-            className={`panel-block panel-explorer ${explorerOpen ? "is-grow" : "is-collapsed"}`}
-          >
-            <div className="section-header">
-              <div>
-                  <p className="section-eyebrow">Resource Lens</p>
-                  <div className="section-title-row">
-                    <h2>Resource lens</h2>
-                  </div>
-              </div>
-              <button
-                type="button"
-                className="ghost-button"
-                onClick={() => setExplorerOpen((current) => !current)}
-                disabled={!activeWorkspace}
-              >
-                {explorerOpen ? "Collapse" : "Expand"}
-              </button>
-            </div>
-            {!explorerOpen ? (
-              <div className="panel-collapsed-note">
-                <EmptyVisual
-                  label={activeWorkspace ? "File tree collapsed" : "No directory resource"}
-                  tone={activeWorkspace ? "active" : "idle"}
-                />
-              </div>
-            ) : activeWorkspace ? (
-              workspaceTreeLoading ? (
-                <div className="empty-state compact">
-                  <EmptyVisual label="Loading file tree" tone="loading" />
-                </div>
-              ) : workspaceTree ? (
-                <div className="tree-panel">
-                  <WorkspaceTreeNode
-                    node={workspaceTree}
-                    level={0}
-                    selectedPath={selectedFilePath}
-                    onOpenFile={handleOpenFile}
-                  />
-                </div>
-              ) : (
-                <div className="empty-state compact">
-                  <EmptyVisual label="No visible file tree" tone="idle" />
-                </div>
-              )
-            ) : (
-              <div className="empty-state compact">
-                <EmptyVisual label="No directory resource" tone="idle" />
-              </div>
-            )}
-          </section>
-        </aside>
+        <WorkstreamRail
+          sessions={sessions}
+          activeWorkstreamEntries={activeWorkstreamEntries}
+          waitingWorkstreamEntries={waitingWorkstreamEntries}
+          doneWorkstreamEntries={doneWorkstreamEntries}
+          activeSessionId={activeSessionId}
+          chatSending={chatSending}
+          onCreateSession={handleCreateSession}
+          onSelectSession={handleSelectSession}
+          onDeleteSession={handleDeleteSession}
+          exceptionEntries={exceptionEntries}
+          resourceDisplayCount={resourceDisplayCount}
+          observedCodexState={observedCodexState}
+          workspaces={workspaces}
+          externalAgentsByWorkspaceId={externalAgentsByWorkspaceId}
+          activeWorkspaceId={activeWorkspaceId}
+          activeSessionWorkspaceId={activeSessionWorkspaceId}
+	          onSelectWorkspace={handleSelectWorkspace}
+	          onRemoveWorkspace={handleRemoveWorkspace}
+	          untrackedExternalAgents={untrackedExternalAgents}
+	          selectedObservedAgentId={activeObservedAgentId}
+	          onInspectExternalAgent={handleInspectExternalAgent}
+	          explorerOpen={explorerOpen}
+          setExplorerOpen={setExplorerOpen}
+          activeWorkspace={activeWorkspace}
+          workspaceTreeLoading={workspaceTreeLoading}
+          workspaceTree={workspaceTree}
+          selectedFilePath={selectedFilePath}
+          onOpenFile={handleOpenFile}
+          externalProjectionAgents={externalProjectionAgents}
+        />
 
         <section className="chat-pane">
-          <div className="chat-head">
-            <div className="chat-head-shell runtime-head-shell">
-              <div className="chat-head-main">
-                <p className="section-eyebrow">Current task</p>
-                <h2>{currentTaskTitle}</h2>
-                <p className="runtime-task-subtitle">
-                  Workstream: {runtimeWorkstreamLabel} · {currentTaskStateLabel}
-                </p>
-              </div>
-              <div className="runtime-state-strip" aria-label="task state">
-                <div className={`runtime-state-tile tone-${runtimePanelTone}`}>
-                  <span>Run</span>
-                  <strong>{currentRunStateLabel}</strong>
-                </div>
-                <div className={`runtime-state-tile tone-${nextIntentLabel === "approve" ? "approval" : "idle"}`}>
-                  <span>Next</span>
-                  <strong>{nextIntentLabel}</strong>
-                </div>
-                <div className={`runtime-state-tile tone-${runtimeOutputCards.length ? "active" : "idle"}`}>
-                  <span>Outputs</span>
-                  <strong>{outputCountLabel}</strong>
-                </div>
-              </div>
-            </div>
-          </div>
+          <RuntimeHeader
+            currentTaskTitle={currentTaskTitle}
+            runtimeWorkstreamLabel={runtimeWorkstreamLabel}
+            currentTaskStateLabel={currentTaskStateLabel}
+            runtimePanelTone={runtimePanelTone}
+            currentRunStateLabel={currentRunStateLabel}
+            nextIntentLabel={nextIntentLabel}
+            runtimeOutputCards={runtimeOutputCards}
+            outputCountLabel={outputCountLabel}
+          />
           <div className="chat-scroll">
             <div className="conversation-stack">
               {!(providerNeedsCodexLogin && !codexAuth.loggedIn) ? (
-                <>
-                  <section className="shell-card active-run-card">
-                    <div className="task-panel-head">
-                      <div>
-                        <p className="section-eyebrow">Active run</p>
-                        <h3>{activeRuntimeTurn ? "Managed Codex run" : "No active run"}</h3>
-                      </div>
-                      <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>managed</span>
-                    </div>
-                    <div
-                      className={`active-run-summary tone-${
-                        activeRuntimeTurn ? (runtimeExceptionCount > 0 ? "error" : "active") : "idle"
-                      }`}
-                    >
-                      <div>
-                        <strong>{activeRunSummary}</strong>
-                        <p>next: {nextIntentLabel}</p>
-                      </div>
-                    </div>
-                  </section>
-
-                  <section className="shell-card runtime-timeline-card">
-                    <div className="task-panel-head">
-                      <div>
-                        <p className="section-eyebrow">Timeline</p>
-                        <h3>Run events</h3>
-                      </div>
-                      <span className="drawer-chip drawer-chip-idle">
-                        {hiddenRuntimeTimelineCount
-                          ? `${visibleRuntimeTimelineItems.length} shown`
-                          : `${visibleRuntimeTimelineItems.length} items`}
-                      </span>
-                    </div>
-                    <div className="task-timeline-list runtime-timeline-list">
-                      {runtimePanelState.error ? (
-                        <div className="status-banner status-banner-error">
-                          <strong>Runtime read failed</strong>
-                          <span>{runtimePanelState.error}</span>
-                        </div>
-                      ) : (
-                        visibleRuntimeTimelineItems.map((item) => (
-                          <div key={item.id} className="task-timeline-item">
-                            <div className="task-timeline-marker" aria-hidden="true" />
-                            <div className="task-timeline-body">
-                              <div className="task-timeline-head">
-                                <span className="task-timeline-time">
-                                  {formatRuntimeTime(item.updatedAt ?? item.createdAt)}
-                                </span>
-                                <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
-                                <span
-                                  className={`drawer-chip drawer-chip-${runtimeTone(
-                                    item.status,
-                                    item.approvalState
-                                  )}`}
-                                >
-                                  {runtimeItemStateLabel(item)}
-                                </span>
-                              </div>
-                              <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
-                              <p>{item.summary || truncateInline(item.content || "No summary.", 120)}</p>
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </section>
-
-                  {visibleOutputCards.length ? (
-                    <section className="shell-card runtime-outputs-card">
-                      <div className="task-panel-head">
-                        <div>
-                          <p className="section-eyebrow">Outputs</p>
-                          <h3>Artifacts</h3>
-                        </div>
-                        <span className="drawer-chip drawer-chip-active">
-                          {`${runtimeOutputCards.length} visible`}
-                        </span>
-                      </div>
-                      <div className="runtime-output-grid">
-                        {visibleOutputCards.map((output) => (
-                          <button
-                            key={output.id}
-                            type="button"
-                            className={`runtime-output-tile tone-${output.tone}`}
-                            onClick={() => setInspectorTab("artifacts")}
-                          >
-                            <strong>{output.title}</strong>
-                            <span>{output.meta}</span>
-                          </button>
-                        ))}
-                        {outputOverflowCount > 0 ? (
-                          <button
-                            type="button"
-                            className="runtime-output-tile tone-idle is-overflow"
-                            onClick={() => setInspectorTab("artifacts")}
-                          >
-                            <strong>{`+${outputOverflowCount}`}</strong>
-                            <span>more</span>
-                          </button>
-                        ) : null}
-                      </div>
-                    </section>
-                  ) : (
-                    <section className="runtime-outputs-strip" aria-label="Outputs">
-                      <div>
-                        <p className="section-eyebrow">Outputs</p>
-                        <h3>Artifacts</h3>
-                      </div>
-                      <span className="drawer-chip drawer-chip-active">
-                        {`${runtimeOutputCards.length} visible`}
-                      </span>
-                    </section>
-                  )}
-                </>
+	                <RuntimeWorkbench
+                    showActiveRunCard={showActiveRunCard}
+	                  activeRunTitle={activeRunTitle}
+	                  activeRunChipLabel={activeRunChipLabel}
+	                  runtimePanelTone={runtimePanelTone}
+	                  activeRunSummary={activeRunSummary}
+	                  activeRunDetail={activeRunDetail}
+	                  activeRunSummaryTone={activeRunSummaryTone}
+	                  nextIntentLabel={nextIntentLabel}
+                  hiddenRuntimeTimelineCount={hiddenRuntimeTimelineCount}
+                  visibleRuntimeTimelineItems={visibleRuntimeTimelineItems}
+                  runtimePanelState={runtimePanelState}
+                  visibleOutputCards={visibleOutputCards}
+                  runtimeOutputCards={runtimeOutputCards}
+                  outputOverflowCount={outputOverflowCount}
+                  selectedDetailId={effectiveSelectedDetailId}
+                  onSelectDetail={handleSelectRuntimeDetail}
+                  onSelectArtifacts={() => setInspectorTab("artifacts")}
+                />
               ) : null}
               {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
                 <div className="shell-card hero-card">
@@ -4300,685 +5829,74 @@ export default function App() {
             </div>
           </div>
 
-          <div className="composer">
-            <div className="composer-shell">
-              <div className="composer-bar-head">
-                <div>
-                  <p className="section-eyebrow">Command Bar</p>
-                  <strong>{commandBarTitle}</strong>
-                </div>
-              </div>
-              <div className="composer-control-strip" aria-label="command quick actions">
-                {commandActionCards.map((action) => (
-                  <button
-                    key={action.id}
-                    type="button"
-                    className={`composer-control-card tone-${action.tone}`}
-                    disabled={action.disabled}
-                    onClick={action.onClick}
-                  >
-                    <span className="section-eyebrow">{action.eyebrow}</span>
-                    <strong>{action.title}</strong>
-                  </button>
-                ))}
-              </div>
-              {activeSessionWorkspaceId ? (
-                <div className="composer-resource-strip">
-                  <div className="composer-resource-main">
-                    <span className="composer-resource-label">Resource</span>
-                    <strong>{activeWorkspace?.name ?? "selected directory"}</strong>
-                    <span className="composer-resource-path">
-                      {activeWorkspace?.path ?? "path unavailable"}
-                    </span>
-                  </div>
-                  <div className="composer-resource-actions">
-                    <button
-                      type="button"
-                      className="ghost-button"
-                      onClick={() => setWorkspaceModalOpen(true)}
-                    >
-                      Change
-                    </button>
-                    <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                      Detach
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-              <textarea
-                ref={composerInputRef}
-                className="composer-input"
-                value={draft}
-                disabled={loginBlocked || chatSending || hasStreamingAssistant}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={handleComposerKeyDown}
-                placeholder={composerPlaceholder}
-              />
-              <div className="composer-actions">
-                <p className="composer-hint">{composerHint}</p>
-                <div className="composer-button-row">
-                  <button
-                    type="button"
-                    className="primary-button"
-                    disabled={commandPrimaryDisabled}
-                    onClick={() => {
-                      if (supervisionState === "idle") {
-                        handleSend();
-                      }
-                    }}
-                  >
-                    {commandPrimaryLabel}
-                  </button>
-                  {supervisionState === "waitingApproval" ? (
-                    <>
-                      <button type="button" className="ghost-button">
-                        Revise
-                      </button>
-                      <button type="button" className="ghost-button">
-                        Evidence
-                      </button>
-                    </>
-                  ) : null}
-                  {supervisionState === "idle" ? (
-                    <button
-                      type="button"
-                      className="ghost-button"
-                      onClick={() => setWorkspaceModalOpen(true)}
-                      aria-label={composerContextButtonLabel}
-                      title={composerContextButtonLabel}
-                    >
-                      More
-                    </button>
-                  ) : null}
-                  {supervisionState === "blocked" ? (
-                    <button type="button" className="danger-button">
-                      Abort
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-            </div>
-          </div>
+	            <CommandBar
+	              commandBarTitle={commandBarTitle}
+	              canControl={hasManagedControl}
+	              canUseCommandInput={canUseCommandInput}
+            commandActionCards={commandActionCards}
+            activeSessionWorkspaceId={activeSessionWorkspaceId}
+            activeWorkspace={activeWorkspace}
+            onOpenWorkspaceModal={() => setWorkspaceModalOpen(true)}
+            onDetachWorkspace={handleDetachWorkspace}
+            composerInputRef={composerInputRef}
+            draft={draft}
+            setDraft={setDraft}
+            loginBlocked={loginBlocked}
+            chatSending={chatSending}
+            hasStreamingAssistant={hasStreamingAssistant}
+            onComposerKeyDown={handleComposerKeyDown}
+            composerPlaceholder={composerPlaceholder}
+            composerHint={composerHint}
+            commandPrimaryDisabled={commandPrimaryDisabled}
+            commandPrimaryLabel={commandPrimaryLabel}
+            supervisionState={supervisionState}
+            onPrimaryAction={handleCommandPrimaryAction}
+            composerContextButtonLabel={composerContextButtonLabel}
+          />
         </section>
 
-        <aside className="inspector">
-          <div className="inspector-head">
-            <div>
-              <p className="section-eyebrow">Inspecting</p>
-              <h2>{inspectorTitle}</h2>
-            </div>
-            <span className="section-count">{runtimePanelStatus}</span>
-          </div>
-
-          <div className="inspector-cockpit">
-            <section className="inspector-checkpoint-card">
-              <span className="section-eyebrow">{inspectorStatus}</span>
-              <h3>{inspectorQuestion}</h3>
-              <p>{inspectorImpact}</p>
-              {hasPendingApproval ? (
-                <div className="inspector-action-row">
-                  <button type="button" className="primary-button">
-                    Approve
-                  </button>
-                  <button type="button" className="ghost-button">
-                    Revise
-                  </button>
-                  <button type="button" className="ghost-button">
-                    Evidence
-                  </button>
-                </div>
-              ) : null}
-            </section>
-
-            <section className="inspector-evidence-card">
-              <h3>Evidence</h3>
-              <div className="inspector-evidence-list">
-                {inspectorEvidence.map((item) => (
-                  <p key={item}>{item}</p>
-                ))}
-              </div>
-            </section>
-
-            <section className="inspector-external-card">
-              <div>
-                <span className="section-eyebrow">External Codex</span>
-                <h3>
-                  {primaryObservedCodexAgent
-                    ? `${codexAgentStateLabel(primaryObservedCodexAgent.state)} · observe-only`
-                    : "observe-only"}
-                </h3>
-              </div>
-              <p>
-                {primaryObservedCodexAgent
-                  ? `workspace: ${primaryObservedCodexAgent.cwd}`
-                  : observedCodexState.loading
-                    ? "scanning local Codex processes"
-                    : "no external run selected"}
-              </p>
-            </section>
-          </div>
-
-          <div className="inspector-summary-strip" aria-label="运行摘要">
-            {inspectorSummaryCards.map((card) => (
-              <article key={card.label} className={`inspector-summary-card tone-${card.tone}`}>
-                <span className="section-eyebrow">{card.label}</span>
-                <strong>{card.value}</strong>
-                <p>{card.detail}</p>
-              </article>
-            ))}
-          </div>
-
-          <div className="inspector-tablist" role="tablist" aria-label="运行详情分区">
-            {inspectorTabs.map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                id={`inspector-tab-${tab.id}`}
-                role="tab"
-                aria-selected={inspectorTab === tab.id}
-                aria-controls={`inspector-panel-${tab.id}`}
-                className={`inspector-tab ${inspectorTab === tab.id ? "is-active" : ""}`}
-                onClick={() => setInspectorTab(tab.id)}
-              >
-                <span className="inspector-tab-topline">
-                  <span className="inspector-tab-label">{tab.label}</span>
-                  <span className={`drawer-chip drawer-chip-${tab.badgeTone}`}>{tab.badgeText}</span>
-                </span>
-              </button>
-            ))}
-          </div>
-
-          <div className="inspector-scroll">
-            {inspectorTab === "trace" ? (
-              <div
-                id="inspector-panel-trace"
-                role="tabpanel"
-                aria-labelledby="inspector-tab-trace"
-                className="inspector-panel-stack"
-              >
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Trace</span>
-                      <strong>运行轨迹</strong>
-                    </div>
-                    <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{runtimePanelStatus}</span>
-                  </div>
-                  <div className="drawer-meta-grid">
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">焦点</span>
-                      <span className="drawer-meta-value">{runtimeFocusDetail}</span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">任务</span>
-                      <span className="drawer-meta-value">
-                        {activeRuntimeTask?.title || "当前还没有任务骨架。"}
-                      </span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">回合</span>
-                      <span className="drawer-meta-value">{activeRunLabel}</span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">最近</span>
-                      <span className="drawer-meta-value">{activeRunSummary}</span>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Events</span>
-                      <strong>事件时间线</strong>
-                    </div>
-                    <span className="drawer-chip drawer-chip-idle">{`${activeRuntimeSnapshot.turnItems.length} item`}</span>
-                  </div>
-                  <div className="drawer-preview-body">
-                    {runtimePanelState.error ? (
-                      <div className="status-banner status-banner-error">
-                        <strong>Runtime 读取失败</strong>
-                        <span>{runtimePanelState.error}</span>
-                      </div>
-                    ) : runtimeItemList.length > 0 ? (
-                      <div className="runtime-item-list">
-                        {runtimeItemList.map((item) => (
-                          <div key={item.id} className="runtime-item-card">
-                            <div className="runtime-item-head">
-                              <span className="section-eyebrow">{turnItemKindLabel(item.kind)}</span>
-                              <span
-                                className={`drawer-chip drawer-chip-${runtimeTone(
-                                  item.status,
-                                  item.approvalState
-                                )}`}
-                              >
-                                {runtimeItemStateLabel(item)}
-                              </span>
-                            </div>
-                            <strong>{item.title || turnItemKindLabel(item.kind)}</strong>
-                            <p>{item.summary || truncateInline(item.content || "暂无摘要。", 96)}</p>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="proposal-empty">
-                        <EmptyVisual label="当前会话还没有可展示的结构化 item" tone="idle" />
-                      </div>
-                    )}
-                  </div>
-                </section>
-              </div>
-            ) : null}
-
-            {inspectorTab === "artifacts" ? (
-              <div
-                id="inspector-panel-artifacts"
-                role="tabpanel"
-                aria-labelledby="inspector-tab-artifacts"
-                className="inspector-panel-stack"
-              >
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Artifacts</span>
-                      <strong>产物面板</strong>
-                    </div>
-                    <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
-                  </div>
-                  <div className="drawer-meta-grid">
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">文件</span>
-                      <span className="drawer-meta-value">{previewTitle}</span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">状态</span>
-                      <span className="drawer-meta-value">
-                        {showPreviewPanel
-                          ? "右侧已载入文件预览"
-                          : previewDeckActive
-                            ? `主区有 ${previewProposals.length} 张预览卡`
-                            : showDecisionDeck
-                              ? `主区有 ${decisionOptions.length} 个方向卡`
-                              : "当前没有可展开的文件产物"}
-                      </span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">产物数</span>
-                      <span className="drawer-meta-value">{`${runtimeArtifactCount} 个产物或预览节点`}</span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">视图</span>
-                      <span className="drawer-meta-value">artifact</span>
-                    </div>
-                  </div>
-                </section>
-
-                {showPreviewPanel ? (
-                  <section className="drawer-panel drawer-panel-preview is-grow">
-                    <div className="drawer-panel-head">
-                      <div className="drawer-panel-title">
-                        <span className="section-eyebrow">Preview</span>
-                        <strong>{previewTitle}</strong>
-                      </div>
-                      <span className={`drawer-chip drawer-chip-${previewStateLabel}`}>{previewStateText}</span>
-                    </div>
-                    <div className="drawer-preview-body">
-                      {previewState.loading ? <EmptyVisual label="正在读取文件" tone="loading" /> : null}
-                      {previewState.error ? (
-                        <div className="status-banner status-banner-error">
-                          <strong>预览失败</strong>
-                          <span>{previewState.error}</span>
-                        </div>
-                      ) : null}
-                      {filePreview ? (
-                        <>
-                          <pre>{filePreview.content}</pre>
-                          {filePreview.isTruncated ? (
-                            <p className="preview-note">该文件较大，当前只显示前 12000 个字符预览。</p>
-                          ) : null}
-                        </>
-                      ) : null}
-                    </div>
-                  </section>
-                ) : (
-                  <section className="drawer-panel">
-                    <div className="drawer-panel-head">
-                      <div className="drawer-panel-title">
-                        <span className="section-eyebrow">Preview</span>
-                        <strong>等待产物</strong>
-                      </div>
-                      <span className="drawer-chip drawer-chip-idle">空</span>
-                    </div>
-                    <div className="drawer-preview-body">
-                      <div className="proposal-empty">
-                        <EmptyVisual
-                          label={previewDeckActive ? "主区已经生成预览卡" : "当前还没有文件级产物"}
-                          tone={previewDeckActive ? "active" : "idle"}
-                        />
-                      </div>
-                    </div>
-                  </section>
-                )}
-              </div>
-            ) : null}
-
-            {inspectorTab === "resources" ? (
-              <div
-                id="inspector-panel-resources"
-                role="tabpanel"
-                aria-labelledby="inspector-tab-resources"
-                className="inspector-panel-stack"
-              >
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Resources</span>
-                      <strong>当前资源</strong>
-                    </div>
-                    <span className={`drawer-chip drawer-chip-${inspectorWorkspaceState}`}>
-                      {inspectorWorkspaceStateText}
-                    </span>
-                  </div>
-                  <div className="drawer-meta-grid">
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">目录</span>
-                      <span className="drawer-meta-value">{activeWorkspace?.name ?? "未附加目录资源"}</span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">路径</span>
-                      <span className="drawer-meta-value drawer-meta-path">
-                        {activeWorkspace?.path ?? "需要代码依据时，再通过回形针添加目录资源。"}
-                      </span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">方式</span>
-                      <span className="drawer-meta-value">{modeIntentText}</span>
-                    </div>
-                    <div className="drawer-meta-row">
-                      <span className="drawer-meta-label">会话</span>
-                      <span className="drawer-meta-value">
-                        {activeSession?.title ?? "请先创建会话。"}
-                      </span>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">External Codex</span>
-                      <strong>外部运行</strong>
-                    </div>
-                    <span
-                      className={`drawer-chip drawer-chip-${
-                        observedCodexState.error
-                          ? "error"
-                          : observedCodexState.agents.length > 0
-                            ? "active"
-                            : observedCodexState.loading
-                              ? "loading"
-                              : "idle"
-                      }`}
-                    >
-                      {observedCodexState.error
-                        ? "读取失败"
-                        : observedCodexState.agents.length > 0
-                          ? `${observedCodexState.agents.length} agent`
-                          : observedCodexState.loading
-                            ? "扫描中"
-                            : "无外部运行"}
-                    </span>
-                  </div>
-                  <div className="drawer-preview-body">
-                    {observedCodexState.error ? (
-                      <div className="status-banner status-banner-error">
-                        <strong>外部 Codex 扫描失败</strong>
-                        <span>{observedCodexState.error}</span>
-                      </div>
-                    ) : observedCodexState.agents.length > 0 ? (
-                      <div className="external-agent-list">
-                        {observedCodexState.agents
-                          .slice(0, 6)
-                          .map((agent) => {
-                            const matchedWorkspace = workspaces.find(
-                              (workspace) => workspace.id === agent.matchedWorkspaceId
-                            );
-                            const matchedSession = sessions.find(
-                              (session) => session.id === agent.matchedSessionId
-                            );
-                            const isCurrentResource =
-                              activeWorkspace?.id && agent.matchedWorkspaceId === activeWorkspace.id;
-                            return (
-                              <div
-                                key={agent.id}
-                                className={`external-agent-card ${isCurrentResource ? "is-current" : ""}`}
-                              >
-                                <div className="external-agent-head">
-                                  <span className="section-eyebrow">pid {agent.pid || "unknown"}</span>
-                                  <span className={`drawer-chip drawer-chip-${codexAgentTone(agent)}`}>
-                                    {codexAgentStateLabel(agent.state)}
-                                  </span>
-                                </div>
-                                <strong>{matchedWorkspace?.name ?? "Codex"}</strong>
-                                <p>{agent.cwd}</p>
-                                <div className="external-agent-meta">
-                                  <span>external</span>
-                                  <span>observe-only</span>
-                                  {matchedWorkspace ? (
-                                    <span>{isCurrentResource ? "current resource" : "matched workspace"}</span>
-                                  ) : (
-                                    <span>unmatched workspace</span>
-                                  )}
-                                  {matchedSession ? <span>{truncateInline(matchedSession.title, 48)}</span> : null}
-                                  <span>{formatRuntimeTime(agent.lastSeenAt)}</span>
-                                </div>
-                                {agent.command ? <pre>{truncateInline(agent.command, 220)}</pre> : null}
-                                {matchedSession ? (
-                                  <button
-                                    type="button"
-                                    className="ghost-button external-agent-action"
-                                    onClick={() => setActiveSessionId(matchedSession.id)}
-                                  >
-                                    聚焦匹配会话
-                                  </button>
-                                ) : null}
-                              </div>
-                            );
-                          })}
-                        {activeWorkspace?.id &&
-                        observedCodexState.agents.every(
-                          (agent) => agent.matchedWorkspaceId !== activeWorkspace.id
-                        ) ? (
-                          <div className="proposal-empty">
-                            <EmptyVisual label="当前资源没有匹配到外部 Codex，已显示全部外部运行" tone="idle" />
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : (
-                      <div className="proposal-empty">
-                        <EmptyVisual
-                          label={observedCodexState.loading ? "正在扫描本机 Codex 进程" : "没有检测到外部 Codex"}
-                          tone={observedCodexState.loading ? "loading" : "idle"}
-                        />
-                      </div>
-                    )}
-                  </div>
-                </section>
-
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Boundary</span>
-                      <strong>资源边界</strong>
-                    </div>
-                    <span className="drawer-chip drawer-chip-idle">{`${runtimeResourceCount} 个资源`}</span>
-                  </div>
-                  <div className="drawer-preview-body">
-                    <div className="proposal-empty">
-                      <EmptyVisual label={modeGuidanceText} tone={collaborationEnabled ? "active" : "idle"} />
-                    </div>
-                  </div>
-                </section>
-              </div>
-            ) : null}
-
-            {inspectorTab === "controls" ? (
-              <div
-                id="inspector-panel-controls"
-                role="tabpanel"
-                aria-labelledby="inspector-tab-controls"
-                className="inspector-panel-stack"
-              >
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Checkpoint</span>
-                      <strong>待决策节点</strong>
-                    </div>
-                    <span className={`drawer-chip drawer-chip-${suggestionInspectorTone}`}>
-                      {suggestionInspectorStatus}
-                    </span>
-                  </div>
-                  <div className="drawer-preview-body">
-                    {proposalPanelState.error ? (
-                      <div className="status-banner status-banner-error">
-                        <strong>加载失败</strong>
-                        <span>{proposalPanelState.error}</span>
-                      </div>
-                    ) : (
-                      <div className="proposal-empty">
-                        <EmptyVisual
-                          label={
-                            showDecisionDeck
-                              ? `主区有 ${decisionOptions.length} 个方向卡`
-                              : previewDeckActive
-                                ? `主区有 ${previewProposals.length} 张预览卡`
-                                : proposalPanelState.loading
-                                  ? "正在展开具体预览"
-                                  : selectedDecisionOption
-                                    ? `已选择 ${selectedChoiceLabel || "一个方向"}`
-                                    : "当前没有额外建议"
-                          }
-                          tone={showDecisionDeck || previewDeckActive || selectedDecisionOption ? "active" : "idle"}
-                        />
-                      </div>
-                    )}
-                  </div>
-                </section>
-
-                <section className="drawer-panel">
-                  <div className="drawer-panel-head">
-                    <div className="drawer-panel-title">
-                      <span className="section-eyebrow">Controls</span>
-                      <strong>控制面板</strong>
-                    </div>
-                    <span className="drawer-chip drawer-chip-idle">{modeLabel}</span>
-                  </div>
-                  <div className="drawer-preview-body control-stack">
-                    <div className="mode-switch" role="tablist" aria-label="资源参与方式">
-                      <button
-                        type="button"
-                        className={`ghost-button mode-switch-button ${
-                          activeSessionMode === SESSION_MODE_CONVERSATION ? "is-active" : ""
-                        }`}
-                        onClick={() => void handleSetSessionMode(SESSION_MODE_CONVERSATION)}
-                        aria-pressed={activeSessionMode === SESSION_MODE_CONVERSATION}
-                      >
-                        不使用资源
-                      </button>
-                      <button
-                        type="button"
-                        className={`ghost-button mode-switch-button ${
-                          activeSessionMode === SESSION_MODE_WORKSPACE ? "is-active" : ""
-                        }`}
-                        disabled={!collaborationAvailable}
-                        onClick={() => void handleSetSessionMode(SESSION_MODE_WORKSPACE)}
-                        aria-pressed={activeSessionMode === SESSION_MODE_WORKSPACE}
-                        title={
-                          collaborationAvailable ? "让当前 run 读取附加资源" : "等待资源请求"
-                        }
-                      >
-                        使用资源
-                      </button>
-                    </div>
-                    {collaborationEnabled ? (
-                      <div className="mode-switch turn-intent-switch" role="tablist" aria-label="当前回合阶段">
-                        <button
-                          type="button"
-                          className={`ghost-button mode-switch-button ${
-                            activeTurnIntent === TURN_INTENT_AUTO ? "is-active" : ""
-                          }`}
-                          onClick={() =>
-                            setTurnIntentBySession((current) => ({
-                              ...current,
-                              [activeSessionId]: TURN_INTENT_AUTO,
-                            }))
-                          }
-                          aria-pressed={activeTurnIntent === TURN_INTENT_AUTO}
-                        >
-                          协作分析
-                        </button>
-                        <button
-                          type="button"
-                          className={`ghost-button mode-switch-button ${
-                            activeTurnIntent === TURN_INTENT_CHOICE ? "is-active" : ""
-                          }`}
-                          onClick={() =>
-                            setTurnIntentBySession((current) => ({
-                              ...current,
-                              [activeSessionId]: TURN_INTENT_CHOICE,
-                            }))
-                          }
-                          aria-pressed={activeTurnIntent === TURN_INTENT_CHOICE}
-                        >
-                          方向建议
-                        </button>
-                        <button
-                          type="button"
-                          className={`ghost-button mode-switch-button ${
-                            activeTurnIntent === TURN_INTENT_PREVIEW ? "is-active" : ""
-                          }`}
-                          onClick={() =>
-                            setTurnIntentBySession((current) => ({
-                              ...current,
-                              [activeSessionId]: TURN_INTENT_PREVIEW,
-                            }))
-                          }
-                          aria-pressed={activeTurnIntent === TURN_INTENT_PREVIEW}
-                        >
-                          具体预览
-                        </button>
-                      </div>
-                    ) : null}
-                    <div className="control-button-grid">
-                      {activeSessionWorkspaceId ? (
-                        <button type="button" className="ghost-button" onClick={handleDetachWorkspace}>
-                          移除资源
-                        </button>
-                      ) : null}
-                      <button type="button" className="ghost-button" onClick={handleCreateSession}>
-                        新任务流
-                      </button>
-                      <button type="button" className="ghost-button" onClick={() => setWorkspaceModalOpen(true)}>
-                        附加资源
-                      </button>
-                      {providerNeedsCodexLogin && !codexAuth.loggedIn ? (
-                        <button
-                          type="button"
-                          className="primary-button"
-                          disabled={codexChecking}
-                          onClick={handleCodexLogin}
-                        >
-                          {codexChecking ? "登录中…" : "登录 Codex"}
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                </section>
-              </div>
-            ) : null}
-          </div>
-        </aside>
+        <InspectorPanel
+          inspectorEyebrow={inspectorEyebrow}
+          inspectorTitle={inspectorTitle}
+          runtimePanelStatus={runtimePanelStatus}
+          inspectorStatus={inspectorStatus}
+          inspectorQuestion={inspectorQuestion}
+          inspectorImpact={inspectorImpact}
+          hasPendingApproval={hasPendingApproval}
+          isHistoryDetail={isHistoryDetail}
+          historyItems={historyPageItems}
+          historyPageLabel={
+            foldedRuntimeTimelineItems.length
+              ? `${historyPageStart}-${historyPageEnd} / ${foldedRuntimeTimelineItems.length}`
+              : "empty"
+          }
+          historyCanShowNewer={safeHistoryPageIndex > 0}
+          historyCanShowOlder={historyPageEnd < foldedRuntimeTimelineItems.length}
+          detailCanExpand={Boolean(detailCanExpand)}
+          detailExpanded={detailExpanded}
+          onToggleDetailExpanded={() => setDetailExpanded((expanded) => !expanded)}
+          inspectorDetailHeading={inspectorDetailHeading}
+          inspectorEvidence={inspectorEvidence}
+          canControl={hasManagedControl}
+          onApprove={handleInspectorApprove}
+          onRevise={() => composerInputRef.current?.focus()}
+          onEvidence={() => setInspectorTab("trace")}
+          canReturnToHistory={Boolean(lastHistoryDetailId && effectiveSelectedDetailId === lastHistoryDetailId)}
+          onSelectHistoryItem={(item) => {
+            const detailId = `timeline:${item.id}`;
+            setLastHistoryDetailId(detailId);
+            setSelectedDetailId(detailId);
+          }}
+          onBackToLatest={() => {
+            setLastHistoryDetailId("");
+            setSelectedDetailId(visibleRuntimeTimelineItems[0] ? `timeline:${visibleRuntimeTimelineItems[0].id}` : "active-run");
+          }}
+          onBackToHistory={() => setSelectedDetailId("history")}
+          onHistoryNewer={() => setHistoryPageIndex((page) => Math.max(0, page - 1))}
+          onHistoryOlder={() =>
+            setHistoryPageIndex((page) => Math.min(historyPageCount - 1, page + 1))
+          }
+        />
       </main>
 
       <WorkspaceModal
