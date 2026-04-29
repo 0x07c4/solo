@@ -1371,6 +1371,7 @@ select {
 }
 
 .active-run-card,
+.runtime-focus-card,
 .runtime-timeline-card,
 .runtime-outputs-card {
   display: flex;
@@ -4726,6 +4727,7 @@ select {
 }
 
 .app-shell.mode-workbench .active-run-card,
+.app-shell.mode-workbench .runtime-focus-card,
 .app-shell.mode-workbench .runtime-timeline-card,
 .app-shell.mode-workbench .runtime-outputs-card {
   padding: 12px 14px;
@@ -5170,10 +5172,35 @@ select {
   block-size: auto !important;
   min-block-size: 0 !important;
   max-block-size: none !important;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell.mode-workbench .conversation-stack > .runtime-timeline-card.runtime-timeline-card .runtime-timeline-list {
+  flex: 0 0 auto;
+}
+
+.app-shell.mode-workbench .conversation-stack {
+  justify-content: flex-start;
 }
 
 .app-shell.mode-workbench .conversation-stack > .active-run-card {
   flex: 0 0 auto;
+}
+
+.app-shell.mode-workbench .conversation-stack > .runtime-focus-card {
+  flex: 0 0 auto;
+}
+
+.app-shell.mode-workbench .runtime-focus-card .active-run-summary {
+  min-height: 86px;
+}
+
+.app-shell.mode-workbench .runtime-focus-card .active-run-summary p {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .app-shell.mode-workbench {

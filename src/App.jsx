@@ -2393,7 +2393,6 @@ function RuntimeHeader({
 }
 
 function RuntimeWorkbench({
-  showActiveRunCard,
   activeRunTitle,
   activeRunChipLabel,
   runtimePanelTone,
@@ -2413,33 +2412,31 @@ function RuntimeWorkbench({
 }) {
   return (
     <>
-      {showActiveRunCard ? (
-        <section className="shell-card active-run-card">
-          <div className="task-panel-head">
-            <div>
-              <p className="section-eyebrow">Active run</p>
-              <h3>{activeRunTitle}</h3>
-            </div>
-            <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{activeRunChipLabel}</span>
+      <section className="shell-card runtime-focus-card">
+        <div className="task-panel-head">
+          <div>
+            <p className="section-eyebrow">Focus</p>
+            <h3>{activeRunTitle}</h3>
           </div>
-          <button
-            type="button"
-            className={`active-run-summary tone-${activeRunSummaryTone} ${selectedDetailId === "active-run" ? "is-selected" : ""}`}
-            onClick={() => onSelectDetail("active-run")}
-          >
-            <div>
-              <strong>{activeRunSummary}</strong>
-              <p>{activeRunDetail || `next: ${nextIntentLabel}`}</p>
-            </div>
-          </button>
-        </section>
-      ) : null}
+          <span className={`drawer-chip drawer-chip-${runtimePanelTone}`}>{activeRunChipLabel}</span>
+        </div>
+        <button
+          type="button"
+          className={`active-run-summary tone-${activeRunSummaryTone} ${selectedDetailId === "active-run" ? "is-selected" : ""}`}
+          onClick={() => onSelectDetail("active-run")}
+        >
+          <div>
+            <strong>{activeRunSummary}</strong>
+            <p>{activeRunDetail || `next: ${nextIntentLabel}`}</p>
+          </div>
+        </button>
+      </section>
 
       <section className="shell-card runtime-timeline-card">
         <div className="task-panel-head">
           <div>
             <p className="section-eyebrow">Timeline</p>
-            <h3>Run events</h3>
+            <h3>Recent activity</h3>
           </div>
           <span className="drawer-chip drawer-chip-idle">
             {hiddenRuntimeTimelineCount
@@ -2530,17 +2527,7 @@ function RuntimeWorkbench({
             ) : null}
           </div>
         </section>
-      ) : (
-        <section className="runtime-outputs-strip" aria-label="Outputs">
-          <div>
-            <p className="section-eyebrow">Outputs</p>
-            <h3>Artifacts</h3>
-          </div>
-          <span className="drawer-chip drawer-chip-active">
-            {`${runtimeOutputCards.length} visible`}
-          </span>
-        </section>
-      )}
+      ) : null}
     </>
   );
 }
@@ -2568,6 +2555,7 @@ function CommandBar({
   canUseCommandInput,
   onPrimaryAction,
   composerContextButtonLabel,
+  onRevise,
 }) {
   return (
     <div className="composer">
@@ -2632,14 +2620,9 @@ function CommandBar({
               {commandPrimaryLabel}
             </button>
             {canControl && supervisionState === "waitingApproval" ? (
-              <>
-                <button type="button" className="ghost-button">
-                  Revise
-                </button>
-                <button type="button" className="ghost-button">
-                  Evidence
-                </button>
-              </>
+              <button type="button" className="ghost-button" onClick={onRevise}>
+                Revise
+              </button>
             ) : null}
             {supervisionState === "idle" ? (
               <button
@@ -2710,14 +2693,8 @@ function InspectorPanel({
           <p>{inspectorImpact}</p>
           {canControl && hasPendingApproval ? (
             <div className="inspector-action-row">
-              <button type="button" className="primary-button" onClick={onApprove}>
-                Approve
-              </button>
-              <button type="button" className="ghost-button" onClick={onRevise}>
-                Revise
-              </button>
               <button type="button" className="ghost-button" onClick={onEvidence}>
-                Evidence
+                More
               </button>
             </div>
           ) : detailCanExpand ? (
@@ -2746,7 +2723,7 @@ function InspectorPanel({
           ) : null}
         </section>
 
-        {isHistoryDetail ? (
+        {!hasPendingApproval && !isHistoryDetail ? null : isHistoryDetail ? (
           <section className="inspector-evidence-card inspector-history-card">
             <div className="task-panel-head">
               <h3>{inspectorDetailHeading}</h3>
@@ -5222,16 +5199,7 @@ export default function App() {
       : hasVisibleRuntimeResult
         ? activeRuntimeVisibleResult.tone
       : "idle";
-  const showActiveRunCard =
-    runtimePanelState.error ||
-    runtimePanelLoading ||
-    supervisionState === "running" ||
-    supervisionState === "waitingApproval" ||
-    supervisionState === "blocked";
-  const effectiveSelectedDetailId =
-    !showActiveRunCard && selectedDetailId === "active-run" && visibleRuntimeTimelineItems[0]
-      ? `timeline:${visibleRuntimeTimelineItems[0].id}`
-      : selectedDetailId;
+  const effectiveSelectedDetailId = selectedDetailId;
   const isHistoryDetail = effectiveSelectedDetailId === "history";
   const selectedTimelineItem = !isHistoryDetail && effectiveSelectedDetailId.startsWith("timeline:")
     ? runtimeTimelineDisplayItems.find((item) => `timeline:${item.id}` === effectiveSelectedDetailId) ?? null
@@ -5247,8 +5215,13 @@ export default function App() {
     : selectedOutputCard
       ? "Output is available from the current managed run."
       : activeRunDetailText;
+  const selectedTimelineItemIsFailure = selectedTimelineItem
+    ? isActionableRuntimeFailure(selectedTimelineItem)
+    : false;
   const selectedPreviewDetailText = selectedTimelineItem
-    ? truncateInline(selectedRawDetailText, 260)
+    ? selectedTimelineItemIsFailure
+      ? selectedRawDetailText
+      : truncateInline(selectedRawDetailText, 260)
     : selectedOutputCard
       ? selectedRawDetailText
       : activeRuntimeVisibleResult.detail || truncateInline(activeRunDetailText, 260);
@@ -5256,6 +5229,7 @@ export default function App() {
     !hasPendingApproval &&
     !isHistoryDetail &&
     !selectedOutputCard &&
+    !selectedTimelineItemIsFailure &&
     compactText(selectedRawDetailText, 1) &&
     selectedRawDetailText.length > selectedPreviewDetailText.length + 12;
   const detailBodyText = detailCanExpand && detailExpanded
@@ -5355,7 +5329,7 @@ export default function App() {
       : ["No active run", "No pending checkpoint", "Task target missing"];
   const inspectorEyebrow = hasPendingApproval ? "Decision required" : "Detail";
   const inspectorDetailHeading = hasPendingApproval
-    ? "Evidence"
+    ? "Context"
     : isHistoryDetail
       ? "Older events"
       : "Selected context";
@@ -5669,7 +5643,6 @@ export default function App() {
             <div className="conversation-stack">
               {!(providerNeedsCodexLogin && !codexAuth.loggedIn) ? (
 	                <RuntimeWorkbench
-                    showActiveRunCard={showActiveRunCard}
 	                  activeRunTitle={activeRunTitle}
 	                  activeRunChipLabel={activeRunChipLabel}
 	                  runtimePanelTone={runtimePanelTone}
@@ -5852,6 +5825,7 @@ export default function App() {
             supervisionState={supervisionState}
             onPrimaryAction={handleCommandPrimaryAction}
             composerContextButtonLabel={composerContextButtonLabel}
+            onRevise={() => composerInputRef.current?.focus()}
           />
         </section>
 
@@ -5880,7 +5854,18 @@ export default function App() {
           canControl={hasManagedControl}
           onApprove={handleInspectorApprove}
           onRevise={() => composerInputRef.current?.focus()}
-          onEvidence={() => setInspectorTab("trace")}
+          onEvidence={() => {
+            const contextItem =
+              visibleRuntimeTimelineItems.find(
+                (item) => String(item?.approvalState ?? "") === "pending"
+              ) ?? visibleRuntimeTimelineItems[0];
+            setSelectedDetailId(
+              contextItem && contextItem.id !== "runtime-older-events"
+                ? `timeline:${contextItem.id}`
+                : "history"
+            );
+            setDetailExpanded(true);
+          }}
           canReturnToHistory={Boolean(lastHistoryDetailId && effectiveSelectedDetailId === lastHistoryDetailId)}
           onSelectHistoryItem={(item) => {
             const detailId = `timeline:${item.id}`;
