@@ -341,7 +341,7 @@ pub struct CodexLoginStatus {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ObservedCodexAgent {
+pub struct ObservedExternalAgent {
     pub id: String,
     pub pid: u32,
     pub cwd: String,

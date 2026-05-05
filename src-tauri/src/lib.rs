@@ -6,7 +6,7 @@ use crate::models::{
     ChatMessage, ChatSession, ChatStreamDoneEvent, ChatStreamStatusEvent, ChatStreamTokenEvent,
     CodexLoginProgressEvent, CodexLoginStatus, CommandFinishedEvent, CommandOutputEvent,
     ConnectionTestResult, ItemApprovalState, ManualImportResult, MessageAttachment,
-    ObservedCodexAgent,
+    ObservedExternalAgent,
     ProposalChooseResult, SessionInteractionMode, SessionRuntimeSnapshot, Settings,
     SettingsUpdate, TaskRecord, TaskStatus, ToolProposal, ToolProposalPayload, TurnIntent,
     TurnItem, TurnItemKind, TurnItemStatus, TurnRecord, TurnStatus, Workspace,
@@ -38,6 +38,9 @@ const SESSION_TAIL_SCAN_LINES: usize = 60;
 const SESSION_TAIL_SCAN_BYTES: usize = 24_000;
 const EXTERNAL_ACTIVITY_ACTIVE_MS: i64 = 60_000;
 const EXTERNAL_ACTIVITY_RECENT_MS: i64 = 600_000;
+const CODEX_EXEC_PROMPT_HISTORY_CHAR_BUDGET: usize = 24_000;
+const CODEX_EXEC_PROMPT_MESSAGE_CHAR_LIMIT: usize = 6_000;
+const CODEX_EXEC_PROMPT_LATEST_USER_CHAR_LIMIT: usize = 16_000;
 
 fn is_codex_auth_provider(provider: &str) -> bool {
     matches!(provider.trim(), "codex_cli" | "openai-codex")
@@ -89,7 +92,7 @@ pub fn run() {
             open_chatgpt_in_browser,
             codex_login_status,
             codex_login_start,
-            codex_running_agents,
+            running_agents,
             settings_get,
             settings_update,
             settings_test_connection,
@@ -346,16 +349,16 @@ fn codex_login_start(app: tauri::AppHandle, state: State<'_, SharedState>) -> Re
 }
 
 #[tauri::command]
-fn codex_running_agents(state: State<'_, SharedState>) -> Result<Vec<ObservedCodexAgent>, String> {
+fn running_agents(state: State<'_, SharedState>) -> Result<Vec<ObservedExternalAgent>, String> {
     let (workspaces, sessions) = state.read(|store| (store.workspaces.clone(), store.sessions.clone()));
-    discover_codex_processes(&workspaces, &sessions)
+    discover_external_agents(&workspaces, &sessions)
 }
 
 #[cfg(target_os = "linux")]
-fn discover_codex_processes(
+fn discover_external_agents(
     workspaces: &[Workspace],
     sessions: &[ChatSession],
-) -> Result<Vec<ObservedCodexAgent>, String> {
+) -> Result<Vec<ObservedExternalAgent>, String> {
     let entries = fs::read_dir("/proc").map_err(|err| format!("读取 /proc 失败：{err}"))?;
     let session_logs = discover_codex_session_jsonl_candidates();
     let mut agents = Vec::new();
@@ -375,10 +378,10 @@ fn discover_codex_processes(
         };
 
         let proc_path = entry.path();
-        let Some((command, is_codex)) = read_proc_cmdline(&proc_path) else {
+        let Some((command, is_observed)) = read_proc_cmdline(&proc_path) else {
             continue;
         };
-        if !is_codex {
+        if !is_observed {
             continue;
         }
 
@@ -419,8 +422,8 @@ fn discover_codex_processes(
         };
         let activity_state = derive_external_activity_state(last_activity_at, last_seen_at);
 
-        agents.push(ObservedCodexAgent {
-            id: format!("external-codex-{pid}"),
+        agents.push(ObservedExternalAgent {
+            id: format!("external-agent-{pid}"),
             pid,
             cwd,
             command,
@@ -447,72 +450,78 @@ fn discover_codex_processes(
 #[cfg(target_os = "linux")]
 fn discover_codex_session_jsonl_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    let Some(root) = codex_session_root() else {
-        return candidates;
-    };
 
-    let mut paths = Vec::new();
-    let year_dirs = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return candidates,
-    };
-
-    for year_dir in year_dirs.flatten() {
-        if !year_dir.path().is_dir() {
-            continue;
-        }
-        let month_dirs = match fs::read_dir(year_dir.path()) {
+    for root in external_session_roots() {
+        let mut paths = Vec::new();
+        let year_dirs = match fs::read_dir(&root) {
             Ok(entries) => entries,
             Err(_) => continue,
         };
-        for month_dir in month_dirs.flatten() {
-            if !month_dir.path().is_dir() {
+
+        for year_dir in year_dirs.flatten() {
+            if !year_dir.path().is_dir() {
                 continue;
             }
-            let day_dirs = match fs::read_dir(month_dir.path()) {
+            let month_dirs = match fs::read_dir(year_dir.path()) {
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
-            for day_dir in day_dirs.flatten() {
-                if !day_dir.path().is_dir() {
+            for month_dir in month_dirs.flatten() {
+                if !month_dir.path().is_dir() {
                     continue;
                 }
-                let files = match fs::read_dir(day_dir.path()) {
+                let day_dirs = match fs::read_dir(month_dir.path()) {
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
-                for file_entry in files.flatten() {
-                    let path = file_entry.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                for day_dir in day_dirs.flatten() {
+                    if !day_dir.path().is_dir() {
                         continue;
                     }
-                    let modified = match path.metadata().and_then(|meta| meta.modified()) {
-                        Ok(modified) => modified
-                            .duration_since(UNIX_EPOCH)
-                            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-                            .unwrap_or(0),
-                        Err(_) => 0,
+                    let files = match fs::read_dir(day_dir.path()) {
+                        Ok(entries) => entries,
+                        Err(_) => continue,
                     };
-                    paths.push((modified, path));
+                    for file_entry in files.flatten() {
+                        let path = file_entry.path();
+                        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                            continue;
+                        }
+                        let modified = match path.metadata().and_then(|meta| meta.modified()) {
+                            Ok(modified) => modified
+                                .duration_since(UNIX_EPOCH)
+                                .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+                                .unwrap_or(0),
+                            Err(_) => 0,
+                        };
+                        paths.push((modified, path));
+                    }
                 }
             }
         }
-    }
 
-    paths.sort_by(|left, right| right.0.cmp(&left.0));
-    for (_, path) in paths
-        .into_iter()
-        .take(EXTERNAL_CODEX_SESSION_SCAN_LIMIT)
-    {
-        candidates.push(path);
+        paths.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, path) in paths
+            .into_iter()
+            .take(EXTERNAL_CODEX_SESSION_SCAN_LIMIT)
+        {
+            candidates.push(path);
+        }
     }
     candidates
 }
 
 #[cfg(target_os = "linux")]
-fn codex_session_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(Path::new(&home).join(".codex").join("sessions"))
+fn external_session_roots() -> Vec<PathBuf> {
+    let home = match std::env::var("HOME") {
+        Ok(home) => home,
+        Err(_) => return Vec::new(),
+    };
+    let home = Path::new(&home);
+    vec![
+        home.join(".codex").join("sessions"),
+        home.join(".opencode").join("sessions"),
+    ]
 }
 
 #[cfg(target_os = "linux")]
@@ -847,10 +856,10 @@ fn normalize_cwd(cwd: &str) -> String {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn discover_codex_processes(
+fn discover_external_agents(
     _workspaces: &[Workspace],
     _sessions: &[ChatSession],
-) -> Result<Vec<ObservedCodexAgent>, String> {
+) -> Result<Vec<ObservedExternalAgent>, String> {
     Ok(Vec::new())
 }
 
@@ -871,8 +880,8 @@ fn read_proc_cmdline(proc_path: &Path) -> Option<(String, bool)> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(first_arg);
-    let is_codex = first_name == "codex";
-    Some((args.join(" "), is_codex))
+    let is_observed = first_name == "codex" || first_name == "opencode";
+    Some((args.join(" "), is_observed))
 }
 
 #[cfg(target_os = "linux")]
@@ -1987,7 +1996,7 @@ async fn process_chat_turn(
                 "You are ChatGPT in workspace-collaboration mode. \
                  The current turn explicitly uses the attached workspace as context. \
                  Be direct, concrete, and task-focused. \
-                 Inspect relevant files first and reference the files you actually looked at. \
+                 Inspect the smallest relevant file set only when workspace-specific evidence is needed, and reference the files you actually looked at. \
                  Do not give generic placeholder templates when workspace-specific analysis is expected. \
                  Use the available workspace context when needed, but keep the human in control: frame file changes or command execution as suggestions or previews unless they are explicitly confirmed."
                     .to_string()
@@ -2068,6 +2077,17 @@ async fn process_chat_turn(
     };
 
     let mut generated_proposals = Vec::new();
+    if settings.provider != "codex_cli" {
+        // Collect proposals created during the openai tool loop above
+        generated_proposals = state.read(|store| {
+            store
+                .proposals
+                .iter()
+                .filter(|p| p.session_id == session_id && p.status == "pending")
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    }
     if settings.provider == "codex_cli" {
         let raw_reply = visible_reply.clone();
         visible_reply = strip_manual_reply_blocks(&raw_reply).trim().to_string();
@@ -2147,6 +2167,15 @@ async fn process_chat_turn(
                 generated_proposals.len()
             )
         };
+    } else if !generated_proposals.is_empty()
+        && (visible_reply.contains("改动完成")
+            || visible_reply.contains("已修改")
+            || visible_reply.contains(" done "))
+    {
+        visible_reply = format!(
+            "我整理了 {} 条建议，已经放到主区卡片里，等你确认。",
+            generated_proposals.len()
+        );
     }
 
     if !reply_streamed_live {
@@ -2749,6 +2778,20 @@ async fn run_codex_chat_turn_streaming(
             };
             if error.contains("Please run `codex login`") || error.contains("logged in") {
                 error = "未登录 ChatGPT，请先点击“登录 ChatGPT”。".to_string();
+            } else if error.contains("Missing scopes") || error.contains("api.responses.write") {
+                error = format!(
+                    "权限不足: OpenAI API Key 缺少 api.responses.write 权限。\
+                    请到 OpenAI Platform 创建/更换一个有 Responses write 权限的项目 API key，\
+                    或为受限 key 添加该权限，并确认组织角色至少为 Member/Owner。\
+                    原始错误: {}",
+                    if error.len() > 200 { &error[..200] } else { &error }
+                );
+            } else if error.to_ascii_lowercase().contains("api key") && error.to_ascii_lowercase().contains("invalid") {
+                error = format!(
+                    "API Key 无效: 请检查 OPENAI_API_KEY 环境变量是否正确设置，\
+                    或与 Solo 设置中配置的 key 是否一致。原始错误: {}",
+                    if error.len() > 200 { &error[..200] } else { &error }
+                );
             }
             let _ = upsert_codex_turn_status_update(
                 &state_for_status,
@@ -3092,6 +3135,33 @@ fn summarize_command_execution(command: &str) -> String {
 fn classify_codex_cli_stderr(line: &str) -> Option<(String, String, String, bool)> {
     let lower = line.to_ascii_lowercase();
 
+    if lower.contains("missing scopes") || lower.contains("api.responses.write") {
+        return Some((
+            "权限".to_string(),
+            "OpenAI API Key 缺少 api.responses.write 权限。请到 OpenAI Platform 创建/更换一个有 Responses write 权限的 project API key，或为 restricted key 添加 api.responses.write 权限。确认组织角色不是 Reader（至少 Member/Owner）。".to_string(),
+            "error".to_string(),
+            true,
+        ));
+    }
+
+    if lower.contains("api key") && (lower.contains("invalid") || lower.contains("unauthorized")) {
+        return Some((
+            "权限".to_string(),
+            "API Key 无效或未授权。请检查 OPENAI_API_KEY 是否已在环境中正确设置，或与 Solo 设置中的 key 是否一致。".to_string(),
+            "error".to_string(),
+            true,
+        ));
+    }
+
+    if lower.contains("insufficient_quota") || lower.contains("billing") || lower.contains("rate limit") {
+        return Some((
+            "资源".to_string(),
+            format!("配额/计费问题: {}", summarize_status_text(line, 80)),
+            "error".to_string(),
+            true,
+        ));
+    }
+
     if lower.contains("timeout waiting for child process to exit") {
         return Some((
             "连接".to_string(),
@@ -3262,7 +3332,7 @@ fn build_codex_exec_prompt(
             .to_string(),
         TurnExecutionMode::Agent => "你是 ChatGPT。当前是工作区协作模式。输出规则：\
              1) 默认用简洁中文，先给结论，再补关键依据；\
-             2) 这一轮已经明确允许结合当前工作区协作，所以先查看相关文件，再回答，并明确提到你看了哪些文件；\
+             2) 这一轮已经明确允许结合当前工作区协作，但只在需要仓库证据时读取最小范围相关文件，并明确提到你看了哪些文件；\
              3) 优先给基于当前工作区的建议、选项、权衡和预览；\
              4) 不要在工作区协作模式下给脱离仓库的空泛模板，除非用户明确说只要通用示例；\
              5) 涉及写文件、执行命令或其他副作用动作时，不要默认替用户执行，应把决策权交给用户；\
@@ -3355,26 +3425,100 @@ fn build_codex_exec_prompt(
     }
     lines.push("以下是当前对话上下文：".to_string());
 
-    for message in messages {
-        let role = match message.role.as_str() {
-            "user" => "User",
-            "assistant" => "Assistant",
-            _ => continue,
-        };
-        let content = message
-            .content
-            .as_ref()
-            .map(|entry| entry.trim())
-            .filter(|entry| !entry.is_empty())
-            .unwrap_or("");
-        if content.is_empty() {
-            continue;
-        }
-        lines.push(format!("\n[{role}]\n{content}"));
+    let prompt_messages = bounded_codex_prompt_messages(messages);
+    if prompt_messages.omitted_count > 0 {
+        lines.push(format!(
+            "为控制输入 token，已省略更早的 {} 条历史消息；优先保留最近上下文和最后一条用户请求。",
+            prompt_messages.omitted_count
+        ));
+    }
+    for message in prompt_messages.messages {
+        lines.push(format!("\n[{}]\n{}", message.role, message.content));
     }
 
     lines.push("\n请继续回答最后一条 User 消息。".to_string());
     lines.join("\n")
+}
+
+struct BoundedPromptMessage {
+    role: &'static str,
+    content: String,
+}
+
+struct BoundedPromptMessages {
+    messages: Vec<BoundedPromptMessage>,
+    omitted_count: usize,
+}
+
+fn bounded_codex_prompt_messages(messages: &[CompletionMessage]) -> BoundedPromptMessages {
+    let normalized = messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role.as_str() {
+                "user" => "User",
+                "assistant" => "Assistant",
+                _ => return None,
+            };
+            let content = message
+                .content
+                .as_ref()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.is_empty())?;
+            Some((role, content))
+        })
+        .collect::<Vec<_>>();
+
+    let latest_user_index = normalized
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (role, _))| *role == "User")
+        .map(|(index, _)| index);
+
+    let mut selected = Vec::new();
+    let mut omitted_count = 0;
+    let mut used_chars = 0;
+
+    for (index, (role, content)) in normalized.iter().enumerate().rev() {
+        let is_latest_user = Some(index) == latest_user_index;
+        let limit = if is_latest_user {
+            CODEX_EXEC_PROMPT_LATEST_USER_CHAR_LIMIT
+        } else {
+            CODEX_EXEC_PROMPT_MESSAGE_CHAR_LIMIT
+        };
+        let bounded_content = truncate_codex_prompt_text(content, limit);
+        let char_count = bounded_content.chars().count();
+
+        if is_latest_user || used_chars + char_count <= CODEX_EXEC_PROMPT_HISTORY_CHAR_BUDGET {
+            used_chars += char_count;
+            selected.push(BoundedPromptMessage {
+                role: *role,
+                content: bounded_content,
+            });
+        } else {
+            omitted_count += 1;
+        }
+    }
+
+    selected.reverse();
+    BoundedPromptMessages {
+        messages: selected,
+        omitted_count,
+    }
+}
+
+fn truncate_codex_prompt_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let head_chars = max_chars.saturating_sub(96);
+    let head = text.chars().take(head_chars).collect::<String>();
+    format!(
+        "{head}\n\n[Solo omitted {} chars from this message to keep Codex input bounded.]",
+        char_count.saturating_sub(head_chars)
+    )
 }
 
 fn workspace_collab_prefers_structured_preview(input: &str) -> bool {

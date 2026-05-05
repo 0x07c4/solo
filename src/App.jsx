@@ -325,14 +325,14 @@ function normalizeRuntimeSnapshot(snapshot, sessionId = "") {
   };
 }
 
-function normalizeObservedCodexAgents(value) {
+function normalizeObservedExternalAgents(value) {
   if (!Array.isArray(value)) {
     return [];
   }
   return value
     .filter((agent) => agent && typeof agent === "object")
-    .map((agent) => ({
-      id: typeof agent.id === "string" && agent.id.trim() ? agent.id : `external-codex-${agent.pid ?? "unknown"}`,
+        .map((agent) => ({
+      id: typeof agent.id === "string" && agent.id.trim() ? agent.id : `external-agent-${agent.pid ?? "unknown"}`,
       pid: Number.isFinite(agent.pid) ? agent.pid : 0,
       cwd: typeof agent.cwd === "string" && agent.cwd.trim() ? agent.cwd : "unknown",
       command: typeof agent.command === "string" ? agent.command : "",
@@ -377,7 +377,7 @@ function normalizeObservedCodexAgents(value) {
     }));
 }
 
-function codexAgentTone(agent) {
+function externalAgentTone(agent) {
   if (agent?.state === "running") {
     return "active";
   }
@@ -771,32 +771,44 @@ function projectionCapabilityLabel(capability) {
   return "managed";
 }
 
-function ExternalAgentResourceCard({ agent, workspace, current, onInspect }) {
+function ExternalAgentResourceCard({ agent, workspace, current, onInspect, onAttach, isAttached, canAttach }) {
   const activityLabel = agent.projection?.activityState || compactAgentActivityState(agent);
   const lastEventLabel = compactText(agent.lastEventSummary || agent.lastEventType || "No recent event", 48);
 
   return (
-    <button
-      type="button"
-      className={`external-resource-agent-card ${current ? "is-current" : ""}`}
-      onClick={() => onInspect(agent.id)}
-      aria-label={`Inspect external Codex session for ${workspace?.name ?? "untracked workspace"}`}
-    >
+    <div className={`external-resource-agent-card ${current ? "is-current" : ""}`}>
+      <button
+        type="button"
+        className="external-agent-surface"
+        onClick={() => onInspect(agent.id)}
+        aria-label={`Inspect external agent session for ${workspace?.name ?? "untracked workspace"}`}
+      >
       <div className="external-resource-agent-head">
         <div>
-          <span className="section-eyebrow">External Codex</span>
+          <span className="section-eyebrow">External Agent</span>
           <strong>{workspace?.name ?? "Untracked workspace"}</strong>
         </div>
-        <span className={`drawer-chip drawer-chip-${codexAgentTone(agent)}`}>
+        <span className={`drawer-chip drawer-chip-${externalAgentTone(agent)}`}>
           {activityLabel}
         </span>
       </div>
       <div className="external-agent-meta">
         <span>observe-only</span>
-        <span>{workspace ? "linked" : "untracked"}</span>
+        <span>{isAttached ? "attached to task" : workspace ? "linked" : "untracked"}</span>
       </div>
       <p>{lastEventLabel}</p>
-    </button>
+      </button>
+      {canAttach && !isAttached && onAttach ? (
+        <button
+          type="button"
+          className="ghost-button attach-agent-button"
+          onClick={(e) => { e.stopPropagation(); onAttach(agent.id); }}
+          aria-label="Attach this agent to the current task"
+        >
+          Attach to task
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2103,6 +2115,9 @@ function WorkstreamRail({
   untrackedExternalAgents,
   selectedObservedAgentId,
   onInspectExternalAgent,
+  onAttachExternalAgent,
+  attachedAgentIds,
+  canAttachAgents,
   explorerOpen,
   setExplorerOpen,
   activeWorkspace,
@@ -2113,33 +2128,6 @@ function WorkstreamRail({
   externalProjectionAgents,
 }) {
   const externalAgentsForDisplay = externalProjectionAgents ?? [];
-  const renderWorkstreamGroup = (label, entries, emptyLabel, emptyTone) => (
-    <section className="workstream-group">
-      <div className="workstream-group-head">
-        <span className="section-eyebrow">{label}</span>
-        <span className="section-count">{entries.length}</span>
-      </div>
-      {entries.length ? (
-        <div className="session-list">
-          {entries.map((entry) => (
-            <WorkstreamCard
-              key={entry.id}
-              entry={entry}
-              active={entry.id === activeSessionId}
-              onSelect={onSelectSession}
-              onDelete={onDeleteSession}
-              deletingDisabled={chatSending && entry.id === activeSessionId}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="panel-collapsed-note">
-          <EmptyVisual label={emptyLabel} tone={emptyTone} />
-        </div>
-      )}
-    </section>
-  );
-
   return (
     <aside className="sidebar">
       <section className="panel-block panel-sessions">
@@ -2155,10 +2143,37 @@ function WorkstreamRail({
             New
           </button>
         </div>
-        <div className="workstream-groups">
-          {renderWorkstreamGroup("Active", activeWorkstreamEntries, "No active workstreams", "active")}
-          {renderWorkstreamGroup("Waiting", waitingWorkstreamEntries, "No waiting workstreams", "loading")}
-          {renderWorkstreamGroup("Done", doneWorkstreamEntries, "No completed workstreams", "ready")}
+        <div className="session-panel-list">
+          {[
+            { label: "Active", entries: activeWorkstreamEntries, empty: "No active workstreams", tone: "active" },
+            { label: "Waiting", entries: waitingWorkstreamEntries, empty: "No waiting workstreams", tone: "loading" },
+            { label: "Done", entries: doneWorkstreamEntries, empty: "No completed workstreams", tone: "ready" },
+          ].map((group) => (
+            <div key={group.label} className="session-group">
+              <div className="session-group-head">
+                <span className="section-eyebrow">{group.label}</span>
+                <span className="section-count">{group.entries.length}</span>
+              </div>
+              {group.entries.length ? (
+                <div className="session-list">
+                  {group.entries.map((entry) => (
+                    <WorkstreamCard
+                      key={entry.id}
+                      entry={entry}
+                      active={entry.id === activeSessionId}
+                      onSelect={onSelectSession}
+                      onDelete={onDeleteSession}
+                      deletingDisabled={chatSending && entry.id === activeSessionId}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="panel-collapsed-note">
+                  <EmptyVisual label={group.empty} tone={group.tone} />
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       </section>
 
@@ -2212,7 +2227,7 @@ function WorkstreamRail({
           <div className="workspace-list">
             {observedCodexState.error ? (
               <div className="resource-inline-error">
-                <strong>External Codex scan failed</strong>
+                <strong>External agent scan failed</strong>
                 <span>{observedCodexState.error}</span>
               </div>
             ) : null}
@@ -2252,14 +2267,17 @@ function WorkstreamRail({
                   </button>
 	                  {workspaceAgents.length ? (
 	                    <div className="workspace-agent-stack">
-	                      {workspaceAgents.slice(0, 2).map((agent) => (
-	                        <ExternalAgentResourceCard
-	                          key={agent.id}
-	                          agent={agent}
-	                          workspace={workspace}
-	                          current={agent.id === selectedObservedAgentId}
-	                          onInspect={onInspectExternalAgent}
-	                        />
+ 	                      {workspaceAgents.slice(0, 2).map((agent) => (
+ 	                        <ExternalAgentResourceCard
+ 	                          key={agent.id}
+ 	                          agent={agent}
+ 	                          workspace={workspace}
+ 	                          current={agent.id === selectedObservedAgentId}
+ 	                          onInspect={onInspectExternalAgent}
+ 	                          onAttach={onAttachExternalAgent}
+ 	                          isAttached={attachedAgentIds.includes(agent.id)}
+ 	                          canAttach={canAttachAgents}
+ 	                        />
 	                      ))}
 	                    </div>
 	                  ) : null}
@@ -2272,14 +2290,17 @@ function WorkstreamRail({
                   <span className="section-eyebrow">Untracked</span>
                   <span className="section-count">{untrackedExternalAgents.length}</span>
                 </div>
-	                {untrackedExternalAgents.slice(0, 1).map((agent) => (
-	                  <ExternalAgentResourceCard
-	                    key={agent.id}
-	                    agent={agent}
-	                    workspace={null}
-	                    current={agent.id === selectedObservedAgentId}
-	                    onInspect={onInspectExternalAgent}
-	                  />
+ 	                {untrackedExternalAgents.slice(0, 1).map((agent) => (
+ 	                  <ExternalAgentResourceCard
+ 	                    key={agent.id}
+ 	                    agent={agent}
+ 	                    workspace={null}
+ 	                    current={agent.id === selectedObservedAgentId}
+ 	                    onInspect={onInspectExternalAgent}
+ 	                    onAttach={onAttachExternalAgent}
+ 	                    isAttached={attachedAgentIds.includes(agent.id)}
+ 	                    canAttach={canAttachAgents}
+ 	                  />
 	                ))}
 	              </div>
 	            ) : null}
@@ -2289,9 +2310,9 @@ function WorkstreamRail({
             <EmptyVisual
               label={
                 observedCodexState.error
-                  ? "External Codex scan failed"
+                  ? "External agent scan failed"
                   : observedCodexState.loading
-                    ? "Scanning external Codex"
+                    ? "Scanning external agents"
                     : "No resources"
               }
               tone={observedCodexState.error ? "error" : observedCodexState.loading ? "loading" : "idle"}
@@ -2667,8 +2688,6 @@ function InspectorPanel({
   inspectorDetailHeading,
   inspectorEvidence,
   canControl,
-  onApprove,
-  onRevise,
   onEvidence,
   onSelectHistoryItem,
   onBackToLatest,
@@ -2758,9 +2777,20 @@ function InspectorPanel({
           <section className="inspector-evidence-card">
             <h3>{inspectorDetailHeading}</h3>
             <div className="inspector-evidence-list">
-              {inspectorEvidence.map((item, index) => (
-                <p key={`${index}-${item}`}>{item}</p>
-              ))}
+              {inspectorEvidence.map((item, index) => {
+                const isDiff = typeof item === 'string' && (
+                  item.startsWith("---") ||
+                  item.includes("\n") ||
+                  item.includes("@@ ") ||
+                  item.includes("--- ") ||
+                  item.includes("+++ ")
+                );
+                return isDiff ? (
+                  <pre key={`${index}-pre`} className="inspector-evidence-pre">{item}</pre>
+                ) : (
+                  <p key={`${index}-text`}>{item}</p>
+                );
+              })}
             </div>
           </section>
         )}
@@ -3032,14 +3062,14 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
-    const loadObservedCodexAgents = async () => {
+    const loadObservedExternalAgents = async () => {
       setObservedCodexState((current) => ({
         ...current,
         loading: current.agents.length === 0,
         error: "",
       }));
       try {
-        const agents = normalizeObservedCodexAgents(await desktop.codexRunningAgents());
+        const agents = normalizeObservedExternalAgents(await desktop.runningAgents());
         if (cancelled) {
           return;
         }
@@ -3060,8 +3090,8 @@ export default function App() {
       }
     };
 
-    void loadObservedCodexAgents();
-    const timer = window.setInterval(() => void loadObservedCodexAgents(), CODEX_AGENT_POLL_INTERVAL_MS);
+    void loadObservedExternalAgents();
+    const timer = window.setInterval(() => void loadObservedExternalAgents(), CODEX_AGENT_POLL_INTERVAL_MS);
 
     return () => {
       cancelled = true;
@@ -3121,6 +3151,8 @@ export default function App() {
   const [windowMaximized, setWindowMaximized] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [, setInspectorTab] = useState("trace");
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [taskExternalAgentAttachments, setTaskExternalAgentAttachments] = useState({});
 
   useEffect(() => {
     setSelectedDetailId("active-run");
@@ -3128,8 +3160,9 @@ export default function App() {
   }, [activeSessionId]);
 
   useEffect(() => {
+    setSelectedTaskId("");
     setDetailExpanded(false);
-  }, [activeSessionId, selectedDetailId]);
+  }, [activeSessionId]);
 
   useEffect(() => {
     setHistoryPageIndex(0);
@@ -3183,8 +3216,18 @@ export default function App() {
   );
   const activeRuntimeTask = useMemo(() => {
     const tasks = activeRuntimeSnapshot.tasks ?? [];
-    return tasks[0] ?? null;
-  }, [activeRuntimeSnapshot]);
+    if (selectedTaskId && tasks.length) {
+      return tasks.find((task) => task.id === selectedTaskId) ?? tasks[0] ?? null;
+    }
+    const first = tasks[0] ?? null;
+    return first;
+  }, [activeRuntimeSnapshot, selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTaskId && activeRuntimeTask?.id) {
+      setSelectedTaskId(activeRuntimeTask.id);
+    }
+  }, [activeRuntimeTask?.id, selectedTaskId]);
   const activeRuntimeTurn = useMemo(() => {
     const turns = activeRuntimeSnapshot.turns ?? [];
     if (!turns.length) {
@@ -3201,9 +3244,7 @@ export default function App() {
     if (!activeRuntimeTurn?.id) {
       return [];
     }
-    return (activeRuntimeSnapshot.turnItems ?? []).filter(
-      (item) => item.turnId === activeRuntimeTurn.id
-    );
+    return activeRuntimeSnapshot.turnItems ?? [];
   }, [activeRuntimeSnapshot, activeRuntimeTurn]);
   const sessionRuntimeSummaries = useMemo(
     () =>
@@ -4166,6 +4207,19 @@ export default function App() {
     setInspectorTab("trace");
   };
 
+  const handleAttachExternalAgent = (agentId) => {
+    if (!selectedTaskId) return;
+    setTaskExternalAgentAttachments((current) => {
+      const existing = current[selectedTaskId] ?? [];
+      if (existing.includes(agentId)) return current;
+      return { ...current, [selectedTaskId]: [...existing, agentId] };
+    });
+  };
+
+  const attachedAgentIdsForCurrentTask = selectedTaskId
+    ? (taskExternalAgentAttachments[selectedTaskId] ?? [])
+    : [];
+
   const handleDeleteSession = async (sessionId) => {
     const targetSession = sessions.find((entry) => entry.id === sessionId);
     if (!targetSession) {
@@ -4821,7 +4875,7 @@ export default function App() {
       runtimeFailedCount
   );
   const hasManagedWorkstream = sessions.length > 0;
-  const shouldShowExternalAsPrimary = !hasManagedWorkstream && !hasManagedRuntimeSignal;
+  const shouldShowExternalAsPrimary = !hasManagedWorkstream && !hasManagedRuntimeSignal && !selectedTaskId;
   const activeObservedAgent = shouldShowExternalAsPrimary
     ? selectedObservedAgent ?? soloProjection.primaryExternal
     : null;
@@ -4894,7 +4948,7 @@ export default function App() {
           status: "pending",
           approvalState: "notRequired",
           title: "Read-only boundary",
-          summary: "External Codex sessions can be observed, not controlled.",
+          summary: "External agent sessions can be observed, not controlled.",
           createdAt: activeObservedAgent.lastSeenAt,
           updatedAt: activeObservedAgent.lastSeenAt,
         },
@@ -4974,35 +5028,37 @@ export default function App() {
         updatedAt: message?.updatedAt ?? message?.createdAt ?? null,
       };
     });
-  const runtimeTimelineDisplayItems = isObservingExternal
-    ? observedTimelineItems
-    : runtimeTimelineItems.length
-    ? [runtimeAssistantTimelineItem, runtimeMonitorTimelineItem, ...runtimeTimelineItems].filter(Boolean)
-    : sessionMessageTimelineItems.length
-      ? [runtimeMonitorTimelineItem, ...sessionMessageTimelineItems].filter(Boolean)
-    : [
-        runtimeMonitorTimelineItem,
-        {
-          id: "fallback-task-target",
-          kind: "summary",
-          status: "pending",
-          approvalState: "notRequired",
-          title: "Task target missing",
-          summary: "Create a task to start a managed run.",
-          createdAt: null,
-          updatedAt: null,
-        },
-        {
-          id: "fallback-no-run",
-          kind: "statusUpdate",
-          status: "pending",
-          approvalState: "notRequired",
-          title: "No active run",
-          summary: "Solo is waiting for a concrete target.",
-          createdAt: null,
-          updatedAt: null,
-        },
-      ].filter(Boolean);
+  const runtimeTimelineDisplayItems = [
+    ...(isObservingExternal && !selectedTaskId
+      ? observedTimelineItems
+      : runtimeTimelineItems.length
+      ? [runtimeAssistantTimelineItem, runtimeMonitorTimelineItem, ...runtimeTimelineItems].filter(Boolean)
+      : sessionMessageTimelineItems.length
+        ? [runtimeMonitorTimelineItem, ...sessionMessageTimelineItems].filter(Boolean)
+      : [
+          runtimeMonitorTimelineItem,
+          {
+            id: "fallback-task-target",
+            kind: "summary",
+            status: "pending",
+            approvalState: "notRequired",
+            title: "Task target missing",
+            summary: "Create a task to start a managed run.",
+            createdAt: null,
+            updatedAt: null,
+          },
+          {
+            id: "fallback-no-run",
+            kind: "statusUpdate",
+            status: "pending",
+            approvalState: "notRequired",
+            title: "No active run",
+            summary: "Solo is waiting for a concrete target.",
+            createdAt: null,
+            updatedAt: null,
+          },
+        ].filter(Boolean)),
+  ];
   const runtimePriorityTimelineItems = [
     ...runtimeTimelineDisplayItems.filter(isActionableRuntimeFailure),
     ...runtimeTimelineDisplayItems.filter(
@@ -5026,6 +5082,20 @@ export default function App() {
         isRuntimeStatusOnlyItem(item)
     ),
   ];
+  const pendingCheckpointItem =
+    runtimePriorityTimelineItems.find(
+      (item) =>
+        String(item?.approvalState ?? "").toLowerCase() === "pending" ||
+        String(item?.status ?? "").toLowerCase() === "waitinguser"
+    ) ?? null;
+  const pendingCheckpointTitle =
+    pendingCheckpointItem?.title || activeDecisionPreviewOption?.title || selectedChoiceLabel || "Decision required";
+  const pendingCheckpointSummary =
+    pendingCheckpointItem?.summary ||
+    pendingCheckpointItem?.content ||
+    activeDecisionPreviewOption?.summary ||
+    selectedDecisionOption?.summary ||
+    "Review the proposed direction before Codex continues.";
   const runtimeWorkstreamLabel =
     isObservingExternal
       ? `${compactAgentVisibilityLabel(activeObservedAgent)} · observe-only`
@@ -5053,15 +5123,15 @@ export default function App() {
       ? "Observe-only target selected. Enter a task to start a new managed run."
       : "Enter a task to create a managed run.";
   const supervisionState = hasManagedControl
-    ? hasCurrentTurnAssistantResult
-      ? "idle"
+    ? hasPendingApproval
+      ? "waitingApproval"
+      : hasCurrentTurnAssistantResult
+        ? "idle"
       : runtimeExceptionCount > 0
-      ? "blocked"
-      : hasPendingApproval
-        ? "waitingApproval"
-        : managedRuntimeProjection.activityState === "running"
-          ? "running"
-          : "idle"
+        ? "blocked"
+      : managedRuntimeProjection.activityState === "running"
+        ? "running"
+        : "idle"
     : "idle";
   const shouldInspectExternal =
     isInspectingExternal && !hasPendingApproval && supervisionState !== "blocked";
@@ -5081,15 +5151,19 @@ export default function App() {
     ? "error"
     : runtimePanelLoading
       ? "loading"
+      : hasPendingApproval
+        ? "waiting"
       : hasCurrentTurnAssistantResult
         ? "idle"
       : isObservingExternal
         ? projectionRuntimeStatusLabel(activeObservedProjection.activityState)
         : projectionRuntimeStatusLabel(managedRuntimeProjection.activityState);
   const nextIntentLabel = hasManagedControl
-    ? projectionNextIntentChipLabel(resolvedManagedIntent)
+    ? hasPendingApproval
+      ? "approve"
+      : projectionNextIntentChipLabel(resolvedManagedIntent)
     : "inspect";
-  const runtimeTimelineBudget = isObservingExternal ? 2 : 6;
+  const runtimeTimelineBudget = isObservingExternal ? 2 : 12;
   const shouldFoldRuntimeTimeline = runtimePriorityTimelineItems.length > runtimeTimelineBudget;
   const primaryRuntimeTimelineItems = runtimePriorityTimelineItems.slice(
     0,
@@ -5135,6 +5209,9 @@ export default function App() {
       title: card.title || "Preview",
       meta: card.relativePath || card.kind || "preview",
       tone: card.status === "failed" ? "error" : "approval",
+      kind: card.kind || "preview",
+      diffText: card.diffText || "",
+      relativePath: card.relativePath || "",
     })),
     ...(filePreview
       ? [
@@ -5175,24 +5252,35 @@ export default function App() {
         activeObservedAgent.lastEventSummary || activeObservedAgent.lastEventType || "No recent session event.",
         96
       )
-    : activeRuntimeVisibleResult.title;
+    : hasPendingApproval
+      ? pendingCheckpointTitle
+      : activeRuntimeVisibleResult.title;
   const activeRunDetail = isObservingExternal
     ? `visibility: ${compactAgentVisibilityLabel(activeObservedAgent)} · control: observe-only`
-    : activeRuntimeVisibleResult.detail;
+    : hasPendingApproval
+      ? pendingCheckpointSummary
+      : activeRuntimeVisibleResult.detail;
   const activeRunFullDetail = isObservingExternal
     ? activeRunDetail
     : activeRuntimeVisibleResult.fullDetail || activeRunDetail;
   const activeRunTitle = isObservingExternal
-    ? "Observed Codex session"
-    : activeRuntimeTurn
-      ? "Managed Codex run"
-      : hasVisibleRuntimeResult
-        ? "Latest Codex result"
-      : "No active run";
-  const activeRunChipLabel = isObservingExternal ? "observe-only" : "managed";
+    ? "Observed agent session"
+    : hasPendingApproval
+      ? "Checkpoint needs decision"
+      : activeRuntimeTurn && selectedTaskId
+        ? `Task: ${compactText(activeRuntimeTask?.title || "Untitled task", 48)}`
+        : activeRuntimeTurn
+          ? "Managed run"
+          : hasVisibleRuntimeResult
+            ? "Latest result"
+            : "No active run";
+  const activeRunChipLabel = isObservingExternal ? "observe-only" : hasPendingApproval ? "approval"
+    : selectedTaskId ? "managed" : "idle";
   const activeRunSummaryTone = isObservingExternal
     ? projectionToTone(activeObservedProjection.activityState)
-    : activeRuntimeTurn
+    : hasPendingApproval
+      ? "approval"
+      : activeRuntimeTurn
       ? runtimeExceptionCount > 0
         ? "error"
         : activeRuntimeVisibleResult.tone
@@ -5213,7 +5301,7 @@ export default function App() {
       selectedTimelineItem.summary ||
       "Event detail is captured in the runtime timeline."
     : selectedOutputCard
-      ? "Output is available from the current managed run."
+      ? (selectedOutputCard.diffText || "Output is available from the current managed run.")
       : activeRunDetailText;
   const selectedTimelineItemIsFailure = selectedTimelineItem
     ? isActionableRuntimeFailure(selectedTimelineItem)
@@ -5238,7 +5326,9 @@ export default function App() {
   const detailPanelTitle = selectedTimelineItem
     ? selectedTimelineItem.title || turnItemKindLabel(selectedTimelineItem.kind)
     : selectedOutputCard
-      ? selectedOutputCard.title
+      ? selectedOutputCard.relativePath
+        ? `${selectedOutputCard.title} (${selectedOutputCard.relativePath})`
+        : selectedOutputCard.title || "Artifact"
       : isHistoryDetail
         ? "History"
       : selectedDetailId === "outputs"
@@ -5293,9 +5383,9 @@ export default function App() {
             : []),
         ];
   const inspectorTitle = hasPendingApproval
-    ? "Checkpoint · direction approval"
+    ? pendingCheckpointTitle
     : shouldInspectExternal
-      ? "External Codex"
+      ? "External Agent"
       : hasManagedControl
       ? detailPanelTitle
       : "No checkpoint selected";
@@ -5307,21 +5397,29 @@ export default function App() {
       ? detailPanelStatus
       : "Idle";
   const inspectorQuestion = hasPendingApproval
-    ? "Accept current direction?"
+    ? "Approve or revise?"
     : shouldInspectExternal
       ? "Review observed external run?"
       : hasManagedControl
       ? detailPanelSummary
       : "Describe the next task target.";
   const inspectorImpact = hasPendingApproval
-    ? "Impact: next phase can continue after approval"
+    ? "Impact: Codex remains paused until you decide."
     : shouldInspectExternal
       ? "Impact: observe-only, controls disabled"
       : hasManagedControl
       ? detailPanelImpact
       : "Impact: no managed runtime changes until a task is created.";
   const inspectorEvidence = hasPendingApproval
-    ? ["Decision pending", "Preview available", "Runtime unchanged"]
+    ? [
+        pendingCheckpointSummary,
+        `source: ${pendingCheckpointItem ? turnItemKindLabel(pendingCheckpointItem.kind) : "preview"}`,
+        ...(selectedOutputCard?.diffText ? [
+          "--- DIFF ---",
+          selectedOutputCard.diffText,
+        ] : []),
+        "action: use the command bar to approve or revise",
+      ]
     : shouldInspectExternal
       ? inspectedObservedProjection.evidence
       : hasManagedControl
@@ -5445,7 +5543,6 @@ export default function App() {
 
     let targetSessionId = activeSessionId;
     let targetWorkspaceId = activeSessionWorkspaceId;
-    let targetSessionMode = activeSessionMode;
 
     if (!targetSessionId) {
       try {
@@ -5454,41 +5551,26 @@ export default function App() {
           session = await desktop.workspaceSelect(session.id, activeWorkspaceId);
         }
         setSessions((current) => upsertSession(current, session));
+        setSelectedObservedAgentId("");
+        setActiveSessionId(session.id);
         targetSessionId = session.id;
         targetWorkspaceId = session.workspaceId ?? "";
-        targetSessionMode = normalizeSessionMode(session.interactionMode);
-        setActiveSessionId(session.id);
-        setActiveWorkspaceId(session.workspaceId ?? "");
       } catch (error) {
         setNotice({ kind: "error", text: normalizeError(error) });
         return;
       }
     }
 
-    setSelectedObservedAgentId("");
-
-    if (targetWorkspaceId) {
-      if (targetSessionMode !== SESSION_MODE_WORKSPACE) {
-        try {
-          const updated = await desktop.sessionModeSet(targetSessionId, SESSION_MODE_WORKSPACE);
-          setSessions((current) => upsertSession(current, updated));
-        } catch (error) {
-          setNotice({ kind: "error", text: normalizeError(error) });
-          return;
-        }
-      }
-      void handleSend({
-        sessionId: targetSessionId,
-        interactionMode: SESSION_MODE_WORKSPACE,
-        turnIntent: TURN_INTENT_AUTO,
-      });
-      return;
-    }
+    const requestedInteractionMode = targetWorkspaceId
+      ? SESSION_MODE_WORKSPACE
+      : SESSION_MODE_CONVERSATION;
+    const requestedTurnIntent =
+      turnIntentBySession[targetSessionId] ?? TURN_INTENT_AUTO;
 
     void handleSend({
       sessionId: targetSessionId,
-      interactionMode: SESSION_MODE_CONVERSATION,
-      turnIntent: TURN_INTENT_AUTO,
+      interactionMode: requestedInteractionMode,
+      turnIntent: requestedTurnIntent,
     });
   };
 
@@ -5617,8 +5699,11 @@ export default function App() {
 	          onRemoveWorkspace={handleRemoveWorkspace}
 	          untrackedExternalAgents={untrackedExternalAgents}
 	          selectedObservedAgentId={activeObservedAgentId}
-	          onInspectExternalAgent={handleInspectExternalAgent}
-	          explorerOpen={explorerOpen}
+          onInspectExternalAgent={handleInspectExternalAgent}
+          onAttachExternalAgent={handleAttachExternalAgent}
+          attachedAgentIds={attachedAgentIdsForCurrentTask}
+          canAttachAgents={Boolean(selectedTaskId)}
+          explorerOpen={explorerOpen}
           setExplorerOpen={setExplorerOpen}
           activeWorkspace={activeWorkspace}
           workspaceTreeLoading={workspaceTreeLoading}
@@ -5852,8 +5937,6 @@ export default function App() {
           inspectorDetailHeading={inspectorDetailHeading}
           inspectorEvidence={inspectorEvidence}
           canControl={hasManagedControl}
-          onApprove={handleInspectorApprove}
-          onRevise={() => composerInputRef.current?.focus()}
           onEvidence={() => {
             const contextItem =
               visibleRuntimeTimelineItems.find(

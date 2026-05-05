@@ -217,7 +217,8 @@ pub async fn chat_completion(
             "messages": messages,
             "tools": tool_definitions(),
             "tool_choice": "auto",
-            "temperature": 0.2
+            "temperature": 0.2,
+            "thinking": { "type": "disabled" }
         }))
         .send()
         .await

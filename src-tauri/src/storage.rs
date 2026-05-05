@@ -39,13 +39,11 @@ pub struct Store {
     pub sessions: Vec<ChatSession>,
     pub workspaces: Vec<Workspace>,
     pub proposals: Vec<ToolProposal>,
-    // Phase 1 runtime skeleton: wired into persistence first, then integrated
-    // into turn execution and UI projection in follow-up changes.
-    #[allow(dead_code)]
+    // Task → Run → Event binding loop: TaskRecord / TurnRecord / TurnItem are
+    // active persistence primitives. See docs/task-run-event-implementation.md
+    // for the full binding contract and call sites.
     pub tasks: Vec<TaskRecord>,
-    #[allow(dead_code)]
     pub turns: Vec<TurnRecord>,
-    #[allow(dead_code)]
     pub turn_items: Vec<TurnItem>,
     data_dir: PathBuf,
 }
@@ -116,17 +114,14 @@ impl Store {
         write_json(self.data_dir.join(PROPOSALS_FILE), &self.proposals)
     }
 
-    #[allow(dead_code)]
     pub fn save_tasks(&self) -> Result<(), String> {
         write_json(self.data_dir.join(TASKS_FILE), &self.tasks)
     }
 
-    #[allow(dead_code)]
     pub fn save_turns(&self) -> Result<(), String> {
         write_json(self.data_dir.join(TURNS_FILE), &self.turns)
     }
 
-    #[allow(dead_code)]
     pub fn save_turn_items(&self) -> Result<(), String> {
         write_json(self.data_dir.join(TURN_ITEMS_FILE), &self.turn_items)
     }

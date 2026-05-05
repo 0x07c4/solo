@@ -96,8 +96,8 @@
 - 本地持久化的 sessions / workspaces / settings
 - `codex_cli` 驱动的执行链路
 - 流式状态、阶段摘要和右侧 runtime snapshot
-- Rust 端最小 `TaskRecord / TurnRecord / TurnItem` 持久化骨架
-- proposal / approval 流程和基础事件总线
+- Rust 端 `TaskRecord / TurnRecord / TurnItem` 完整持久化与执行链路绑定（闭环已完成，见 [docs/task-run-event-implementation.md](./docs/task-run-event-implementation.md)）
+- proposal / approval 流程和基础事件总线（已与 TurnItem 状态同步）
 
 这些资产依然有用，但应被重新解释为：
 
@@ -178,3 +178,21 @@
 - 文档、设计和实现优先围绕“观测系统”推进
 - 如果出现“继续围绕聊天 UI 打磨体验”和“推进任务治理 / 状态追溯 / 资源协调”之间的冲突，后者优先
 - 如果旧文档里仍然保留 `human-in-the-loop chat workbench` 的表达，应视为历史阶段判断，而不是当前方向
+
+## 6. Agent Self-Improvement
+
+opencode agent 在每次 session 启动时应读取以下记忆文件以获得持续改进能力：
+
+1. `~/.config/opencode/memories/PROFILE.md` — 长期稳定的用户画像与工作偏好
+2. `~/.config/opencode/memories/ACTIVE.md` — 跨任务高优先级规则
+
+任务过程中，在以下情形记录新记忆条目到 `~/.config/opencode/memories/`：
+- `LEARNINGS.md`: 非显而易见的经验、纠正、知识更新
+- `ERRORS.md`: 可复用的错误与排障经验
+- `FEATURE_REQUESTS.md`: 当前能力未满足的长期需求
+
+记录规则：
+- 只在结论非显而易见、可复用、或可能再次出现时才记录
+- 使用中文
+- 不记录一次性的琐碎细节
+- 静默记录，不打断用户

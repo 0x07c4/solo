@@ -2613,17 +2613,27 @@ select {
 .external-resource-agent-card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
   width: 100%;
   border: 1px solid color-mix(in srgb, #75bab2 36%, var(--border-default) 64%);
   border-radius: 10px;
-  padding: 9px 10px;
   background: color-mix(in srgb, #142b29 46%, var(--surface-pane-strong) 54%);
+  overflow: hidden;
+}
+
+.external-agent-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 10px;
+  background: transparent;
+  border: none;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
+  width: 100%;
 }
 
 .external-resource-agent-card:hover,
@@ -2634,6 +2644,17 @@ select {
 .external-resource-agent-card.is-current {
   border-color: color-mix(in srgb, #75bab2 48%, var(--border-default) 52%);
   box-shadow: inset 3px 0 0 color-mix(in srgb, #75bab2 72%, transparent);
+}
+
+.external-agent-surface:hover {
+  background: color-mix(in srgb, var(--surface-pane-strong) 88%, #142b29 12%);
+}
+
+.attach-agent-button {
+  margin: 0 10px 9px;
+  align-self: flex-start;
+  font-size: 0.68rem;
+  min-height: 26px;
 }
 
 .external-resource-agent-head {
@@ -3804,6 +3825,110 @@ select {
 
 .proposal-actions .primary-button,
 .proposal-actions .ghost-button {
+  min-height: 32px;
+  flex: 1;
+}
+
+.pending-proposal-card {
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-default) 82%);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-pane-strong) 96%, var(--accent-soft) 4%);
+  overflow: hidden;
+  min-width: 0;
+  margin-bottom: 10px;
+}
+
+.pending-proposal-head {
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent), transparent);
+  border-bottom-color: color-mix(in srgb, var(--accent) 14%, var(--border-default) 86%);
+}
+
+.pending-proposal-head h3 {
+  margin: 2px 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  line-height: 1.35;
+  color: var(--text-strong);
+}
+
+.pending-proposal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+}
+
+.pending-proposal-body > p {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+
+.pending-proposal-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pending-proposal-file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pending-proposal-file-list li code {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  padding: 2px 8px;
+  border-radius: 5px;
+  display: inline-block;
+}
+
+.pending-proposal-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pending-proposal-diff > .ghost-button {
+  align-self: flex-start;
+}
+
+.diff-preview-block {
+  border: 1px solid color-mix(in srgb, var(--border-default) 80%, transparent);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.diff-preview-block pre {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--code-surface);
+  color: var(--code-text);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1.45;
+  white-space: pre;
+}
+
+.pending-proposal-actions {
+  display: flex;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.pending-proposal-actions .primary-button,
+.pending-proposal-actions .ghost-button {
   min-height: 32px;
   flex: 1;
 }
